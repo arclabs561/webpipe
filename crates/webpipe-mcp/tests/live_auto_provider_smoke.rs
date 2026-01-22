@@ -80,7 +80,7 @@ fn webpipe_live_auto_search_smoke_opt_in() {
 
         let s = resp
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();

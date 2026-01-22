@@ -4,4 +4,3 @@
 //! It re-exports the backend-agnostic types/traits from `webpipe-core`.
 
 pub use webpipe_core::*;
-

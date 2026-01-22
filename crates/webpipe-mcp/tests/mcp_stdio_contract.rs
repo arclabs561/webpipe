@@ -87,7 +87,7 @@ fn webpipe_stdio_lists_tools() {
             .await?;
         let s = resp
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -123,7 +123,7 @@ fn webpipe_stdio_lists_tools() {
             .await?;
         let s2 = resp2
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();

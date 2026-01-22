@@ -80,7 +80,7 @@ fn webpipe_live_url_seed_smoke_opt_in() {
                 .await?;
             let text = r
                 .content
-                .get(0)
+                .first()
                 .and_then(|c| c.as_text())
                 .map(|t| t.text.clone())
                 .unwrap_or_default();
@@ -110,7 +110,7 @@ fn webpipe_live_url_seed_smoke_opt_in() {
                 .await?;
             let text = r
                 .content
-                .get(0)
+                .first()
                 .and_then(|c| c.as_text())
                 .map(|t| t.text.clone())
                 .unwrap_or_default();

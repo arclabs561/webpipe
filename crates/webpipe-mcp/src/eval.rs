@@ -33,13 +33,11 @@ fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
         return ("".to_string(), !s.is_empty());
     }
     let mut out = String::new();
-    let mut n = 0usize;
-    for ch in s.chars() {
+    for (n, ch) in s.chars().enumerate() {
         if n >= max_chars {
             return (out, true);
         }
         out.push(ch);
-        n += 1;
     }
     (out, false)
 }
@@ -463,13 +461,13 @@ mod tests {
             serde_json::from_str(&q_raw).expect("queries_seed.json valid json");
         assert_eq!(qv["schema_version"].as_u64(), Some(1));
         assert_eq!(qv["kind"].as_str(), Some("webpipe_seed_queries"));
-        assert!(qv["queries"].as_array().unwrap().len() >= 1);
+        assert!(!qv["queries"].as_array().unwrap().is_empty());
 
         let r_raw = std::fs::read_to_string(base.join("qrels_seed.json")).expect("qrels_seed.json");
         let rv: serde_json::Value =
             serde_json::from_str(&r_raw).expect("qrels_seed.json valid json");
         assert_eq!(rv["schema_version"].as_u64(), Some(1));
         assert_eq!(rv["kind"].as_str(), Some("webpipe_seed_qrels"));
-        assert!(rv["qrels"].as_array().unwrap().len() >= 1);
+        assert!(!rv["qrels"].as_array().unwrap().is_empty());
     }
 }

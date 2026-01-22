@@ -59,7 +59,7 @@ async fn web_cache_search_extract_finds_warmed_cache_entry() {
             .expect("call_tool");
         let text = r
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -176,7 +176,7 @@ async fn web_cache_search_extract_can_load_persisted_corpus_opt_in() {
             .expect("call_tool");
         let text = r
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -187,7 +187,7 @@ async fn web_cache_search_extract_can_load_persisted_corpus_opt_in() {
     {
         let service = ()
             .serve(
-                TokioChildProcess::new(tokio::process::Command::new(&bin).configure(|cmd| {
+                TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
                     cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
                     cmd.env("WEBPIPE_CACHE_SEARCH_PERSIST", "1");
@@ -229,7 +229,7 @@ async fn web_cache_search_extract_can_load_persisted_corpus_opt_in() {
     {
         let service = ()
             .serve(
-                TokioChildProcess::new(tokio::process::Command::new(&bin).configure(|cmd| {
+                TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
                     cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
                     cmd.env("WEBPIPE_CACHE_SEARCH_PERSIST", "1");

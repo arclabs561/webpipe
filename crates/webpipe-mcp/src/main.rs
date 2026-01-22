@@ -13,6 +13,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Run as an MCP stdio server (for Cursor / MCP clients).
     #[cfg(feature = "stdio")]
@@ -636,7 +637,7 @@ mod mcp {
                 }
             }
             if chosen.is_empty() {
-                chosen = order.get(0).cloned().unwrap_or_default();
+                chosen = order.first().cloned().unwrap_or_default();
             }
 
             // Frontier: best-effort list of top candidates by score (bounded, stable).
@@ -905,7 +906,7 @@ mod mcp {
         }
         let s = r
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -1590,9 +1591,7 @@ mod mcp {
             elapsed_ms: u64,
             http_429: bool,
         ) {
-            let entry = map
-                .entry(name.to_string())
-                .or_insert_with(ProviderUsage::default);
+            let entry = map.entry(name.to_string()).or_default();
             entry.calls += 1;
             if ok {
                 entry.ok += 1;
@@ -1653,10 +1652,7 @@ mod mcp {
                 s.routing_last_seen_tick = s.routing_last_seen_tick.saturating_add(1);
                 let tick = s.routing_last_seen_tick;
                 s.routing_query_last_seen.insert(qk.clone(), tick);
-                let per_qk = s
-                    .search_windows_by_query_key
-                    .entry(qk.clone())
-                    .or_insert_with(std::collections::BTreeMap::new);
+                let per_qk = s.search_windows_by_query_key.entry(qk.clone()).or_default();
                 let w = per_qk
                     .entry(name.to_string())
                     .or_insert_with(|| muxer::Window::new(cap));
@@ -1827,7 +1823,7 @@ mod mcp {
         }
 
         fn approx_bytes_len(s: &str) -> usize {
-            s.as_bytes().len()
+            s.len()
         }
 
         fn content_type_is_pdf(ct: Option<&str>) -> bool {
@@ -1912,8 +1908,8 @@ mod mcp {
             }
             let mut out: Vec<webpipe_local::extract::ScoredChunk> = chunks
                 .iter()
-                .cloned()
                 .filter(|c| !Self::chunk_is_low_signal(c))
+                .cloned()
                 .collect();
             // Never return an empty list if we had chunks; fall back to original.
             if out.is_empty() {
@@ -2141,7 +2137,7 @@ mod mcp {
             if urls.is_empty() {
                 return Vec::new();
             }
-            let max_urls = max_urls.max(1).min(10);
+            let max_urls = max_urls.clamp(1, 10);
 
             match url_selection_mode {
                 "auto" => {
@@ -3068,7 +3064,7 @@ mod mcp {
             let mut search_backend_provider: Option<String> = None;
 
             let (query, urls): (String, Vec<String>) = if let Some(urls) = args.urls {
-                let q = args.query.unwrap_or_else(|| "".to_string());
+                let q = args.query.unwrap_or_default();
                 (q, urls)
             } else {
                 if no_network {
@@ -3532,9 +3528,8 @@ mod mcp {
                         .and_then(|v| v.trim().parse::<usize>().ok())
                 })
                 .unwrap_or(1)
-                .max(1)
-                .min(5);
-            let frontier_max = args.agentic_frontier_max.unwrap_or(200).max(50).min(2_000);
+                .clamp(1, 5);
+            let frontier_max = args.agentic_frontier_max.unwrap_or(200).clamp(50, 2_000);
             let mut stuck_streak: usize = 0;
 
             while per_url.len() < max_urls {
@@ -3660,7 +3655,7 @@ mod mcp {
                         }
                         // Generic penalty: avoid auth/challenge/consent URLs unless they are clearly relevant.
                         if url_looks_like_auth_or_challenge(u) {
-                            s = s / 4;
+                            s /= 4;
                         }
                         let k = canonicalize_url_no_frag(u).unwrap_or_else(|| u.clone());
                         let p = *priors.get(&k).unwrap_or(&0);
@@ -3681,11 +3676,11 @@ mod mcp {
                             .then_with(|| url_scores[ib].cmp(&url_scores[ia]))
                             .then_with(|| ia.cmp(&ib))
                     });
-                    let mut best_i = *idxs.get(0).unwrap_or(&0);
+                    let mut best_i = idxs.first().copied().unwrap_or(0);
 
                     let selector_used: &'static str = "lexical";
                     if best_i >= frontier.len() {
-                        best_i = idxs.get(0).copied().unwrap_or(0);
+                        best_i = idxs.first().copied().unwrap_or(0);
                     }
 
                     let picked = frontier.swap_remove(best_i);
@@ -4319,7 +4314,7 @@ mod mcp {
                     && bytes_len >= 50_000
                     && structure_opt
                         .as_ref()
-                        .is_some_and(|s| structure_looks_like_ui_shell(s))
+                        .is_some_and(structure_looks_like_ui_shell)
                 {
                     warnings.push("main_content_low_signal");
                 }
@@ -4334,12 +4329,12 @@ mod mcp {
                 let page_signal = chunks.iter().map(|c| c.score).max().unwrap_or(0);
                 // Stuck detection: repeated low-signal pages should trigger an extra search round (if allowed),
                 // rather than burning the remaining URL budget on adjacent low-quality pages.
-                if page_signal == 0 || warnings.iter().any(|w| *w == "empty_extraction") {
+                if page_signal == 0 || warnings.contains(&"empty_extraction") {
                     stuck_streak = stuck_streak.saturating_add(1);
                 } else {
                     stuck_streak = 0;
                 }
-                if warnings.iter().any(|w| *w == "blocked_by_js_challenge") {
+                if warnings.contains(&"blocked_by_js_challenge") {
                     stuck_streak = stuck_streak.saturating_add(1);
                 }
 
@@ -6023,7 +6018,7 @@ mod mcp {
 
             let answer_text = resp
                 .choices
-                .get(0)
+                .first()
                 .map(|c| c.message.content.clone())
                 .unwrap_or_default();
             let (answer, _n, clipped) = Self::truncate_to_chars(&answer_text, max_answer_chars);
@@ -6706,7 +6701,7 @@ mod mcp {
                                 Ok(p) => match p.search(&q).await {
                                     Ok(r) => {
                                         cost_units_total =
-                                            cost_units_total.saturating_add(r.cost_units as u64);
+                                            cost_units_total.saturating_add(r.cost_units);
                                         for rr in r.results {
                                             let key = canonicalize_url(&rr.url);
                                             if seen.insert(key) {
@@ -6725,7 +6720,7 @@ mod mcp {
                                         self.stats_record_search_provider_qk(
                                             "brave",
                                             true,
-                                            r.cost_units as u64,
+                                            r.cost_units,
                                             pt0.elapsed().as_millis() as u64,
                                             None,
                                             qk.as_deref(),
@@ -6777,7 +6772,7 @@ mod mcp {
                                 Ok(p) => match p.search(&q).await {
                                     Ok(r) => {
                                         cost_units_total =
-                                            cost_units_total.saturating_add(r.cost_units as u64);
+                                            cost_units_total.saturating_add(r.cost_units);
                                         for rr in r.results {
                                             let key = canonicalize_url(&rr.url);
                                             if seen.insert(key) {
@@ -6796,7 +6791,7 @@ mod mcp {
                                         self.stats_record_search_provider_qk(
                                             "searxng",
                                             true,
-                                            r.cost_units as u64,
+                                            r.cost_units,
                                             pt0.elapsed().as_millis() as u64,
                                             None,
                                             qk.as_deref(),
@@ -6848,7 +6843,7 @@ mod mcp {
                                 Ok(p) => match p.search(&q).await {
                                     Ok(r) => {
                                         cost_units_total =
-                                            cost_units_total.saturating_add(r.cost_units as u64);
+                                            cost_units_total.saturating_add(r.cost_units);
                                         for rr in r.results {
                                             let key = canonicalize_url(&rr.url);
                                             if seen.insert(key) {
@@ -6867,7 +6862,7 @@ mod mcp {
                                         self.stats_record_search_provider_qk(
                                             "tavily",
                                             true,
-                                            r.cost_units as u64,
+                                            r.cost_units,
                                             pt0.elapsed().as_millis() as u64,
                                             None,
                                             qk.as_deref(),
@@ -7143,7 +7138,7 @@ mod mcp {
                                         self.stats_record_search_provider_qk(
                                             "tavily",
                                             true,
-                                            r.cost_units as u64,
+                                            r.cost_units,
                                             pt0.elapsed().as_millis() as u64,
                                             None,
                                             qk.as_deref(),
@@ -7223,7 +7218,7 @@ mod mcp {
                                         self.stats_record_search_provider_qk(
                                             "searxng",
                                             true,
-                                            r.cost_units as u64,
+                                            r.cost_units,
                                             pt0.elapsed().as_millis() as u64,
                                             None,
                                             qk.as_deref(),
@@ -7303,7 +7298,7 @@ mod mcp {
                                         self.stats_record_search_provider_qk(
                                             "brave",
                                             true,
-                                            r.cost_units as u64,
+                                            r.cost_units,
                                             pt0.elapsed().as_millis() as u64,
                                             None,
                                             qk.as_deref(),
@@ -7499,7 +7494,7 @@ mod mcp {
                                         self.stats_record_search_provider_qk(
                                             "brave",
                                             true,
-                                            r.cost_units as u64,
+                                            r.cost_units,
                                             pt0.elapsed().as_millis() as u64,
                                             None,
                                             qk.as_deref(),
@@ -7591,7 +7586,7 @@ mod mcp {
                                             self.stats_record_search_provider_qk(
                                                 "searxng",
                                                 true,
-                                                r.cost_units as u64,
+                                                r.cost_units,
                                                 pt0.elapsed().as_millis() as u64,
                                                 None,
                                                 qk.as_deref(),
@@ -7689,7 +7684,7 @@ mod mcp {
                                             self.stats_record_search_provider_qk(
                                                 "tavily",
                                                 true,
-                                                r.cost_units as u64,
+                                                r.cost_units,
                                                 pt0.elapsed().as_millis() as u64,
                                                 None,
                                                 qk.as_deref(),
@@ -7851,7 +7846,7 @@ mod mcp {
                             self.stats_record_search_provider_qk(
                                 "brave",
                                 true,
-                                r.cost_units as u64,
+                                r.cost_units,
                                 pt0.elapsed().as_millis() as u64,
                                 None,
                                 qk.as_deref(),
@@ -7935,7 +7930,7 @@ mod mcp {
                             self.stats_record_search_provider_qk(
                                 "tavily",
                                 true,
-                                r.cost_units as u64,
+                                r.cost_units,
                                 pt0.elapsed().as_millis() as u64,
                                 None,
                                 qk.as_deref(),
@@ -7965,7 +7960,7 @@ mod mcp {
                                             self.stats_record_search_provider_qk(
                                                 "brave",
                                                 true,
-                                                r.cost_units as u64,
+                                                r.cost_units,
                                                 pt0.elapsed().as_millis() as u64,
                                                 None,
                                                 qk.as_deref(),
@@ -8119,7 +8114,7 @@ mod mcp {
                             self.stats_record_search_provider_qk(
                                 "searxng",
                                 true,
-                                r.cost_units as u64,
+                                r.cost_units,
                                 pt0.elapsed().as_millis() as u64,
                                 None,
                                 qk.as_deref(),
@@ -8761,7 +8756,7 @@ mod mcp {
                 && pipeline
                     .structure
                     .as_ref()
-                    .is_some_and(|s| structure_looks_like_ui_shell(s))
+                    .is_some_and(structure_looks_like_ui_shell)
             {
                 warnings.push("main_content_low_signal");
             }
@@ -8973,7 +8968,7 @@ mod mcp {
         fn payload_from_call_tool_result(r: &CallToolResult) -> serde_json::Value {
             let s = r
                 .content
-                .get(0)
+                .first()
                 .and_then(|c| c.as_text())
                 .map(|t| t.text.clone())
                 .unwrap_or_default();
@@ -9140,12 +9135,12 @@ mod mcp {
             assert_eq!(n, out.chars().count());
             assert_eq!(n, 3);
             assert_eq!(out, "aé🙂");
-            assert_eq!(clipped, true);
+            assert!(clipped);
 
             let (out2, n2, clipped2) = WebpipeMcp::truncate_to_chars(s, 10);
             assert_eq!(n2, out2.chars().count());
             assert_eq!(out2, s);
-            assert_eq!(clipped2, false);
+            assert!(!clipped2);
         }
 
         proptest! {
@@ -10273,7 +10268,10 @@ mod mcp {
             assert_eq!(v["ok"].as_bool(), Some(true));
             let ev = &v["evidence"];
             assert_eq!(ev["arxiv"]["ok"].as_bool(), Some(true));
-            assert!(ev["arxiv"]["papers"].as_array().unwrap_or(&vec![]).len() >= 1);
+            assert!(ev["arxiv"]["papers"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false));
         }
 
         #[tokio::test]
@@ -11203,7 +11201,7 @@ mod mcp {
             assert_eq!(
                 v["warnings"]
                     .as_array()
-                    .and_then(|a| a.get(0))
+                    .and_then(|a| a.first())
                     .and_then(|x| x.as_str()),
                 Some("empty_extraction")
             );
@@ -11410,7 +11408,7 @@ mod mcp {
             use std::net::SocketAddr;
 
             let md = "# Hi\n\nHello world";
-            let expected_bytes = md.as_bytes().len() as u64;
+            let expected_bytes = md.len() as u64;
 
             let app = Router::new().route(
                 "/v2/scrape",
@@ -12037,7 +12035,7 @@ async fn main() -> Result<()> {
 
                         let s = r
                             .content
-                            .get(0)
+                            .first()
                             .and_then(|c| c.as_text())
                             .map(|t| t.text.clone())
                             .unwrap_or_default();
@@ -12154,7 +12152,7 @@ async fn main() -> Result<()> {
 
                         let s = r
                             .content
-                            .get(0)
+                            .first()
                             .and_then(|c| c.as_text())
                             .map(|t| t.text.clone())
                             .unwrap_or_default();

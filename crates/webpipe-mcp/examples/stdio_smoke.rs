@@ -23,7 +23,7 @@ use tokio::process::Command;
 fn first_text(result: &rmcp::model::CallToolResult) -> Option<&str> {
     result
         .content
-        .get(0)
+        .first()
         .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
 }

@@ -157,7 +157,7 @@ async fn web_extract_handles_multiple_content_types() {
             .expect("call_tool web_extract");
         let text = r
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -216,13 +216,10 @@ async fn web_extract_handles_multiple_content_types() {
     assert_eq!(v_json["content_type"].as_str(), Some("application/json"));
     assert_eq!(v_json["extraction"]["engine"].as_str(), Some("json"));
     assert_eq!(v_json["extract"]["engine"].as_str(), Some("json"));
-    assert!(
-        v_json["structure"]["outline"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .len()
-            >= 1
-    );
+    assert!(v_json["structure"]["outline"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false));
 
     // Markdown should be treated as markdown.
     let v_md = call_extract(&service, &format!("{base}/md"), None).await;

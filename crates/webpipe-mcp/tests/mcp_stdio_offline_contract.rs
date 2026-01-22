@@ -104,7 +104,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             .await?;
         let meta_s = meta
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -130,7 +130,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             .await?;
         let search_s = search
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -151,7 +151,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             .await?;
         let bad_s = bad
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -182,7 +182,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             .await?;
         let hydrate_s = hydrate
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -209,7 +209,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             .await?;
         let fetch_s = fetch
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -240,7 +240,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             .await?;
         let fetch2_s = fetch2
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();
@@ -283,7 +283,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             .await?;
         let extract_s = extract
             .content
-            .get(0)
+            .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .unwrap_or_default();

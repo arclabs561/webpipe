@@ -62,7 +62,7 @@ fn webpipe_live_firecrawl_eval_fetch_smoke_opt_in() {
 
     assert_eq!(v["schema_version"].as_u64(), Some(1));
     assert_eq!(v["kind"].as_str(), Some("eval_fetch"));
-    assert_eq!(v["inputs"]["fetchers"].is_array(), true);
+    assert!(v["inputs"]["fetchers"].is_array());
     assert_eq!(v["inputs"]["extract"].as_bool(), Some(true));
     assert_eq!(v["inputs"]["max_text_chars"].as_u64(), Some(200));
 

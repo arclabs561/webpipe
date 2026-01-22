@@ -61,6 +61,6 @@ fn webpipe_eval_search_contract_no_keys_no_network() {
         assert_eq!(result["query"].as_str(), Some("contract test query"));
         assert_eq!(result["max_results"].as_u64(), Some(3));
         assert_eq!(result["error"]["code"].as_str(), Some("not_configured"));
-        assert!(result["error"]["message"].as_str().unwrap_or("").len() > 0);
+        assert!(!result["error"]["message"].as_str().unwrap_or("").is_empty());
     }
 }

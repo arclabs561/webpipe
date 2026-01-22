@@ -36,7 +36,10 @@ fn webpipe_doctor_contract_json_and_bool_flags() {
     assert!(v["configured"]["providers"]["tavily"].is_boolean());
     assert!(v["configured"]["remote_fetch"]["firecrawl"].is_boolean());
     assert!(v["configured"]["llm"]["perplexity"].is_boolean());
-    assert!(!v["configured"]["cache_dir"].as_str().unwrap_or("").is_empty());
+    assert!(!v["configured"]["cache_dir"]
+        .as_str()
+        .unwrap_or("")
+        .is_empty());
 
     // Check list should exist and include the stdio handshake check with skipped=true.
     let checks = v["checks"].as_array().expect("checks array");
