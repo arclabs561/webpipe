@@ -1,0 +1,29 @@
+# Representative URLs for manual evals (fetch/extract/deep_research with urls=[...]).
+# Keep these public and stable-ish; they are not used by automated tests.
+#
+# Seeded from real usage context (chat history), then filtered:
+# - drop localhost/127.0.0.1 and template URLs
+# - drop empty/garbage entries
+# - keep public docs / specs / forums / APIs we actually interact with
+
+https://example.com/
+https://www.rust-lang.org/
+https://docs.rs/serde_json/latest/serde_json/macro.json.html
+https://en.wikipedia.org/wiki/Unicode
+https://en.wikipedia.org/wiki/Graph_Laplacian
+https://en.wikipedia.org/wiki/Spectral_clustering
+
+# MCP + Cursor docs (real failure surface)
+https://docs.cursor.com/context/model-context-protocol
+https://docs.cursor.com/context/model-context-protocol#configuring-mcp-servers
+https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+https://modelcontextprotocol.io/docs/develop/connect-local-servers
+
+# Real “setup friction” references
+https://forum.cursor.com/t/how-to-use-environment-variables-in-mcp-json/79296
+https://exdst.com/posts/20250524-cursor-mcp-troubleshooting
+
+# Provider API docs (we integrate against these)
+https://docs.perplexity.ai/api-reference/chat-completions-post
+https://api.perplexity.ai/chat/completions
+https://api.firecrawl.dev/v2/scrape

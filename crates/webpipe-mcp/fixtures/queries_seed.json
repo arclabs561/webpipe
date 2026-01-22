@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "kind": "webpipe_seed_queries",
+  "queries": [
+    {
+      "query_id": "mcp_stdio_transport",
+      "query": "MCP stdio transport protocol stdout stderr newline framing",
+      "intent": "Find the authoritative stdio transport rules and common failure modes."
+    },
+    {
+      "query_id": "cursor_mcp_env_vars",
+      "query": "Cursor MCP mcp.json environment variables env block .env file support",
+      "intent": "Figure out how env vars are passed to stdio MCP servers in Cursor."
+    },
+    {
+      "query_id": "transport_closed",
+      "query": "MCP TransportClosed ConnectionClosed initialized request error stdout contamination",
+      "intent": "Diagnose stdio handshake failures and early-close causes."
+    },
+    {
+      "query_id": "cargo_install_path",
+      "query": "cargo install --path binary location ~/.cargo/bin Cursor PATH issues",
+      "intent": "Resolve why Cursor cannot find cargo-installed binaries."
+    },
+    {
+      "query_id": "firecrawl_fallback",
+      "query": "Firecrawl v2 scrape markdown field JS-heavy page extraction empty_extraction fallback",
+      "intent": "When to use Firecrawl and how responses are shaped."
+    },
+    {
+      "query_id": "perplexity_chat_completions",
+      "query": "Perplexity chat completions API search_mode reasoning_effort parameters",
+      "intent": "Use Perplexity API knobs correctly and safely."
+    }
+  ]
+}
+

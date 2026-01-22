@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "webpipe": {
+      "command": "<ABS_PATH_TO_WEBPIPE>/target/release/webpipe",
+      "args": [
+        "mcp-stdio"
+      ],
+      "env": {
+        "CURSOR_WORKSPACE_ROOT": "<ABS_PATH_TO_WORKSPACE_ROOT>",
+        "WEBPIPE_CACHE_DIR": "<ABS_PATH_TO_CACHE_DIR>",
+        "WEBPIPE_BRAVE_API_KEY": "<SET_ME>",
+        "WEBPIPE_TAVILY_API_KEY": "<SET_ME>",
+        "WEBPIPE_SEARXNG_ENDPOINT": "<OPTIONAL: http(s)://<host>:<port> (base or /search)>",
+        "WEBPIPE_FIRECRAWL_API_KEY": "<SET_ME>",
+        "WEBPIPE_PERPLEXITY_API_KEY": "<SET_ME>"
+      }
+    }
+  }
+}
+

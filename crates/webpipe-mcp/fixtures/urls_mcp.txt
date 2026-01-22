@@ -1,0 +1,9 @@
+# MCP-focused URLs (seeded from real chat history).
+# Use with: webpipe eval-search-extract --urls-file ... --query "MCP stdio transport"
+
+https://docs.cursor.com/context/model-context-protocol
+https://docs.cursor.com/context/model-context-protocol#configuring-mcp-servers
+https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+https://modelcontextprotocol.io/docs/develop/connect-local-servers
+https://exdst.com/posts/20250524-cursor-mcp-troubleshooting
+https://forum.cursor.com/t/how-to-use-environment-variables-in-mcp-json/79296

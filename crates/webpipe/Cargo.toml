@@ -1,0 +1,10 @@
+[package]
+name = "webpipe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Public facade crate for webpipe (re-exports webpipe-core)."
+
+[dependencies]
+webpipe-core = { path = "../webpipe-core" }
+

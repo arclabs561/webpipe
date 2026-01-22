@@ -1,0 +1,19 @@
+target/
+.generated/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets (never commit)
+.env
+.env.*
+*.pem
+*.p12
+id_rsa*
+id_ed25519*
+*token*
+*secret*
+*credentials*
+

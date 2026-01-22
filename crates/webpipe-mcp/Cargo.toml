@@ -1,0 +1,37 @@
+[package]
+name = "webpipe-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "webpipe MCP stdio server + CLI harness."
+
+[dependencies]
+webpipe-core = { path = "../webpipe-core" }
+webpipe-local = { path = "../webpipe-local" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "0.12.0", optional = true, features = ["macros", "server", "client", "transport-io", "transport-child-process", "schemars"] }
+schemars = { version = "1.2.0", optional = true, features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+assert_cmd = "2.0"
+predicates = "3.0"
+axum = "0.7"
+proptest = "1.9"
+
+[features]
+default = ["stdio"]
+stdio = ["dep:rmcp", "dep:schemars"]
+vision-gemini = ["webpipe-local/vision-gemini"]
+
+[[bin]]
+name = "webpipe"
+path = "src/main.rs"
+

@@ -1,0 +1,23 @@
+# Representative search queries for manual evals and regression probing.
+# - Blank lines and #comments should be ignored by readers.
+# - Keep these privacy-safe (public topics only).
+
+Rust serde_json json macro ownership moves
+Unicode scalar value offset vs UTF-8 byte offset
+site:docs.rs tokio select biased
+
+ICML 2017 Soft-DTW Cuturi Blondel paper
+Differentiable dynamic programming structured attention Mensch Blondel 2018
+
+Graph Laplacian normalized vs random walk difference
+Spectral clustering tutorial normalized laplacian eigenvectors
+
+Arabic RTL unicode normalization example
+中文 分词 Unicode 标准化 NFC NFKC 区别
+
+# MCP / stdio / tooling (reflects real distribution for this repo)
+MCP stdio transport stdout contamination TransportClosed
+Cursor MCP mcp.json env vars not picked up
+Perplexity chat completions API search_mode reasoning_effort
+Firecrawl v2 scrape API markdown field
+cargo install --path binary not found in Cursor PATH

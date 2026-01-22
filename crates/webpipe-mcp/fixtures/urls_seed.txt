@@ -1,0 +1,50 @@
+# Seed URL corpus (curated “real-ish” distribution).
+#
+# Sources:
+# - MCP/Cursor/webpipe-related chat history
+# - Public docs/specs/forums that show up in real debugging sessions
+#
+# Rules:
+# - Public only (no localhost/127.0.0.1, no private hosts)
+# - Stable-ish pages preferred (docs/specs/releases)
+# - Keep this list broad enough to exercise extraction edge cases (JS-heavy, long pages, code blocks)
+
+# Baseline sanity
+https://example.com/
+
+# Rust ecosystem pages we touch while building MCP servers
+https://doc.rust-lang.org/cargo/commands/cargo-install.html
+https://docs.rs/serde_json/latest/serde_json/macro.json.html
+https://docs.rs/tokio/latest/tokio/
+https://docs.rs/clap/latest/clap/
+https://docs.rs/reqwest/latest/reqwest/
+
+# MCP spec + docs
+https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+https://modelcontextprotocol.io/docs/develop/connect-local-servers
+https://modelcontextprotocol.io/docs/develop/build-server
+https://modelcontextprotocol.io/docs/clients
+
+# Cursor MCP docs + “real” troubleshooting
+https://docs.cursor.com/context/model-context-protocol
+https://docs.cursor.com/context/model-context-protocol#configuring-mcp-servers
+https://docs.cursor.com/mcp
+https://cursor.com/docs/context/mcp
+https://exdst.com/posts/20250524-cursor-mcp-troubleshooting
+https://forum.cursor.com/t/how-to-use-environment-variables-in-mcp-json/79296
+https://forum.cursor.com/t/resolve-local-environment-variables-in-mcp-server-definitions/79639
+
+# Provider API surfaces we integrate against
+https://docs.perplexity.ai/api-reference/chat-completions-post
+https://docs.perplexity.ai/llms-full.txt
+https://api.perplexity.ai/chat/completions
+https://api.firecrawl.dev/v2/scrape
+
+# MCP server ecosystem reference points
+https://github.com/modelcontextprotocol/servers
+https://github.com/ast-grep/ast-grep-mcp
+
+# Unicode / text pitfalls we explicitly care about
+https://en.wikipedia.org/wiki/Unicode
+https://en.wikipedia.org/wiki/UTF-8
+

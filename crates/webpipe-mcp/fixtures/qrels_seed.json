@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "kind": "webpipe_seed_qrels",
+  "qrels": [
+    {
+      "query_id": "mcp_stdio_transport",
+      "url": "https://modelcontextprotocol.io/specification/2025-03-26/basic/transports",
+      "grade": 2,
+      "rationale": "Primary spec: stdio framing + MUST/MAY language."
+    },
+    {
+      "query_id": "cursor_mcp_env_vars",
+      "url": "https://docs.cursor.com/context/model-context-protocol#configuring-mcp-servers",
+      "grade": 2,
+      "rationale": "Cursor MCP configuration surface."
+    },
+    {
+      "query_id": "cursor_mcp_env_vars",
+      "url": "https://forum.cursor.com/t/how-to-use-environment-variables-in-mcp-json/79296",
+      "grade": 1,
+      "rationale": "Real-world discussion about env vars in mcp.json."
+    },
+    {
+      "query_id": "transport_closed",
+      "url": "https://modelcontextprotocol.io/specification/2025-03-26/basic/transports",
+      "grade": 2,
+      "rationale": "Spec explains stdout/stderr discipline and newline framing; key for TransportClosed."
+    },
+    {
+      "query_id": "cargo_install_path",
+      "url": "https://doc.rust-lang.org/cargo/commands/cargo-install.html",
+      "grade": 2,
+      "rationale": "Authoritative cargo install behavior and binary location expectations."
+    },
+    {
+      "query_id": "firecrawl_fallback",
+      "url": "https://api.firecrawl.dev/v2/scrape",
+      "grade": 2,
+      "rationale": "Actual endpoint contract surface used by webpipe."
+    },
+    {
+      "query_id": "perplexity_chat_completions",
+      "url": "https://docs.perplexity.ai/api-reference/chat-completions-post",
+      "grade": 2,
+      "rationale": "Perplexity request schema including optional knobs."
+    }
+  ]
+}
+
