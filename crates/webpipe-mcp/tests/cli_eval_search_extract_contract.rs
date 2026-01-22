@@ -68,5 +68,5 @@ fn webpipe_eval_search_extract_contract_urls_mode_offlineish() {
     assert_eq!(v["schema_version"].as_u64(), Some(1));
     assert_eq!(v["kind"].as_str(), Some("eval_search_extract"));
     assert_eq!(v["generated_at_epoch_s"].as_u64(), Some(1700000000));
-    assert!(v["runs"].as_array().unwrap().len() >= 1);
+    assert!(!v["runs"].as_array().unwrap().is_empty());
 }

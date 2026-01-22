@@ -29,7 +29,7 @@ async fn call(
         .expect("call_tool");
     let text = r
         .content
-        .get(0)
+        .first()
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
         .unwrap_or_default();
@@ -86,7 +86,10 @@ async fn searxng_provider_e2e_via_stdio_server() {
     .await;
     assert_eq!(v["ok"].as_bool(), Some(true));
     assert_eq!(v["backend_provider"].as_str(), Some("searxng"));
-    assert!(v["results"].as_array().unwrap_or(&vec![]).len() >= 1);
+    assert!(v["results"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false));
 
     // Auto fallback should pick searxng when it is the only configured provider.
     let v2 = call(

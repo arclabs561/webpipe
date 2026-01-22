@@ -12,5 +12,5 @@ fn webpipe_version_contract() {
 
     assert_eq!(v["schema_version"].as_u64(), Some(1));
     assert_eq!(v["name"].as_str(), Some("webpipe"));
-    assert!(v["version"].as_str().unwrap_or("").len() > 0);
+    assert!(!v["version"].as_str().unwrap_or("").is_empty());
 }

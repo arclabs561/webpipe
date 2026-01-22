@@ -207,6 +207,7 @@ fn collect_meta_files(cache_dir: &Path, max_scan_entries: usize) -> Vec<PathBuf>
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cache_search_extract(
     cache_dir: &Path,
     query: &str,

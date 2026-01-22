@@ -29,7 +29,7 @@ async fn call(
         .expect("call_tool");
     let text = r
         .content
-        .get(0)
+        .first()
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
         .unwrap_or_default();

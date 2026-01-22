@@ -24,7 +24,7 @@ fn webpipe_doctor_contract_json_and_bool_flags() {
 
     assert_eq!(v["schema_version"].as_u64(), Some(1));
     assert_eq!(v["name"].as_str(), Some("webpipe"));
-    assert!(v["version"].as_str().unwrap_or("").len() > 0);
+    assert!(!v["version"].as_str().unwrap_or("").is_empty());
     assert!(v.get("elapsed_ms").is_some());
     assert_eq!(
         v["features"]["stdio"].as_bool(),
@@ -36,7 +36,7 @@ fn webpipe_doctor_contract_json_and_bool_flags() {
     assert!(v["configured"]["providers"]["tavily"].is_boolean());
     assert!(v["configured"]["remote_fetch"]["firecrawl"].is_boolean());
     assert!(v["configured"]["llm"]["perplexity"].is_boolean());
-    assert!(v["configured"]["cache_dir"].as_str().unwrap_or("").len() > 0);
+    assert!(!v["configured"]["cache_dir"].as_str().unwrap_or("").is_empty());
 
     // Check list should exist and include the stdio handshake check with skipped=true.
     let checks = v["checks"].as_array().expect("checks array");
