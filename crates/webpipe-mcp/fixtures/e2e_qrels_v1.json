@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "kind": "webpipe_e2e_qrels",
+  "notes": "Deterministic qrels for the localhost E2E query set (v1).",
+  "qrels": [
+    {
+      "query_id": "local-docs-route-handlers",
+      "expected_url_substrings": ["/docs/app/getting-started/route-handlers"]
+    },
+    {
+      "query_id": "local-install",
+      "expected_url_substrings": ["/install/linux"]
+    }
+  ]
+}
+

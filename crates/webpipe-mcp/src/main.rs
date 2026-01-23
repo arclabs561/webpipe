@@ -28,6 +28,8 @@ enum Commands {
     /// Run a small E2E matrix over a versioned query set (writes a JSONL artifact).
     #[cfg(feature = "stdio")]
     EvalMatrix(EvalMatrixCmd),
+    /// Score an eval-matrix JSONL artifact against an E2E qrels file (json).
+    EvalMatrixScore(EvalMatrixScoreCmd),
     /// Diagnose configuration/launch issues (json; no secrets).
     Doctor(DoctorCmd),
     /// Print version info.
@@ -215,6 +217,22 @@ struct EvalMatrixCmd {
     #[arg(long, default_value_t = 200)]
     max_chunk_chars: usize,
     /// Output JSONL path (default: .generated/webpipe-eval-matrix-<epoch>.jsonl)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+struct EvalMatrixScoreCmd {
+    /// Matrix artifact path produced by `eval-matrix` (jsonl).
+    #[arg(long)]
+    matrix_artifact: std::path::PathBuf,
+    /// E2E qrels file (json), see `crates/webpipe-mcp/fixtures/e2e_qrels_v1.json`.
+    #[arg(long)]
+    qrels: std::path::PathBuf,
+    /// Output JSON path (default: .generated/webpipe-eval-matrix-score-<epoch>.json)
     #[arg(long)]
     out: Option<std::path::PathBuf>,
     /// Override "now" for deterministic outputs.
@@ -13246,6 +13264,147 @@ async fn main() -> Result<()> {
                 writeln!(f, "{}", serde_json::to_string(&row_c)?)?;
             }
 
+            println!("{}", out.display());
+        }
+        Commands::EvalMatrixScore(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    ".generated/webpipe-eval-matrix-score-{now}.json"
+                ))
+            });
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+
+            let qrels = eval::load_e2e_qrels_v1(&args.qrels)?;
+
+            // Read + parse JSONL rows.
+            let raw = std::fs::read_to_string(&args.matrix_artifact)?;
+            let mut rows: Vec<serde_json::Value> = Vec::new();
+            for (i, line) in raw.lines().enumerate() {
+                let s = line.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+                    anyhow::anyhow!("matrix_artifact line {}: invalid json: {}", i + 1, e)
+                })?;
+                rows.push(v);
+            }
+
+            // Index: query_id -> case -> row
+            let mut by_q: std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>> =
+                std::collections::BTreeMap::new();
+            for r in rows {
+                let qid = r.get("query_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let case = r.get("case").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if qid.is_empty() || case.is_empty() {
+                    continue;
+                }
+                by_q.entry(qid).or_default().insert(case, r);
+            }
+
+            fn extract_urls_from_result(res: &serde_json::Value) -> std::collections::BTreeSet<String> {
+                let mut out = std::collections::BTreeSet::new();
+                if let Some(top) = res.get("top_chunks").and_then(|v| v.as_array()) {
+                    for c in top {
+                        if let Some(u) = c.get("url").and_then(|v| v.as_str()) {
+                            out.insert(u.to_string());
+                        }
+                    }
+                }
+                if let Some(per_url) = res.get("results").and_then(|v| v.as_array()) {
+                    for r in per_url {
+                        if let Some(u) = r.get("url").and_then(|v| v.as_str()) {
+                            out.insert(u.to_string());
+                        }
+                        if let Some(u) = r.get("final_url").and_then(|v| v.as_str()) {
+                            out.insert(u.to_string());
+                        }
+                    }
+                }
+                out
+            }
+
+            let expected_cases = ["search", "warm_urls", "offline_urls"];
+            let mut per_query: Vec<serde_json::Value> = Vec::new();
+            let mut totals = serde_json::json!({
+                "queries": qrels.qrels.len(),
+                "cases": { "search": {"ok": 0, "hit": 0}, "warm_urls": {"ok": 0, "hit": 0}, "offline_urls": {"ok": 0, "hit": 0} }
+            });
+
+            for q in &qrels.qrels {
+                let mut per_case = Vec::new();
+                for case in expected_cases {
+                    let row = by_q
+                        .get(&q.query_id)
+                        .and_then(|m| m.get(case))
+                        .cloned();
+
+                    if let Some(row) = row {
+                        let res = row.get("result").cloned().unwrap_or(serde_json::Value::Null);
+                        let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let urls = extract_urls_from_result(&res);
+                        let hit = ok
+                            && q.expected_url_substrings.iter().any(|needle| {
+                                let needle = needle.as_str();
+                                urls.iter().any(|u| u.contains(needle))
+                            });
+
+                        if ok {
+                            totals["cases"][case]["ok"] =
+                                serde_json::json!(totals["cases"][case]["ok"].as_u64().unwrap_or(0) + 1);
+                        }
+                        if hit {
+                            totals["cases"][case]["hit"] =
+                                serde_json::json!(totals["cases"][case]["hit"].as_u64().unwrap_or(0) + 1);
+                        }
+
+                        per_case.push(serde_json::json!({
+                            "case": case,
+                            "row_present": true,
+                            "ok": ok,
+                            "hit": hit,
+                            "expected_url_substrings": q.expected_url_substrings,
+                            "observed_url_count": urls.len(),
+                        }));
+                    } else {
+                        per_case.push(serde_json::json!({
+                            "case": case,
+                            "row_present": false,
+                            "ok": false,
+                            "hit": false,
+                            "expected_url_substrings": q.expected_url_substrings,
+                            "observed_url_count": 0,
+                        }));
+                    }
+                }
+                per_query.push(serde_json::json!({
+                    "query_id": q.query_id,
+                    "cases": per_case
+                }));
+            }
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_matrix_score",
+                "generated_at_epoch_s": now,
+                "inputs": {
+                    "matrix_artifact": args.matrix_artifact,
+                    "qrels": args.qrels
+                },
+                "totals": totals,
+                "per_query": per_query
+            });
+
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
             println!("{}", out.display());
         }
         Commands::Doctor(args) => {

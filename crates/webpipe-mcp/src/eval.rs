@@ -464,6 +464,39 @@ pub fn load_e2e_queries_v1(path: &Path) -> Result<E2eQueriesV1> {
     Ok(v)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct E2eQrelsV1 {
+    pub schema_version: u64,
+    pub kind: String,
+    pub qrels: Vec<E2eQrelV1>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct E2eQrelV1 {
+    pub query_id: String,
+    pub expected_url_substrings: Vec<String>,
+}
+
+pub fn load_e2e_qrels_v1(path: &Path) -> Result<E2eQrelsV1> {
+    let raw = fs::read_to_string(path)?;
+    let v: E2eQrelsV1 = serde_json::from_str(&raw)?;
+    if v.schema_version != 1 || v.kind != "webpipe_e2e_qrels" {
+        anyhow::bail!("unexpected e2e qrels kind/schema_version");
+    }
+    for q in &v.qrels {
+        if q.query_id.trim().is_empty() {
+            anyhow::bail!("e2e qrels: query_id must be non-empty");
+        }
+        if q.expected_url_substrings.is_empty() {
+            anyhow::bail!("e2e qrels: expected_url_substrings must be non-empty");
+        }
+        if q.expected_url_substrings.iter().any(|s| s.trim().is_empty()) {
+            anyhow::bail!("e2e qrels: expected_url_substrings must not contain empty strings");
+        }
+    }
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +565,19 @@ mod tests {
         assert!(!v.queries.is_empty());
         assert!(v.queries.iter().all(|q| !q.query_id.trim().is_empty()));
         assert!(v.queries.iter().all(|q| !q.query.trim().is_empty()));
+    }
+
+    #[test]
+    fn e2e_qrels_fixture_is_parseable_json() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let v = load_e2e_qrels_v1(&base.join("e2e_qrels_v1.json")).expect("e2e_qrels_v1.json");
+        assert_eq!(v.schema_version, 1);
+        assert_eq!(v.kind, "webpipe_e2e_qrels");
+        assert!(!v.qrels.is_empty());
+        assert!(v.qrels.iter().all(|q| !q.query_id.trim().is_empty()));
+        assert!(v
+            .qrels
+            .iter()
+            .all(|q| !q.expected_url_substrings.is_empty()));
     }
 }
