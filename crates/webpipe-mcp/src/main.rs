@@ -275,6 +275,10 @@ mod mcp {
 
     const SCHEMA_VERSION: u64 = 1;
 
+    fn p<T>(v: T) -> Parameters<Option<T>> {
+        Parameters(Some(v))
+    }
+
     // ---- Minimal self-contained helpers (public-repo friendly) ----
     //
     // Historically, this repo used workspace-local crates for text normalization, Pareto selection,
@@ -1049,7 +1053,7 @@ mod mcp {
         ids_only: Option<bool>,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebSeedSearchExtractArgs {
         /// Query to use for chunk selection.
         query: String,
@@ -1107,7 +1111,7 @@ mod mcp {
         compact: Option<bool>,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebFetchArgs {
         url: String,
         /// Which fetch backend to use (default: local). Allowed: local, firecrawl
@@ -1143,7 +1147,7 @@ mod mcp {
         include_headers: Option<bool>,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebExtractArgs {
         url: String,
         /// Which fetch backend to use (default: local). Allowed: local, firecrawl
@@ -1210,7 +1214,7 @@ mod mcp {
         semantic_top_k: Option<usize>,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebSearchArgs {
         query: String,
         /// Which provider to use (default: brave). Allowed: auto, brave, tavily, searxng
@@ -1230,7 +1234,7 @@ mod mcp {
         country: Option<String>,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct ArxivSearchArgs {
         /// Search query (required).
         query: String,
@@ -1257,7 +1261,7 @@ mod mcp {
         semantic_top_k: Option<usize>,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct ArxivEnrichArgs {
         /// ArXiv ID (e.g. "0805.3415") or an arxiv.org/abs URL.
         id_or_url: String,
@@ -1272,7 +1276,7 @@ mod mcp {
         timeout_ms: Option<u64>,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebCacheSearchExtractArgs {
         /// Search query (required).
         query: String,
@@ -1326,7 +1330,7 @@ mod mcp {
         compact: Option<bool>,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     pub(crate) struct WebSearchExtractArgs {
         /// Search query. Required unless `urls` is provided.
         #[serde(default)]
@@ -1495,7 +1499,7 @@ mod mcp {
         pub(crate) compact: Option<bool>,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebDeepResearchArgs {
         /// User question / research prompt.
         query: String,
@@ -2733,13 +2737,14 @@ mod mcp {
         )]
         async fn web_seed_urls(
             &self,
-            params: Parameters<WebSeedUrlsArgs>,
+            params: Parameters<Option<WebSeedUrlsArgs>>,
         ) -> Result<CallToolResult, McpError> {
             let t0 = std::time::Instant::now();
             self.stats_inc_tool("web_seed_urls");
-            let max = params.0.max.unwrap_or(25).clamp(1, 50);
-            let include_ids = params.0.include_ids.unwrap_or(true);
-            let ids_only = params.0.ids_only.unwrap_or(false);
+            let args = params.0.unwrap_or_default();
+            let max = args.max.unwrap_or(25).clamp(1, 50);
+            let include_ids = args.include_ids.unwrap_or(true);
+            let ids_only = args.ids_only.unwrap_or(false);
 
             // Curated seed registry (single source of truth).
             let seeds = seed_registry();
@@ -2781,12 +2786,12 @@ mod mcp {
         )]
         async fn web_seed_search_extract(
             &self,
-            params: Parameters<WebSeedSearchExtractArgs>,
+            params: Parameters<Option<WebSeedSearchExtractArgs>>,
         ) -> Result<CallToolResult, McpError> {
             let t0 = std::time::Instant::now();
             self.stats_inc_tool("web_seed_search_extract");
 
-            let args = params.0;
+            let args = params.0.unwrap_or_default();
             let query = args.query.trim().to_string();
             if query.is_empty() {
                 let mut payload = serde_json::json!({
@@ -2855,7 +2860,7 @@ mod mcp {
 
             for (id, url) in urls.iter() {
                 let r = self
-                    .web_extract(Parameters(WebExtractArgs {
+                    .web_extract(p(WebExtractArgs {
                         url: url.clone(),
                         fetch_backend: Some(fetch_backend.clone()),
                         no_network: Some(no_network),
@@ -3002,7 +3007,7 @@ mod mcp {
         #[tool(description = "Report in-process usage/cost stats since server start (no secrets)")]
         async fn webpipe_usage(
             &self,
-            _params: Parameters<WebpipeUsageArgs>,
+            _params: Parameters<Option<WebpipeUsageArgs>>,
         ) -> Result<CallToolResult, McpError> {
             let kind = "webpipe_usage";
             let t0 = std::time::Instant::now();
@@ -3129,9 +3134,9 @@ mod mcp {
         #[tool(description = "Search ArXiv (Atom API) with bounded results")]
         async fn arxiv_search(
             &self,
-            params: Parameters<ArxivSearchArgs>,
+            params: Parameters<Option<ArxivSearchArgs>>,
         ) -> Result<CallToolResult, McpError> {
-            let args = params.0;
+            let args = params.0.unwrap_or_default();
             self.stats_inc_tool("arxiv_search");
             let t0 = std::time::Instant::now();
 
@@ -3245,9 +3250,9 @@ mod mcp {
         #[tool(description = "Fetch ArXiv metadata and optionally find discussion pages (bounded)")]
         async fn arxiv_enrich(
             &self,
-            params: Parameters<ArxivEnrichArgs>,
+            params: Parameters<Option<ArxivEnrichArgs>>,
         ) -> Result<CallToolResult, McpError> {
-            let args = params.0;
+            let args = params.0.unwrap_or_default();
             self.stats_inc_tool("arxiv_enrich");
             let t0 = std::time::Instant::now();
 
@@ -3296,7 +3301,7 @@ mod mcp {
                 // (Extraction can be done separately via `web_search_extract` if desired.)
                 let q = format!("{} discussion", abs_url);
                 let r = self
-                    .web_search(Parameters(WebSearchArgs {
+                    .web_search(p(WebSearchArgs {
                         query: q,
                         provider: Some("auto".to_string()),
                         auto_mode: Some("mab".to_string()),
@@ -3317,9 +3322,9 @@ mod mcp {
         )]
         pub(crate) async fn web_search_extract(
             &self,
-            params: Parameters<WebSearchExtractArgs>,
+            params: Parameters<Option<WebSearchExtractArgs>>,
         ) -> Result<CallToolResult, McpError> {
-            let args = params.0;
+            let args = params.0.unwrap_or_default();
             self.stats_inc_tool("web_search_extract");
             let t0 = std::time::Instant::now();
 
@@ -3606,7 +3611,7 @@ mod mcp {
 
                 // Use our existing web_search tool logic to keep routing/fallback consistent.
                 let sr = self
-                    .web_search(Parameters(WebSearchArgs {
+                    .web_search(p(WebSearchArgs {
                         query: q.clone(),
                         provider: Some(requested_provider.clone()),
                         auto_mode: Some(requested_auto_mode.clone()),
@@ -4051,7 +4056,7 @@ mod mcp {
                     search_rounds = search_rounds.saturating_add(1);
                     let query2 = query.trim().to_string();
                     let sr2 = self
-                        .web_search(Parameters(WebSearchArgs {
+                        .web_search(p(WebSearchArgs {
                             query: query2.clone(),
                             provider: Some(prov2.clone()),
                             auto_mode: Some(auto2.clone()),
@@ -5203,9 +5208,9 @@ mod mcp {
         )]
         async fn web_cache_search_extract(
             &self,
-            params: Parameters<WebCacheSearchExtractArgs>,
+            params: Parameters<Option<WebCacheSearchExtractArgs>>,
         ) -> Result<CallToolResult, McpError> {
-            let args = params.0;
+            let args = params.0.unwrap_or_default();
             self.stats_inc_tool("web_cache_search_extract");
             let t0 = std::time::Instant::now();
 
@@ -5499,9 +5504,9 @@ mod mcp {
         )]
         async fn web_deep_research(
             &self,
-            params: Parameters<WebDeepResearchArgs>,
+            params: Parameters<Option<WebDeepResearchArgs>>,
         ) -> Result<CallToolResult, McpError> {
-            let args = params.0;
+            let args = params.0.unwrap_or_default();
             self.stats_inc_tool("web_deep_research");
             let t0 = std::time::Instant::now();
 
@@ -5699,7 +5704,7 @@ mod mcp {
             }
 
             let evidence_r = self
-                .web_search_extract(Parameters(WebSearchExtractArgs {
+                .web_search_extract(p(WebSearchExtractArgs {
                     query: Some(query.clone()),
                     urls: args.urls.clone(),
                     provider: Some(provider.clone()),
@@ -6569,9 +6574,9 @@ mod mcp {
         )]
         async fn web_fetch(
             &self,
-            params: Parameters<WebFetchArgs>,
+            params: Parameters<Option<WebFetchArgs>>,
         ) -> Result<CallToolResult, McpError> {
-            let args = params.0;
+            let args = params.0.unwrap_or_default();
             self.stats_inc_tool("web_fetch");
             let include_headers = args.include_headers.unwrap_or(false);
             let include_text = args.include_text.unwrap_or(false);
@@ -7028,9 +7033,9 @@ mod mcp {
         )]
         async fn web_search(
             &self,
-            params: Parameters<WebSearchArgs>,
+            params: Parameters<Option<WebSearchArgs>>,
         ) -> Result<CallToolResult, McpError> {
-            let args = params.0;
+            let args = params.0.unwrap_or_default();
             let max_results = args.max_results.unwrap_or(10).clamp(1, 20);
 
             let provider_name = args.provider.unwrap_or_else(|| "brave".to_string());
@@ -8741,9 +8746,9 @@ mod mcp {
         #[tool(description = "Fetch a URL and extract readable text (HTML -> text)")]
         async fn web_extract(
             &self,
-            params: Parameters<WebExtractArgs>,
+            params: Parameters<Option<WebExtractArgs>>,
         ) -> Result<CallToolResult, McpError> {
-            let args = params.0;
+            let args = params.0.unwrap_or_default();
             self.stats_inc_tool("web_extract");
             let width = args.width.unwrap_or(100).clamp(20, 240);
             let max_chars = args.max_chars.unwrap_or(20_000).min(200_000);
@@ -9467,6 +9472,10 @@ mod mcp {
         use super::*;
         use proptest::prelude::*;
 
+        fn p<T>(v: T) -> Parameters<Option<T>> {
+            Parameters(Some(v))
+        }
+
         struct EnvGuard {
             // Hold the lock for the full test (env vars are process-global).
             _lock: std::sync::MutexGuard<'static, ()>,
@@ -9731,7 +9740,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search(Parameters(WebSearchArgs {
+                .web_search(p(WebSearchArgs {
                     query: "q".to_string(),
                     provider: Some("auto".to_string()),
                     auto_mode: Some("fallback".to_string()),
@@ -9765,7 +9774,7 @@ mod mcp {
 
             // brave (not configured)
             let r1 = svc
-                .web_search(Parameters(WebSearchArgs {
+                .web_search(p(WebSearchArgs {
                     query: "q1".to_string(),
                     provider: Some("brave".to_string()),
                     auto_mode: None,
@@ -9787,7 +9796,7 @@ mod mcp {
 
             // tavily (not configured)
             let r2 = svc
-                .web_search(Parameters(WebSearchArgs {
+                .web_search(p(WebSearchArgs {
                     query: "q2".to_string(),
                     provider: Some("tavily".to_string()),
                     auto_mode: None,
@@ -9837,7 +9846,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "test question".to_string(),
                     audit: None,
                     synthesize: None,
@@ -9874,7 +9883,7 @@ mod mcp {
                     include_evidence: Some(true),
                     now_epoch_s: Some(1700000000),
                     llm_backend: None,
-                }))
+                })))
                 .await
                 .expect("call");
 
@@ -9962,7 +9971,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "test question".to_string(),
                     audit: None,
                     synthesize: None,
@@ -9999,7 +10008,7 @@ mod mcp {
                     include_evidence: Some(true),
                     now_epoch_s: Some(1700000000),
                     llm_backend: Some("ollama".to_string()),
-                }))
+                })))
                 .await
                 .expect("call");
 
@@ -10093,7 +10102,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "test question".to_string(),
                     audit: None,
                     synthesize: None,
@@ -10130,7 +10139,7 @@ mod mcp {
                     include_evidence: Some(true),
                     now_epoch_s: Some(1700000000),
                     llm_backend: Some("openai_compat".to_string()),
-                }))
+                })))
                 .await
                 .expect("call");
 
@@ -10159,7 +10168,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "q".to_string(),
                     audit: None,
                     synthesize: None,
@@ -10196,7 +10205,7 @@ mod mcp {
                     include_evidence: Some(false),
                     now_epoch_s: Some(1700000000),
                     llm_backend: Some("openai_compat".to_string()),
-                }))
+                })))
                 .await
                 .expect("call");
 
@@ -10217,7 +10226,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "q".to_string(),
                     audit: Some(true),
                     synthesize: Some(false),
@@ -10254,7 +10263,7 @@ mod mcp {
                     include_evidence: Some(true),
                     now_epoch_s: Some(1700000000),
                     llm_backend: Some("auto".to_string()),
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -10274,7 +10283,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "q".to_string(),
                     audit: Some(true),
                     synthesize: Some(false),
@@ -10311,7 +10320,7 @@ mod mcp {
                     include_evidence: Some(false),
                     now_epoch_s: Some(1700000000),
                     llm_backend: Some("auto".to_string()),
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -10394,7 +10403,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "q".to_string(),
                     audit: Some(true),
                     synthesize: Some(true),
@@ -10431,7 +10440,7 @@ mod mcp {
                     include_evidence: Some(true),
                     now_epoch_s: Some(1700000000),
                     llm_backend: Some("perplexity".to_string()),
-                }))
+                })))
                 .await
                 .expect("call");
 
@@ -10490,7 +10499,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search(Parameters(WebSearchArgs {
+                .web_search(p(WebSearchArgs {
                     provider: Some("auto".to_string()),
                     auto_mode: Some("fallback".to_string()),
                     query: "q".to_string(),
@@ -10568,7 +10577,7 @@ mod mcp {
             }
 
             let r = svc
-                .web_search(Parameters(WebSearchArgs {
+                .web_search(p(WebSearchArgs {
                     provider: Some("auto".to_string()),
                     auto_mode: Some("fallback".to_string()),
                     query: "q".to_string(),
@@ -10642,7 +10651,7 @@ mod mcp {
             // Also provide urls to avoid needing web_search_extract network calls.
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "paper about something".to_string(),
                     audit: None,
                     synthesize: Some(false),
@@ -10679,7 +10688,7 @@ mod mcp {
                     include_evidence: Some(true),
                     now_epoch_s: Some(1700000000),
                     llm_backend: Some("auto".to_string()),
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -10763,7 +10772,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "paper about something".to_string(),
                     audit: None,
                     synthesize: Some(false),
@@ -10800,7 +10809,7 @@ mod mcp {
                     include_evidence: Some(true),
                     now_epoch_s: Some(1700000000),
                     llm_backend: Some("auto".to_string()),
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -10869,7 +10878,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_deep_research(Parameters(WebDeepResearchArgs {
+                .web_deep_research(Parameters(Some(WebDeepResearchArgs {
                     query: "paper about something".to_string(),
                     audit: None,
                     synthesize: Some(true),
@@ -10906,7 +10915,7 @@ mod mcp {
                     include_evidence: Some(true),
                     now_epoch_s: Some(1700000000),
                     llm_backend: Some("ollama".to_string()),
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -10952,7 +10961,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search_extract(Parameters(WebSearchExtractArgs {
+                .web_search_extract(p(WebSearchExtractArgs {
                     query: Some("q".to_string()),
                     urls: Some(vec![url]),
                     url_selection_mode: None,
@@ -11046,7 +11055,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search_extract(Parameters(WebSearchExtractArgs {
+                .web_search_extract(p(WebSearchExtractArgs {
                     query: Some("main content".to_string()),
                     urls: Some(vec![url]),
                     provider: Some("auto".to_string()),
@@ -11134,7 +11143,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search_extract(Parameters(WebSearchExtractArgs {
+                .web_search_extract(p(WebSearchExtractArgs {
                     query: Some("install".to_string()),
                     urls: Some(vec![url_a]),
                     provider: Some("auto".to_string()),
@@ -11215,7 +11224,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search_extract(Parameters(WebSearchExtractArgs {
+                .web_search_extract(p(WebSearchExtractArgs {
                     query: Some("route handlers".to_string()),
                     urls: Some(vec![url]),
                     url_selection_mode: Some("auto".to_string()),
@@ -11307,7 +11316,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search_extract(Parameters(WebSearchExtractArgs {
+                .web_search_extract(p(WebSearchExtractArgs {
                     query: None,
                     urls: Some(vec![url]),
                     url_selection_mode: Some("auto".to_string()),
@@ -11453,7 +11462,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search_extract(Parameters(WebSearchExtractArgs {
+                .web_search_extract(p(WebSearchExtractArgs {
                     query: Some("route handlers".to_string()),
                     urls: Some(vec![landing_url]),
                     url_selection_mode: Some("auto".to_string()),
@@ -11614,7 +11623,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search_extract(Parameters(WebSearchExtractArgs {
+                .web_search_extract(p(WebSearchExtractArgs {
                     query: Some("route handlers".to_string()),
                     urls: Some(vec![landing_url]),
                     url_selection_mode: Some("auto".to_string()),
@@ -11706,7 +11715,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_extract(Parameters(WebExtractArgs {
+                .web_extract(p(WebExtractArgs {
                     url,
                     fetch_backend: Some("local".to_string()),
                     no_network: Some(false),
@@ -11770,7 +11779,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_fetch(Parameters(WebFetchArgs {
+                .web_fetch(p(WebFetchArgs {
                     url,
                     fetch_backend: Some("local".to_string()),
                     no_network: Some(false),
@@ -11854,7 +11863,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search_extract(Parameters(WebSearchExtractArgs {
+                .web_search_extract(p(WebSearchExtractArgs {
                     query: Some("hello".to_string()),
                     urls: Some(vec![url.clone()]),
                     url_selection_mode: None,
@@ -11969,7 +11978,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_extract(Parameters(WebExtractArgs {
+                .web_extract(p(WebExtractArgs {
                     url: "https://example.com/".to_string(),
                     fetch_backend: Some("firecrawl".to_string()),
                     no_network: Some(false),
@@ -12038,7 +12047,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_extract(Parameters(WebExtractArgs {
+                .web_extract(p(WebExtractArgs {
                     url: "https://example.com/".to_string(),
                     fetch_backend: Some("firecrawl".to_string()),
                     no_network: Some(false),
@@ -12197,7 +12206,7 @@ mod mcp {
         async fn web_seed_urls_contract_is_stable_and_bounded() {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_seed_urls(Parameters(WebSeedUrlsArgs {
+                .web_seed_urls(p(WebSeedUrlsArgs {
                     max: Some(2),
                     include_ids: Some(true),
                     ids_only: Some(false),
@@ -12253,7 +12262,7 @@ mod mcp {
 
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_seed_search_extract(Parameters(WebSeedSearchExtractArgs {
+                .web_seed_search_extract(p(WebSeedSearchExtractArgs {
                     query: "unique_b".to_string(),
                     urls: Some(vec![format!("http://{addr}/a"), format!("http://{addr}/b")]),
                     seed_ids: None,
@@ -12335,7 +12344,7 @@ mod mcp {
             // We don't need async: the tool is async, so use a tokio runtime for a minimal call.
             let rt = tokio::runtime::Runtime::new().expect("rt");
             let r = rt
-                .block_on(svc.web_seed_urls(Parameters(WebSeedUrlsArgs {
+                .block_on(svc.web_seed_urls(p(WebSeedUrlsArgs {
                     max: Some(5),
                     include_ids: Some(true),
                     ids_only: Some(true),
@@ -12358,7 +12367,7 @@ mod mcp {
         async fn web_seed_search_extract_rejects_all_unknown_seed_ids() {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_seed_search_extract(Parameters(WebSeedSearchExtractArgs {
+                .web_seed_search_extract(Parameters(Some(WebSeedSearchExtractArgs {
                     query: "anything".to_string(),
                     urls: None,
                     seed_ids: Some(vec!["nope1".to_string(), "nope2".to_string()]),
@@ -12376,7 +12385,7 @@ mod mcp {
                     cache_ttl_s: None,
                     include_text: Some(false),
                     compact: Some(true),
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -12396,14 +12405,14 @@ mod mcp {
             let _env = EnvGuard::new(&SEARCH_ENV_KEYS);
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search(Parameters(WebSearchArgs {
+                .web_search(Parameters(Some(WebSearchArgs {
                     query: "   ".to_string(),
                     provider: Some("brave".to_string()),
                     auto_mode: None,
                     max_results: Some(5),
                     language: None,
                     country: None,
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -12421,14 +12430,14 @@ mod mcp {
             let _env = EnvGuard::new(&SEARCH_ENV_KEYS);
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_search(Parameters(WebSearchArgs {
+                .web_search(Parameters(Some(WebSearchArgs {
                     query: "q".to_string(),
                     provider: Some("nope".to_string()),
                     auto_mode: None,
                     max_results: Some(1),
                     language: None,
                     country: None,
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -12446,7 +12455,7 @@ mod mcp {
             let _env = EnvGuard::new(&["WEBPIPE_CACHE_DIR"]);
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_fetch(Parameters(WebFetchArgs {
+                .web_fetch(Parameters(Some(WebFetchArgs {
                     url: "   ".to_string(),
                     fetch_backend: None,
                     no_network: None,
@@ -12459,7 +12468,7 @@ mod mcp {
                     cache_ttl_s: None,
                     include_headers: None,
                     include_text: None,
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -12475,7 +12484,7 @@ mod mcp {
             let _env = EnvGuard::new(&["WEBPIPE_CACHE_DIR"]);
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
-                .web_extract(Parameters(WebExtractArgs {
+                .web_extract(Parameters(Some(WebExtractArgs {
                     url: "   ".to_string(),
                     fetch_backend: None,
                     no_network: None,
@@ -12498,7 +12507,7 @@ mod mcp {
                     max_block_chars: None,
                     semantic_rerank: None,
                     semantic_top_k: None,
-                }))
+                })))
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
@@ -12720,7 +12729,7 @@ async fn main() -> Result<()> {
                     let mut per_mode: Vec<serde_json::Value> = Vec::new();
                     for m in &selection_modes {
                         let r = svc
-                            .web_search_extract(Parameters(mcp::WebSearchExtractArgs {
+                            .web_search_extract(Parameters(Some(mcp::WebSearchExtractArgs {
                                 query: if q0.trim().is_empty() {
                                     None
                                 } else {
@@ -12766,7 +12775,7 @@ async fn main() -> Result<()> {
                                 agentic_frontier_max: args.agentic_frontier_max,
                                 planner_max_calls: args.planner_max_calls,
                                 compact: None,
-                            }))
+                            })))
                             .await
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
@@ -12841,7 +12850,7 @@ async fn main() -> Result<()> {
                     let mut per_mode: Vec<serde_json::Value> = Vec::new();
                     for m in &selection_modes {
                         let r = svc
-                            .web_search_extract(Parameters(mcp::WebSearchExtractArgs {
+                            .web_search_extract(Parameters(Some(mcp::WebSearchExtractArgs {
                                 query: Some(q.clone()),
                                 urls: None,
                                 provider: Some(args.provider.clone()),
@@ -12883,7 +12892,7 @@ async fn main() -> Result<()> {
                                 agentic_frontier_max: args.agentic_frontier_max,
                                 planner_max_calls: args.planner_max_calls,
                                 compact: None,
-                            }))
+                            })))
                             .await
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
