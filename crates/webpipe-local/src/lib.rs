@@ -50,12 +50,19 @@ impl FsCache {
     }
 
     fn key_for_fetch(req: &FetchRequest) -> String {
+        Self::key_for_fetch_v2(req)
+    }
+
+    fn key_for_fetch_v2(req: &FetchRequest) -> String {
         // Deterministic key: url + relevant knobs. Keep it stable and readable-ish.
         let mut h = Sha256::new();
         h.update(b"url:");
         h.update(req.url.as_bytes());
         h.update(b"\nmax_bytes:");
-        h.update(req.max_bytes.unwrap_or(0).to_string().as_bytes());
+        match req.max_bytes {
+            Some(n) => h.update(n.to_string().as_bytes()),
+            None => h.update(b"none"),
+        }
         h.update(b"\nheaders:");
         let allow_unsafe = matches!(
             std::env::var("WEBPIPE_ALLOW_UNSAFE_HEADERS")
@@ -85,6 +92,41 @@ impl FsCache {
         hex::encode(h.finalize())
     }
 
+    fn key_for_fetch_legacy_v1(req: &FetchRequest) -> String {
+        // Legacy key function kept for backwards-compatible cache reads.
+        // It treated max_bytes=None as "0", which collides with max_bytes=Some(0).
+        let mut h = Sha256::new();
+        h.update(b"url:");
+        h.update(req.url.as_bytes());
+        h.update(b"\nmax_bytes:");
+        h.update(req.max_bytes.unwrap_or(0).to_string().as_bytes());
+        h.update(b"\nheaders:");
+        let allow_unsafe = matches!(
+            std::env::var("WEBPIPE_ALLOW_UNSAFE_HEADERS")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        for (k, v) in &req.headers {
+            if !allow_unsafe {
+                let kl = k.trim().to_ascii_lowercase();
+                if matches!(
+                    kl.as_str(),
+                    "authorization" | "cookie" | "proxy-authorization"
+                ) {
+                    continue;
+                }
+            }
+            h.update(k.as_bytes());
+            h.update(b"=");
+            h.update(v.as_bytes());
+            h.update(b"\n");
+        }
+        hex::encode(h.finalize())
+    }
+
     fn paths(&self, key: &str) -> (PathBuf, PathBuf) {
         let dir = self.root.join(&key[0..2]).join(&key[2..4]);
         let meta = dir.join(format!("{key}.json"));
@@ -96,12 +138,27 @@ impl FsCache {
         if !req.cache.read {
             return Ok(None);
         }
-        let key = Self::key_for_fetch(req);
-        let (meta_p, body_p) = self.paths(&key);
-        if !meta_p.exists() || !body_p.exists() {
-            return Ok(None);
-        }
-        let meta_bytes = fs::read(&meta_p).map_err(|e| Error::Cache(e.to_string()))?;
+        let key_v2 = Self::key_for_fetch_v2(req);
+        let (meta_p, body_p) = self.paths(&key_v2);
+        let (meta_bytes, body, used_legacy_key) = if meta_p.exists() && body_p.exists() {
+            (
+                fs::read(&meta_p).map_err(|e| Error::Cache(e.to_string()))?,
+                fs::read(&body_p).map_err(|e| Error::Cache(e.to_string()))?,
+                false,
+            )
+        } else {
+            let key_legacy = Self::key_for_fetch_legacy_v1(req);
+            let (meta_p2, body_p2) = self.paths(&key_legacy);
+            if !meta_p2.exists() || !body_p2.exists() {
+                return Ok(None);
+            }
+            (
+                fs::read(&meta_p2).map_err(|e| Error::Cache(e.to_string()))?,
+                fs::read(&body_p2).map_err(|e| Error::Cache(e.to_string()))?,
+                true,
+            )
+        };
+
         let mut meta: serde_json::Value =
             serde_json::from_slice(&meta_bytes).map_err(|e| Error::Cache(e.to_string()))?;
         let fetched_at = meta
@@ -117,7 +174,6 @@ impl FsCache {
                 return Ok(None);
             }
         }
-        let body = fs::read(&body_p).map_err(|e| Error::Cache(e.to_string()))?;
 
         // Re-hydrate minimal response.
         let status = meta.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
@@ -149,7 +205,7 @@ impl FsCache {
             }
         }
 
-        Ok(Some(FetchResponse {
+        let out = FetchResponse {
             url,
             final_url,
             status,
@@ -159,7 +215,16 @@ impl FsCache {
             truncated,
             source: FetchSource::Cache,
             timings_ms: BTreeMap::new(),
-        }))
+        };
+
+        // Best-effort migration: if we hit via a legacy key and writes are enabled,
+        // copy into the v2 key space so future reads are fast and unambiguous.
+        if used_legacy_key && req.cache.write {
+            // Ignore errors: migration should not fail the read path.
+            let _ = self.put(req, &out);
+        }
+
+        Ok(Some(out))
     }
 
     pub fn put(&self, req: &FetchRequest, resp: &FetchResponse) -> Result<()> {
@@ -736,5 +801,79 @@ mod tests {
             headers.contains_key("content-type"),
             "cache meta should keep content-type"
         );
+    }
+
+    #[test]
+    fn cache_key_v2_distinguishes_none_from_zero() {
+        let base = FetchRequest {
+            url: "https://example.com/".to_string(),
+            timeout_ms: None,
+            max_bytes: None,
+            headers: BTreeMap::new(),
+            cache: FetchCachePolicy {
+                read: true,
+                write: true,
+                ttl_s: None,
+            },
+        };
+        let mut none = base.clone();
+        none.max_bytes = None;
+        let mut zero = base.clone();
+        zero.max_bytes = Some(0);
+
+        let k2_none = FsCache::key_for_fetch_v2(&none);
+        let k2_zero = FsCache::key_for_fetch_v2(&zero);
+        assert_ne!(k2_none, k2_zero, "v2 must distinguish None vs Some(0)");
+
+        let k1_none = FsCache::key_for_fetch_legacy_v1(&none);
+        let k1_zero = FsCache::key_for_fetch_legacy_v1(&zero);
+        assert_eq!(
+            k1_none, k1_zero,
+            "legacy v1 treated None and Some(0) as identical"
+        );
+    }
+
+    #[test]
+    fn cache_get_reads_legacy_v1_key_and_migrates_to_v2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = FsCache::new(tmp.path().to_path_buf());
+
+        let req = FetchRequest {
+            url: "https://example.com/".to_string(),
+            timeout_ms: None,
+            max_bytes: None, // legacy collision case
+            headers: BTreeMap::new(),
+            cache: FetchCachePolicy {
+                read: true,
+                write: true, // enable migration
+                ttl_s: None,
+            },
+        };
+
+        // Manually write a legacy v1 cache entry.
+        let legacy_key = FsCache::key_for_fetch_legacy_v1(&req);
+        let (meta_p, body_p) = cache.paths(&legacy_key);
+        std::fs::create_dir_all(meta_p.parent().unwrap()).unwrap();
+        std::fs::write(&body_p, b"hello").unwrap();
+        let meta = serde_json::json!({
+            "schema_version": 1,
+            "fetched_at_epoch_s": 0,
+            "url": req.url,
+            "final_url": "https://example.com/".to_string(),
+            "status": 200,
+            "content_type": "text/plain",
+            "headers": { "content-type": "text/plain", "set-cookie": "secret" },
+            "truncated": false,
+        });
+        std::fs::write(&meta_p, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let got = cache.get(&req).unwrap().expect("expected legacy cache hit");
+        assert_eq!(got.bytes, b"hello");
+
+        // The read should migrate into v2 key space.
+        let v2_key = FsCache::key_for_fetch_v2(&req);
+        let (meta2_p, body2_p) = cache.paths(&v2_key);
+        assert!(meta2_p.exists(), "expected v2 meta to be written");
+        assert!(body2_p.exists(), "expected v2 body to be written");
     }
 }
