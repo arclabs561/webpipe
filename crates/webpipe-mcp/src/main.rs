@@ -316,6 +316,9 @@ struct EvalMatrixRunCmd {
     /// Optional git SHA to include in the run manifest (best-effort if omitted).
     #[arg(long)]
     git_sha: Option<String>,
+    /// Output format: json|text
+    #[arg(long = "output", alias = "format", default_value = "text")]
+    output: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -13959,8 +13962,10 @@ async fn main() -> Result<()> {
                 }
             });
             std::fs::write(&manifest_out, serde_json::to_string_pretty(&manifest)? + "\n")?;
-
-            println!("{}", judge_out.display());
+            match args.output.to_ascii_lowercase().as_str() {
+                "json" => println!("{}", serde_json::to_string(&manifest)?),
+                _ => println!("{}", judge_out.display()),
+            }
         }
         Commands::Doctor(args) => {
             fn has_env(k: &str) -> bool {
