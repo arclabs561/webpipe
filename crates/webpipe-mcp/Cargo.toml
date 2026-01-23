@@ -16,6 +16,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dirs = "5.0"
 rmcp = { version = "0.12.0", optional = true, features = ["macros", "server", "client", "transport-io", "transport-child-process", "schemars"] }
 schemars = { version = "1.2.0", optional = true, features = ["derive"] }
 

@@ -673,6 +673,14 @@ mod mcp {
         std::env::var("WEBPIPE_CACHE_DIR").ok().map(PathBuf::from)
     }
 
+    fn default_cache_dir() -> PathBuf {
+        // Prefer a persistent per-user cache directory (so warm-cache + no_network works across
+        // restarts), with a temp-dir fallback.
+        dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("webpipe-cache")
+    }
+
     fn has_env(k: &str) -> bool {
         std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty())
     }
@@ -1666,7 +1674,7 @@ mod mcp {
     impl WebpipeMcp {
         pub(crate) fn new() -> Result<Self, McpError> {
             let cache_dir =
-                cache_dir_from_env().or_else(|| Some(std::env::temp_dir().join("webpipe-cache")));
+                cache_dir_from_env().or_else(|| Some(default_cache_dir()));
             let fetcher = LocalFetcher::new(cache_dir)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             Ok(Self {
@@ -12919,7 +12927,11 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::temp_dir().join("webpipe-cache"));
+                .unwrap_or_else(|| {
+                    dirs::cache_dir()
+                        .unwrap_or_else(std::env::temp_dir)
+                        .join("webpipe-cache")
+                });
 
             let mut checks: Vec<serde_json::Value> = Vec::new();
 
