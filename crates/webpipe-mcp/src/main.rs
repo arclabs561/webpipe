@@ -34,6 +34,11 @@ enum Commands {
     EvalMatrixExport(EvalMatrixExportCmd),
     /// Deterministic baseline judge over exported eval-matrix examples (json).
     EvalMatrixJudge(EvalMatrixJudgeCmd),
+    /// Run eval-matrix -> score -> export -> judge (one-shot).
+    ///
+    /// This is a convenience wrapper that invokes the existing subcommands with explicit
+    /// artifact paths, so you can run a full end-to-end evaluation with one call.
+    EvalMatrixRun(EvalMatrixRunCmd),
     /// Diagnose configuration/launch issues (json; no secrets).
     Doctor(DoctorCmd),
     /// Print version info.
@@ -271,6 +276,40 @@ struct EvalMatrixJudgeCmd {
     /// Output JSON path (default: .generated/webpipe-eval-matrix-judge-<epoch>.json)
     #[arg(long)]
     out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+struct EvalMatrixRunCmd {
+    /// E2E query dataset (json), e.g. `crates/webpipe-mcp/fixtures/e2e_queries_v1.json`.
+    #[arg(long)]
+    queries_json: std::path::PathBuf,
+    /// E2E qrels file (json), e.g. `crates/webpipe-mcp/fixtures/e2e_qrels_v1.json`.
+    #[arg(long)]
+    qrels: std::path::PathBuf,
+    /// Base URL used to expand `url_paths` entries in the dataset.
+    #[arg(long)]
+    base_url: String,
+    /// Provider to use for the "search" leg. Allowed: auto, brave, tavily, searxng
+    #[arg(long, default_value = "searxng")]
+    provider: String,
+    /// When provider="auto", choose routing mode. Allowed: fallback, merge, mab
+    #[arg(long, default_value = "fallback")]
+    auto_mode: String,
+    /// How to select `top_chunks` across URLs. Allowed: score, pareto
+    #[arg(long, default_value = "score")]
+    selection_mode: String,
+    /// Which fetch backend to use. Allowed: local, firecrawl
+    #[arg(long, default_value = "local")]
+    fetch_backend: String,
+    /// Output directory for all artifacts (default: .generated).
+    #[arg(long)]
+    out_dir: Option<std::path::PathBuf>,
+    /// Max characters per exported judge_text (keeps artifacts bounded).
+    #[arg(long, default_value_t = 4000)]
+    max_text_chars: usize,
     /// Override "now" for deterministic outputs.
     #[arg(long)]
     now_epoch_s: Option<u64>,
@@ -13765,6 +13804,116 @@ async fn main() -> Result<()> {
 
             std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
             println!("{}", out.display());
+        }
+        Commands::EvalMatrixRun(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let now_s = now.to_string();
+            let out_dir = args
+                .out_dir
+                .unwrap_or_else(|| std::path::PathBuf::from(".generated"));
+            std::fs::create_dir_all(&out_dir)?;
+
+            let matrix_out = out_dir.join(format!("webpipe-eval-matrix-run-{now}.jsonl"));
+            let score_out = out_dir.join(format!("webpipe-eval-matrix-score-run-{now}.json"));
+            let export_out = out_dir.join(format!("webpipe-eval-matrix-export-run-{now}.jsonl"));
+            let judge_out = out_dir.join(format!("webpipe-eval-matrix-judge-run-{now}.json"));
+
+            let exe = std::env::current_exe()?;
+            let queries_json = args.queries_json.to_string_lossy().to_string();
+            let qrels = args.qrels.to_string_lossy().to_string();
+            let matrix_out_s = matrix_out.to_string_lossy().to_string();
+            let score_out_s = score_out.to_string_lossy().to_string();
+            let export_out_s = export_out.to_string_lossy().to_string();
+            let judge_out_s = judge_out.to_string_lossy().to_string();
+            let max_text_chars_s = args.max_text_chars.to_string();
+
+            fn run(mut cmd: std::process::Command) -> Result<()> {
+                let out = cmd.output()?;
+                if !out.status.success() {
+                    let code = out.status.code().unwrap_or(-1);
+                    anyhow::bail!(
+                        "command failed (exit={code}):\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                Ok(())
+            }
+
+            // 1) eval-matrix
+            let mut c = std::process::Command::new(&exe);
+            c.args([
+                "eval-matrix",
+                "--queries-json",
+                &queries_json,
+                "--base-url",
+                &args.base_url,
+                "--provider",
+                &args.provider,
+                "--auto-mode",
+                &args.auto_mode,
+                "--selection-mode",
+                &args.selection_mode,
+                "--fetch-backend",
+                &args.fetch_backend,
+                "--out",
+                &matrix_out_s,
+                "--now-epoch-s",
+                &now_s,
+            ]);
+            run(c)?;
+
+            // 2) eval-matrix-score
+            let mut c = std::process::Command::new(&exe);
+            c.args([
+                "eval-matrix-score",
+                "--matrix-artifact",
+                &matrix_out_s,
+                "--qrels",
+                &qrels,
+                "--out",
+                &score_out_s,
+                "--now-epoch-s",
+                &now_s,
+            ]);
+            run(c)?;
+
+            // 3) eval-matrix-export
+            let mut c = std::process::Command::new(&exe);
+            c.args([
+                "eval-matrix-export",
+                "--matrix-artifact",
+                &matrix_out_s,
+                "--qrels",
+                &qrels,
+                "--max-text-chars",
+                &max_text_chars_s,
+                "--out",
+                &export_out_s,
+                "--now-epoch-s",
+                &now_s,
+            ]);
+            run(c)?;
+
+            // 4) eval-matrix-judge
+            let mut c = std::process::Command::new(&exe);
+            c.args([
+                "eval-matrix-judge",
+                "--examples-artifact",
+                &export_out_s,
+                "--out",
+                &judge_out_s,
+                "--now-epoch-s",
+                &now_s,
+            ]);
+            run(c)?;
+
+            println!("{}", judge_out.display());
         }
         Commands::Doctor(args) => {
             fn has_env(k: &str) -> bool {
