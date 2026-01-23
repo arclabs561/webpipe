@@ -32,6 +32,23 @@ impl FsCache {
         Self { root }
     }
 
+    fn cache_meta_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        // Cache metadata should be privacy-safe. Avoid persisting sensitive headers like Set-Cookie.
+        //
+        // We intentionally keep this allowlist small and expand only when a new field is proven
+        // useful and safe.
+        let mut out = BTreeMap::new();
+        for (k, v) in headers {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "content-type" | "content-length" | "etag" | "last-modified" | "cache-control" => {
+                    out.insert(k.clone(), v.clone());
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     fn key_for_fetch(req: &FetchRequest) -> String {
         // Deterministic key: url + relevant knobs. Keep it stable and readable-ish.
         let mut h = Sha256::new();
@@ -166,7 +183,7 @@ impl FsCache {
             "final_url": resp.final_url,
             "status": resp.status,
             "content_type": resp.content_type,
-            "headers": resp.headers,
+            "headers": Self::cache_meta_headers(&resp.headers),
             "truncated": resp.truncated,
         });
 
@@ -408,6 +425,7 @@ mod tests {
     use super::*;
     use axum::{http::header, http::StatusCode, routing::get, Router};
     use std::net::SocketAddr;
+    use std::path::Path;
     use std::sync::Mutex;
     use webpipe_core::FetchCachePolicy;
 
@@ -645,5 +663,78 @@ mod tests {
         }
 
         std::env::remove_var("WEBPIPE_ALLOW_UNSAFE_HEADERS");
+    }
+
+    fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_files_recursively(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_meta_does_not_persist_set_cookie() {
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/plain"),
+                        (header::SET_COOKIE, "session=secret"),
+                    ],
+                    "hello",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fetcher = LocalFetcher::new(Some(tmp.path().to_path_buf())).unwrap();
+
+        let req = FetchRequest {
+            url: format!("http://{}/", addr),
+            timeout_ms: Some(2_000),
+            max_bytes: Some(100_000),
+            headers: BTreeMap::new(),
+            cache: FetchCachePolicy {
+                read: true,
+                write: true,
+                ttl_s: Some(60),
+            },
+        };
+
+        let r1 = fetcher.fetch(&req).await.unwrap();
+        assert_eq!(r1.source, FetchSource::Network);
+
+        let mut files = Vec::new();
+        collect_files_recursively(tmp.path(), &mut files);
+        let metas: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        assert_eq!(metas.len(), 1, "expected one cache meta json file");
+
+        let bytes = std::fs::read(&metas[0]).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let headers = v.get("headers").and_then(|h| h.as_object()).unwrap();
+        assert!(
+            !headers.contains_key("set-cookie"),
+            "cache meta must not persist set-cookie"
+        );
+        assert!(
+            headers.contains_key("content-type"),
+            "cache meta should keep content-type"
+        );
     }
 }
