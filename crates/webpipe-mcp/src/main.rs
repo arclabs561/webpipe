@@ -313,6 +313,9 @@ struct EvalMatrixRunCmd {
     /// Override "now" for deterministic outputs.
     #[arg(long)]
     now_epoch_s: Option<u64>,
+    /// Optional git SHA to include in the run manifest (best-effort if omitted).
+    #[arg(long)]
+    git_sha: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -13822,6 +13825,7 @@ async fn main() -> Result<()> {
             let score_out = out_dir.join(format!("webpipe-eval-matrix-score-run-{now}.json"));
             let export_out = out_dir.join(format!("webpipe-eval-matrix-export-run-{now}.jsonl"));
             let judge_out = out_dir.join(format!("webpipe-eval-matrix-judge-run-{now}.json"));
+            let manifest_out = out_dir.join(format!("webpipe-eval-matrix-manifest-run-{now}.json"));
 
             let exe = std::env::current_exe()?;
             let queries_json = args.queries_json.to_string_lossy().to_string();
@@ -13843,6 +13847,22 @@ async fn main() -> Result<()> {
                     );
                 }
                 Ok(())
+            }
+
+            fn best_effort_git_sha() -> Option<String> {
+                let out = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .ok()?;
+                if !out.status.success() {
+                    return None;
+                }
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
             }
 
             // 1) eval-matrix
@@ -13912,6 +13932,33 @@ async fn main() -> Result<()> {
                 &now_s,
             ]);
             run(c)?;
+
+            let git_sha = args.git_sha.clone().or_else(best_effort_git_sha);
+            let manifest = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_matrix_run_manifest",
+                "generated_at_epoch_s": now,
+                "inputs": {
+                    "queries_json": args.queries_json,
+                    "qrels": args.qrels,
+                    "base_url": args.base_url,
+                    "provider": args.provider,
+                    "auto_mode": args.auto_mode,
+                    "selection_mode": args.selection_mode,
+                    "fetch_backend": args.fetch_backend,
+                    "max_text_chars": args.max_text_chars
+                },
+                "git": {
+                    "sha": git_sha
+                },
+                "artifacts": {
+                    "matrix": matrix_out,
+                    "score": score_out,
+                    "export": export_out,
+                    "judge": judge_out
+                }
+            });
+            std::fs::write(&manifest_out, serde_json::to_string_pretty(&manifest)? + "\n")?;
 
             println!("{}", judge_out.display());
         }

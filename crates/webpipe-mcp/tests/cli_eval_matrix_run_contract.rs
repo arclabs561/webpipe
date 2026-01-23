@@ -93,5 +93,17 @@ fn webpipe_eval_matrix_run_contract_stubbed_localhost() {
     let raw = std::fs::read_to_string(&judge_path).expect("judge exists");
     let v: serde_json::Value = serde_json::from_str(&raw).expect("json");
     assert_eq!(v["kind"].as_str(), Some("webpipe_eval_matrix_judge"));
+
+    let manifest_path = out_dir.join("webpipe-eval-matrix-manifest-run-1700000000.json");
+    let raw = std::fs::read_to_string(&manifest_path).expect("manifest exists");
+    let mv: serde_json::Value = serde_json::from_str(&raw).expect("json");
+    assert_eq!(
+        mv["kind"].as_str(),
+        Some("webpipe_eval_matrix_run_manifest")
+    );
+    assert_eq!(
+        mv["artifacts"]["judge"].as_str(),
+        Some(judge_path.to_str().unwrap())
+    );
 }
 
