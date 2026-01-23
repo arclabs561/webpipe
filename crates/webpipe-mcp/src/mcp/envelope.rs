@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
     match code {
         "cache_only" => Some(
@@ -113,11 +115,28 @@ pub(crate) fn error_obj(
     message: impl ToString,
     hint: impl ToString,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "code": code.as_str(),
-        "message": message.to_string(),
-        "hint": hint.to_string(),
-        "retryable": code.retryable()
-    })
+    #[derive(Serialize)]
+    struct ErrorObject {
+        code: &'static str,
+        message: String,
+        hint: String,
+        retryable: bool,
+    }
+
+    let e = ErrorObject {
+        code: code.as_str(),
+        message: message.to_string(),
+        hint: hint.to_string(),
+        retryable: code.retryable(),
+    };
+    match serde_json::to_value(e) {
+        Ok(v) => v,
+        Err(_) => serde_json::json!({
+            "code": code.as_str(),
+            "message": message.to_string(),
+            "hint": hint.to_string(),
+            "retryable": code.retryable()
+        }),
+    }
 }
 
