@@ -197,6 +197,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(v.get("max_results").and_then(|x| x.as_u64()).is_some());
     }
 
+    // Some IDE clients send missing args even for required-arg tools. Ensure this does not become
+    // a transport-level -32602; it should return ok=false + invalid_params in-band.
+    let search_no_args = service
+        .call_tool(CallToolRequestParam {
+            name: "web_search".into(),
+            arguments: None,
+        })
+        .await?;
+    println!("web_search(no args): {:?}", search_no_args.is_error);
+    if let Some(s) = first_text(&search_no_args) {
+        let v: serde_json::Value = serde_json::from_str(s)?;
+        assert_eq!(v["schema_version"].as_u64(), Some(1));
+        assert_eq!(v["kind"].as_str(), Some("web_search"));
+        assert_eq!(v["ok"].as_bool(), Some(false));
+        assert_eq!(v["error"]["code"].as_str(), Some("invalid_params"));
+    }
+
     // Offline mode: urls provided, no paid search required.
     let search_extract = service
         .call_tool(CallToolRequestParam {
