@@ -673,7 +673,7 @@ mod mcp {
         std::env::var("WEBPIPE_CACHE_DIR").ok().map(PathBuf::from)
     }
 
-    fn default_cache_dir() -> PathBuf {
+    pub(crate) fn default_cache_dir() -> PathBuf {
         // Prefer a persistent per-user cache directory (so warm-cache + no_network works across
         // restarts), with a temp-dir fallback.
         dirs::cache_dir()
@@ -12927,11 +12927,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    dirs::cache_dir()
-                        .unwrap_or_else(std::env::temp_dir)
-                        .join("webpipe-cache")
-                });
+                .unwrap_or_else(mcp::default_cache_dir);
 
             let mut checks: Vec<serde_json::Value> = Vec::new();
 
