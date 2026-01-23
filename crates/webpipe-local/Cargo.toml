@@ -27,6 +27,7 @@ quick-xml = "0.37"
 
 [dev-dependencies]
 axum = "0.7"
+proptest = "1.9"
 
 [features]
 default = []

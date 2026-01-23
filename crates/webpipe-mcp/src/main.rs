@@ -9617,6 +9617,20 @@ mod mcp {
             }
 
             #[test]
+            fn query_key_scrub_output_is_ascii_normalized(s in any::<String>()) {
+                if let Some(k) = WebpipeMcp::query_key(&s) {
+                    // scrub() is documented as ASCII-lowercase + whitespace-normalized.
+                    prop_assert!(k.is_ascii());
+                    prop_assert!(!k.starts_with(' '));
+                    prop_assert!(!k.ends_with(' '));
+                    prop_assert!(!k.contains("  "));
+                    for ch in k.chars() {
+                        prop_assert!(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == ' ');
+                    }
+                }
+            }
+
+            #[test]
             fn pareto_selection_is_bounded_and_deterministic(
                 urls in prop::collection::vec(any::<String>(), 0..30),
                 scores in prop::collection::vec(any::<u64>(), 0..30),
@@ -9650,6 +9664,77 @@ mod mcp {
                 let sa: Vec<_> = a.iter().map(sig).collect();
                 let sb: Vec<_> = b.iter().map(sig).collect();
                 prop_assert_eq!(sa, sb);
+            }
+
+            #[test]
+            fn score_selection_is_sorted_and_deterministic(
+                urls in prop::collection::vec(any::<String>(), 0..30),
+                scores in prop::collection::vec(any::<u64>(), 0..30),
+                texts in prop::collection::vec(any::<String>(), 0..30),
+                warnings in prop::collection::vec(0usize..6, 0..30),
+                cache_hits in prop::collection::vec(any::<bool>(), 0..30),
+                top_k in 1usize..10,
+            ) {
+                let n = urls.len().min(scores.len()).min(texts.len()).min(warnings.len()).min(cache_hits.len());
+                let mut cands = Vec::new();
+                for i in 0..n {
+                    let start = i;
+                    let end = i.saturating_add(1);
+                    cands.push(ChunkCandidate{
+                        url: urls[i].clone(),
+                        score: scores[i],
+                        start_char: start,
+                        end_char: end,
+                        text: texts[i].clone(),
+                        warnings_count: warnings[i],
+                        cache_hit: cache_hits[i],
+                    });
+                }
+
+                let a = WebpipeMcp::select_top_chunks(cands.clone(), top_k, "score");
+                let b = WebpipeMcp::select_top_chunks(cands.clone(), top_k, "score");
+
+                prop_assert!(a.len() <= top_k);
+                prop_assert_eq!(a.len(), b.len());
+
+                // Deterministic signature.
+                let sig = |c: &ChunkCandidate| (c.url.clone(), c.start_char, c.end_char, WebpipeMcp::score_key(c.score));
+                let sa: Vec<_> = a.iter().map(sig).collect();
+                let sb: Vec<_> = b.iter().map(sig).collect();
+                prop_assert_eq!(sa, sb);
+
+                // Sorted by (score desc, url asc, start_char asc) per implementation.
+                for w in a.windows(2) {
+                    let x = &w[0];
+                    let y = &w[1];
+                    let kx = (-(WebpipeMcp::score_key(x.score)), x.url.clone(), x.start_char);
+                    let ky = (-(WebpipeMcp::score_key(y.score)), y.url.clone(), y.start_char);
+                    prop_assert!(kx <= ky);
+                }
+            }
+
+            #[test]
+            fn error_obj_has_stable_shape(msg in any::<String>(), hint in any::<String>()) {
+                let codes = [
+                    ErrorCode::InvalidParams,
+                    ErrorCode::InvalidUrl,
+                    ErrorCode::NotConfigured,
+                    ErrorCode::NotSupported,
+                    ErrorCode::ProviderUnavailable,
+                    ErrorCode::FetchFailed,
+                    ErrorCode::SearchFailed,
+                    ErrorCode::CacheError,
+                    ErrorCode::UnexpectedError,
+                ];
+
+                for code in codes {
+                    let v = error_obj(code, &msg, &hint);
+                    prop_assert!(v.is_object());
+                    prop_assert_eq!(v.get("code").and_then(|x| x.as_str()), Some(code.as_str()));
+                    prop_assert!(v.get("message").and_then(|x| x.as_str()).is_some());
+                    prop_assert!(v.get("hint").and_then(|x| x.as_str()).is_some());
+                    prop_assert!(v.get("retryable").and_then(|x| x.as_bool()).is_some());
+                }
             }
         }
 

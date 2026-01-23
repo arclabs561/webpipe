@@ -489,6 +489,7 @@ impl FetchBackend for LocalFetcher {
 mod tests {
     use super::*;
     use axum::{http::header, http::StatusCode, routing::get, Router};
+    use proptest::prelude::*;
     use std::net::SocketAddr;
     use std::path::Path;
     use std::sync::Mutex;
@@ -875,5 +876,66 @@ mod tests {
         let (meta2_p, body2_p) = cache.paths(&v2_key);
         assert!(meta2_p.exists(), "expected v2 meta to be written");
         assert!(body2_p.exists(), "expected v2 body to be written");
+    }
+
+    proptest! {
+        #[test]
+        fn key_for_fetch_v2_is_hex_and_never_panics(
+            url in any::<String>(),
+            max_bytes in proptest::option::of(any::<u64>()),
+            hdr_pairs in prop::collection::vec((any::<String>(), any::<String>()), 0..20),
+        ) {
+            let mut headers = BTreeMap::new();
+            for (k, v) in hdr_pairs {
+                headers.insert(k, v);
+            }
+            let req = FetchRequest {
+                url,
+                timeout_ms: None,
+                max_bytes,
+                headers,
+                cache: FetchCachePolicy { read: true, write: true, ttl_s: None },
+            };
+
+            let k = FsCache::key_for_fetch_v2(&req);
+            prop_assert_eq!(k.len(), 64);
+            prop_assert!(k.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+
+            // And the path derivation should not panic for keys we generate.
+            let cache = FsCache::new(std::env::temp_dir().join("webpipe-proptest-cache"));
+            let (_meta, _body) = cache.paths(&k);
+        }
+
+        #[test]
+        fn cache_meta_headers_never_persists_set_cookie(
+            other_pairs in prop::collection::vec((any::<String>(), any::<String>()), 0..20),
+            set_cookie_val in any::<String>(),
+        ) {
+            let mut headers = BTreeMap::new();
+            // Random other headers.
+            for (k, v) in other_pairs {
+                headers.insert(k, v);
+            }
+            // Adversarial variants of Set-Cookie.
+            headers.insert("Set-Cookie".to_string(), set_cookie_val.clone());
+            headers.insert(" set-cookie ".to_string(), set_cookie_val.clone());
+            headers.insert("SET-COOKIE".to_string(), set_cookie_val);
+
+            let out = FsCache::cache_meta_headers(&headers);
+            for k in out.keys() {
+                prop_assert_ne!(k.trim().to_ascii_lowercase(), "set-cookie");
+            }
+            // Allowlist invariant: every stored key must be one of the allowlisted header names.
+            for k in out.keys() {
+                let kl = k.trim().to_ascii_lowercase();
+                prop_assert!(
+                    matches!(
+                        kl.as_str(),
+                        "content-type" | "content-length" | "etag" | "last-modified" | "cache-control"
+                    ),
+                    "unexpected cached meta header key: {kl}"
+                );
+            }
+        }
     }
 }
