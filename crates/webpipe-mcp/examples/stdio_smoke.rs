@@ -90,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         for must_have in [
             "webpipe_meta",
+            "web_seed_urls",
             "web_fetch",
             "web_extract",
             "web_search",
@@ -100,6 +101,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("missing tool {must_have}").into());
             }
         }
+    }
+
+    // Seed urls should work offline and return stable ids.
+    let seed_urls = service
+        .call_tool(CallToolRequestParam {
+            name: "web_seed_urls".into(),
+            arguments: Some(
+                serde_json::json!({"max": 3, "ids_only": true})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        })
+        .await?;
+    println!("web_seed_urls: {:?}", seed_urls.is_error);
+    if let Some(s) = first_text(&seed_urls) {
+        let v: serde_json::Value = serde_json::from_str(s)?;
+        assert_eq!(v["schema_version"].as_u64(), Some(1));
+        assert_eq!(v["kind"].as_str(), Some("web_seed_urls"));
+        assert_eq!(v["ok"].as_bool(), Some(true));
+        assert_eq!(v["max"].as_u64(), Some(3));
+        assert!(v["ids"].is_array());
+        assert!(v["seeds"].is_array());
+        // ids_only should omit kind/note in seeds entries.
+        let seeds = v["seeds"].as_array().unwrap();
+        assert_eq!(seeds.len(), 3);
+        assert!(seeds[0].get("kind").is_none());
+        assert!(seeds[0].get("note").is_none());
     }
 
     // Meta should always work offline and without keys.

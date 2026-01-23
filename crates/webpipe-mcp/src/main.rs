@@ -791,6 +791,8 @@ mod mcp {
     fn warning_hint(code: &'static str) -> Option<&'static str> {
         match code {
             "cache_only" => Some("This result was served from cache (no_network=true). To refresh, set no_network=false."),
+            "no_network_may_require_warm_cache" => Some("no_network=true: some URLs could not be fetched from cache. Pre-warm cache with web_fetch (no_network=false, cache_write=true), then retry with no_network=true."),
+            "unknown_seed_id" => Some("Some seed_ids were not recognized. Call web_seed_urls to see valid ids, or pass urls=[...] explicitly."),
             "empty_extraction" => Some("The response had bytes but extracted text was empty. Consider switching fetch_backend (local vs firecrawl) or increasing max_bytes."),
             "image_no_text_extraction" => Some("This is an image and no text/OCR backend is available in this environment (tesseract/vision)."),
             "links_unavailable" => Some("Link extraction is unavailable for this backend/content type (e.g. firecrawl or pdf)."),
@@ -883,6 +885,122 @@ mod mcp {
         msg.contains(&format!("HTTP {code}")) || msg.contains(&format!("{code} Too Many Requests"))
     }
 
+    fn parse_searxng_arm(name: &str) -> Option<usize> {
+        name.strip_prefix("searxng#")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct SeedSpec {
+        id: &'static str,
+        url: &'static str,
+        kind: &'static str,
+        note: &'static str,
+    }
+
+    fn seed_registry() -> &'static [SeedSpec] {
+        &[
+            SeedSpec {
+                id: "public-apis",
+                url: "https://raw.githubusercontent.com/public-apis/public-apis/master/README.md",
+                kind: "awesome_list",
+                note: "Public APIs directory (huge; good for keyless URL seeds).",
+            },
+            SeedSpec {
+                id: "awesome-selfhosted",
+                url: "https://raw.githubusercontent.com/awesome-selfhosted/awesome-selfhosted/master/README.md",
+                kind: "awesome_list",
+                note: "Self-hosted services; many have public endpoints/docs.",
+            },
+            SeedSpec {
+                id: "awesome",
+                url: "https://raw.githubusercontent.com/sindresorhus/awesome/master/readme.md",
+                kind: "awesome_list",
+                note: "Meta-index of awesome lists (good pivot for more seeds).",
+            },
+            SeedSpec {
+                id: "awesome-python",
+                url: "https://raw.githubusercontent.com/vinta/awesome-python/master/README.md",
+                kind: "awesome_list",
+                note: "Python ecosystem index; good for tooling + libraries for adapters.",
+            },
+            SeedSpec {
+                id: "free-for-dev",
+                url: "https://raw.githubusercontent.com/ripienaar/free-for-dev/master/README.md",
+                kind: "awesome_list",
+                note: "Free tiers across many providers (useful for alternatives when rate-limited).",
+            },
+            SeedSpec {
+                id: "awesome-public-datasets",
+                url: "https://raw.githubusercontent.com/awesomedata/awesome-public-datasets/master/README.rst",
+                kind: "awesome_list",
+                note: "Public datasets index (good seed for offline-ish evidence gathering).",
+            },
+            SeedSpec {
+                id: "awesome-go",
+                url: "https://raw.githubusercontent.com/avelino/awesome-go/main/README.md",
+                kind: "awesome_list",
+                note: "Go ecosystem index (useful for tooling/services).",
+            },
+            SeedSpec {
+                id: "awesome-sysadmin",
+                url: "https://raw.githubusercontent.com/awesome-foss/awesome-sysadmin/master/README.md",
+                kind: "awesome_list",
+                note: "Sysadmin tooling index (good for deployable/self-hostable alternatives).",
+            },
+        ]
+    }
+
+    fn select_seed_urls(
+        registry: &[SeedSpec],
+        urls: Option<Vec<String>>,
+        seed_ids: Option<Vec<String>>,
+        max_urls: usize,
+    ) -> (Vec<(String, String)>, Vec<String>) {
+        if let Some(us) = urls {
+            let picked = us
+                .into_iter()
+                .filter(|u| !u.trim().is_empty())
+                .take(max_urls)
+                .enumerate()
+                .map(|(i, u)| (format!("custom#{i}"), u))
+                .collect::<Vec<_>>();
+            return (picked, Vec::new());
+        }
+
+        let mut unknown_seed_ids: Vec<String> = Vec::new();
+
+        let chosen: Vec<SeedSpec> = if let Some(ids) = seed_ids {
+            let mut out: Vec<SeedSpec> = Vec::new();
+            let mut seen = std::collections::BTreeSet::<String>::new();
+            for id0 in ids {
+                let id = id0.trim().to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                if let Some(s) = registry.iter().find(|s| s.id == id) {
+                    out.push(*s);
+                } else {
+                    unknown_seed_ids.push(id);
+                }
+            }
+            out
+        } else {
+            registry.to_vec()
+        };
+
+        let picked = chosen
+            .into_iter()
+            .take(max_urls)
+            .map(|s| (s.id.to_string(), s.url.to_string()))
+            .collect::<Vec<_>>();
+
+        (picked, unknown_seed_ids)
+    }
+
     fn search_failed_hint(provider: &str, msg: &str, default_hint: &str) -> String {
         if is_http_status(msg, 429) {
             return format!(
@@ -915,6 +1033,79 @@ mod mcp {
 
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebpipeUsageArgs {}
+
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
+    struct WebSeedUrlsArgs {
+        /// Max seed urls to return (bounded).
+        #[serde(default)]
+        max: Option<usize>,
+        /// If true, return an additional `ids` array for convenience.
+        #[serde(default)]
+        include_ids: Option<bool>,
+        /// If true, return only ids+urls (omit kind/note fields) in the `seeds` list.
+        ///
+        /// This is useful when you want maximum output stability (ids/urls only).
+        #[serde(default)]
+        ids_only: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct WebSeedSearchExtractArgs {
+        /// Query to use for chunk selection.
+        query: String,
+        /// Optional explicit URL list. If provided, we use these instead of built-in seeds.
+        #[serde(default)]
+        urls: Option<Vec<String>>,
+        /// Optional seed ids from `web_seed_urls`. Ignored when `urls` is provided.
+        #[serde(default)]
+        seed_ids: Option<Vec<String>>,
+        /// Max URLs to fetch/extract (bounded).
+        #[serde(default)]
+        max_urls: Option<usize>,
+        /// Which fetch backend to use (default: local). Allowed: local, firecrawl
+        #[serde(default)]
+        fetch_backend: Option<String>,
+        /// If true, do not perform any network calls. For local fetch_backend, this means:
+        /// - allow cache reads
+        /// - error on cache miss
+        ///
+        /// For firecrawl fetch_backend, this always errors (firecrawl is network-only).
+        #[serde(default)]
+        no_network: Option<bool>,
+        /// Width for text wrapping (default: 100).
+        #[serde(default)]
+        width: Option<usize>,
+        /// Max chars in output text (default: 20_000).
+        #[serde(default)]
+        max_chars: Option<usize>,
+        /// Max bytes to fetch (default: 2_000_000).
+        #[serde(default)]
+        max_bytes: Option<u64>,
+        /// How many chunks to return per URL (default: 5).
+        #[serde(default)]
+        top_chunks: Option<usize>,
+        /// Cap merged chunks per seed id (default: top_chunks).
+        #[serde(default)]
+        merged_max_per_seed: Option<usize>,
+        /// Max chars per chunk snippet (default: 500).
+        #[serde(default)]
+        max_chunk_chars: Option<usize>,
+        /// Allow cache reads (default: true).
+        #[serde(default)]
+        cache_read: Option<bool>,
+        /// Allow cache writes (default: true).
+        #[serde(default)]
+        cache_write: Option<bool>,
+        /// Optional cache TTL in seconds.
+        #[serde(default)]
+        cache_ttl_s: Option<u64>,
+        /// Include full extracted text (default: false; usually too big for seeds).
+        #[serde(default)]
+        include_text: Option<bool>,
+        /// Compact output (default: true).
+        #[serde(default)]
+        compact: Option<bool>,
+    }
 
     #[derive(Debug, Deserialize, JsonSchema)]
     struct WebFetchArgs {
@@ -2197,7 +2388,8 @@ mod mcp {
                 has_env("WEBPIPE_FIRECRAWL_API_KEY") || has_env("FIRECRAWL_API_KEY");
             let brave_configured =
                 has_env("WEBPIPE_BRAVE_API_KEY") || has_env("BRAVE_SEARCH_API_KEY");
-            let searxng_configured = has_env("WEBPIPE_SEARXNG_ENDPOINT");
+            let searxng_configured =
+                has_env("WEBPIPE_SEARXNG_ENDPOINT") || has_env("WEBPIPE_SEARXNG_ENDPOINTS");
             let perplexity_configured =
                 has_env("WEBPIPE_PERPLEXITY_API_KEY") || has_env("PERPLEXITY_API_KEY");
             let openrouter_configured =
@@ -2290,7 +2482,31 @@ mod mcp {
                     "vision_gemini": cfg!(feature = "vision-gemini")
                 },
                 "supported": {
-                    "mcp_tools": ["webpipe_meta", "webpipe_usage", "webpipe_usage_reset", "web_fetch", "web_extract", "web_search", "web_search_extract", "web_cache_search_extract", "web_deep_research", "arxiv_search", "arxiv_enrich"],
+                    // Tool surface is intentionally small and ordered by “what users reach for first”.
+                    // (UX note: some clients render tools in this order; others don’t, but this is a
+                    // stable, human-friendly reference regardless.)
+                    "mcp_tools": [
+                        "webpipe_meta",
+                        "webpipe_usage",
+                        "webpipe_usage_reset",
+                        "web_seed_urls",
+                        "web_seed_search_extract",
+                        "web_fetch",
+                        "web_extract",
+                        "web_search",
+                        "web_search_extract",
+                        "web_cache_search_extract",
+                        "web_deep_research",
+                        "arxiv_search",
+                        "arxiv_enrich"
+                    ],
+                    "mcp_tool_groups": {
+                        "meta": ["webpipe_meta", "webpipe_usage", "webpipe_usage_reset"],
+                        "seeds": ["web_seed_urls", "web_seed_search_extract"],
+                        "fetch_extract": ["web_fetch", "web_extract"],
+                        "search": ["web_search", "web_search_extract", "web_cache_search_extract"],
+                        "research": ["web_deep_research", "arxiv_search", "arxiv_enrich"]
+                    },
                     // Values for web_search.provider
                     "providers": ["auto", "brave", "tavily", "searxng"],
                     // Values for web_search.auto_mode (when provider="auto")
@@ -2300,6 +2516,7 @@ mod mcp {
                     // Environment knobs (names only; no values) for opportunistic local tooling + multimodal.
                     "knobs": [
                         "WEBPIPE_SEARXNG_ENDPOINT",
+                        "WEBPIPE_SEARXNG_ENDPOINTS",
                         "WEBPIPE_ARXIV_ENDPOINT",
                         "WEBPIPE_PERPLEXITY_ENDPOINT",
                         "WEBPIPE_PDF_SHELLOUT",
@@ -2508,6 +2725,277 @@ mod mcp {
                 "local_tools": local_tools
             });
             add_envelope_fields(&mut payload, "webpipe_meta", t0.elapsed().as_millis());
+            Ok(tool_result(payload))
+        }
+
+        #[tool(
+            description = "Return curated seed URLs (awesome lists) for keyless search workflows"
+        )]
+        async fn web_seed_urls(
+            &self,
+            params: Parameters<WebSeedUrlsArgs>,
+        ) -> Result<CallToolResult, McpError> {
+            let t0 = std::time::Instant::now();
+            self.stats_inc_tool("web_seed_urls");
+            let max = params.0.max.unwrap_or(25).clamp(1, 50);
+            let include_ids = params.0.include_ids.unwrap_or(true);
+            let ids_only = params.0.ids_only.unwrap_or(false);
+
+            // Curated seed registry (single source of truth).
+            let seeds = seed_registry();
+
+            let seeds_out = if ids_only {
+                seeds.iter().take(max).map(|s| serde_json::json!({
+                    "id": s.id,
+                    "url": s.url
+                })).collect::<Vec<_>>()
+            } else {
+                seeds.iter().take(max).map(|s| serde_json::json!({
+                    "id": s.id,
+                    "url": s.url,
+                    "kind": s.kind,
+                    "note": s.note
+                })).collect::<Vec<_>>()
+            };
+
+            let mut payload = serde_json::json!({
+                "ok": true,
+                "max": max,
+                "seeds": seeds_out,
+                "notes": [
+                    "Use these with web_extract or web_search_extract(urls=[...], url_selection_mode=query_rank) to avoid paid search providers.",
+                    "Prefer small bounds (max_urls/top_chunks/max_chars) and cache_read=true to stay deterministic."
+                ]
+            });
+            if include_ids {
+                payload["ids"] = serde_json::json!(
+                    seeds.iter().take(max).map(|s| s.id).collect::<Vec<_>>()
+                );
+            }
+            add_envelope_fields(&mut payload, "web_seed_urls", t0.elapsed().as_millis());
+            Ok(tool_result(payload))
+        }
+
+        #[tool(
+            description = "Fetch+extract a bounded set of seed URLs and return merged top chunks for a query"
+        )]
+        async fn web_seed_search_extract(
+            &self,
+            params: Parameters<WebSeedSearchExtractArgs>,
+        ) -> Result<CallToolResult, McpError> {
+            let t0 = std::time::Instant::now();
+            self.stats_inc_tool("web_seed_search_extract");
+
+            let args = params.0;
+            let query = args.query.trim().to_string();
+            if query.is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "query": "",
+                    "error": error_obj(ErrorCode::InvalidParams, "query must be non-empty", "Provide a query string.")
+                });
+                add_envelope_fields(&mut payload, "web_seed_search_extract", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
+
+            let max_urls = args.max_urls.unwrap_or(4).clamp(1, 10);
+            let width = args.width.unwrap_or(100).clamp(20, 240);
+            let max_chars = args.max_chars.unwrap_or(20_000).min(200_000);
+            let max_bytes = args.max_bytes.unwrap_or(2_000_000).min(10_000_000);
+            let top_chunks = args.top_chunks.unwrap_or(5).clamp(1, 25);
+            let merged_max_per_seed = args.merged_max_per_seed.unwrap_or(top_chunks).clamp(1, 25);
+            let max_chunk_chars = args.max_chunk_chars.unwrap_or(500).clamp(50, 5_000);
+            let include_text = args.include_text.unwrap_or(false);
+            let compact = args.compact.unwrap_or(true);
+
+            let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
+            let no_network = args.no_network.unwrap_or(false);
+            let cache_read = args.cache_read.unwrap_or(true);
+            let cache_write = args.cache_write.unwrap_or(true);
+            let cache_ttl_s = args.cache_ttl_s;
+
+            let mut warnings: Vec<&'static str> = Vec::new();
+            let seed_ids_were_provided = args.urls.is_none() && args.seed_ids.as_ref().is_some();
+            let (urls, unknown_seed_ids) = select_seed_urls(
+                seed_registry(),
+                args.urls.clone(),
+                args.seed_ids.clone(),
+                max_urls,
+            );
+            if !unknown_seed_ids.is_empty() {
+                warnings.push("unknown_seed_id");
+            }
+            if seed_ids_were_provided && urls.is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(
+                        ErrorCode::InvalidParams,
+                        "seed_ids did not match any known seeds",
+                        "Call web_seed_urls to see valid ids, or pass urls=[...] explicitly."
+                    ),
+                    "unknown_seed_ids": unknown_seed_ids,
+                });
+                add_envelope_fields(&mut payload, "web_seed_search_extract", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
+
+            #[derive(Debug, Clone, serde::Serialize)]
+            struct PerUrlResult {
+                id: String,
+                url: String,
+                ok: bool,
+                extraction_engine: Option<String>,
+                chunks: Vec<serde_json::Value>,
+                warnings: Vec<String>,
+                error: Option<serde_json::Value>,
+            }
+
+            let mut per_url: Vec<PerUrlResult> = Vec::new();
+            let mut merged: Vec<(u64, String, serde_json::Value)> = Vec::new();
+
+            for (id, url) in urls.iter() {
+                let r = self
+                    .web_extract(Parameters(WebExtractArgs {
+                        url: url.clone(),
+                        fetch_backend: Some(fetch_backend.clone()),
+                        no_network: Some(no_network),
+                        width: Some(width),
+                        max_chars: Some(max_chars),
+                        query: Some(query.clone()),
+                        top_chunks: Some(top_chunks),
+                        max_chunk_chars: Some(max_chunk_chars),
+                        max_bytes: Some(max_bytes),
+                        include_links: Some(false),
+                        max_links: Some(0),
+                        include_text: Some(include_text),
+                        include_structure: Some(false),
+                        max_outline_items: None,
+                        max_blocks: None,
+                        max_block_chars: None,
+                        semantic_rerank: Some(false),
+                        semantic_top_k: None,
+                        cache_read: Some(cache_read),
+                        cache_write: Some(cache_write),
+                        cache_ttl_s,
+                        timeout_ms: None,
+                    }))
+                    .await?;
+                let v = payload_from_result(&r);
+
+                let ok = v["ok"].as_bool().unwrap_or(false);
+                let engine = v
+                    .get("extraction")
+                    .and_then(|x| x.get("engine"))
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                let chunks = v.get("chunks").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+                let warnings = v
+                    .get("warnings")
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>();
+                let error = v.get("error").cloned();
+
+                if ok {
+                    for c in chunks.iter() {
+                        let score = c.get("score").and_then(|x| x.as_u64()).unwrap_or(0);
+                        merged.push((score, id.clone(), c.clone()));
+                    }
+                }
+
+                per_url.push(PerUrlResult {
+                    id: id.clone(),
+                    url: url.clone(),
+                    ok,
+                    extraction_engine: engine,
+                    chunks,
+                    warnings,
+                    error,
+                });
+            }
+
+            // Merge: higher score first, then stable tiebreak by id.
+            merged.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let max_total_chunks = (max_urls * top_chunks).clamp(1, 50);
+            let mut per_seed_counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut merged_chunks: Vec<serde_json::Value> = Vec::new();
+            for (score, id, mut c) in merged.into_iter() {
+                if merged_chunks.len() >= max_total_chunks {
+                    break;
+                }
+                let n = per_seed_counts.get(&id).copied().unwrap_or(0);
+                if n >= merged_max_per_seed {
+                    continue;
+                }
+                per_seed_counts.insert(id.clone(), n + 1);
+                c["seed_id"] = serde_json::json!(id);
+                c["score"] = serde_json::json!(score);
+                merged_chunks.push(c);
+            }
+
+            let mut payload = serde_json::json!({
+                "ok": true,
+                "query": query,
+                "request": {
+                    "max_urls": max_urls,
+                    "fetch_backend": fetch_backend,
+                    "no_network": no_network,
+                    "width": width,
+                    "max_chars": max_chars,
+                    "max_bytes": max_bytes,
+                    "top_chunks": top_chunks,
+                    "merged_max_per_seed": merged_max_per_seed,
+                    "max_chunk_chars": max_chunk_chars,
+                    "include_text": include_text,
+                    "compact": compact,
+                    "cache_read": cache_read,
+                    "cache_write": cache_write,
+                    "cache_ttl_s": cache_ttl_s
+                },
+                "urls": urls.iter().map(|(id, url)| serde_json::json!({"id": id, "url": url})).collect::<Vec<_>>(),
+                "results": {
+                    "merged_chunks": merged_chunks,
+                    "per_url": per_url
+                }
+            });
+
+            if no_network && payload["results"]["per_url"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .any(|x| {
+                    x.get("error")
+                        .and_then(|e| e.get("code"))
+                        .and_then(|c| c.as_str())
+                        == Some("cache_error")
+                })
+            {
+                warnings.push("no_network_may_require_warm_cache");
+            }
+            if !unknown_seed_ids.is_empty() {
+                payload["unknown_seed_ids"] = serde_json::json!(unknown_seed_ids);
+            }
+            if !warnings.is_empty() {
+                payload["warnings"] = serde_json::json!(warnings);
+                let codes = warning_codes_from(&warnings);
+                payload["warning_codes"] = serde_json::json!(codes.clone());
+                payload["warning_hints"] = warning_hints_from(&codes);
+            }
+
+            if compact {
+                // Keep per_url but drop potentially large echoed chunks there; merged view is enough.
+                if let Some(arr) = payload["results"]["per_url"].as_array_mut() {
+                    for it in arr {
+                        it["chunks"] = serde_json::json!([]);
+                    }
+                }
+            }
+
+            add_envelope_fields(&mut payload, "web_seed_search_extract", t0.elapsed().as_millis());
             Ok(tool_result(payload))
         }
 
@@ -6663,7 +7151,8 @@ mod mcp {
                             has_env("WEBPIPE_BRAVE_API_KEY") || has_env("BRAVE_SEARCH_API_KEY");
                         let tavily_env =
                             has_env("WEBPIPE_TAVILY_API_KEY") || has_env("TAVILY_API_KEY");
-                        let searxng_env = has_env("WEBPIPE_SEARXNG_ENDPOINT");
+                        let searxng_env = has_env("WEBPIPE_SEARXNG_ENDPOINT")
+                            || has_env("WEBPIPE_SEARXNG_ENDPOINTS");
                         if !brave_env && !tavily_env && !searxng_env {
                             let mut payload = serde_json::json!({
                                 "ok": false,
@@ -6677,7 +7166,7 @@ mod mcp {
                                 "error": error_obj(
                                     ErrorCode::NotConfigured,
                                     "no web search providers configured",
-                                    "Set WEBPIPE_BRAVE_API_KEY / WEBPIPE_TAVILY_API_KEY / WEBPIPE_SEARXNG_ENDPOINT, or choose provider explicitly."
+                                    "Set WEBPIPE_BRAVE_API_KEY / WEBPIPE_TAVILY_API_KEY / WEBPIPE_SEARXNG_ENDPOINT(S), or choose provider explicitly."
                                 )
                             });
                             add_envelope_fields(
@@ -6993,7 +7482,8 @@ mod mcp {
                             has_env("WEBPIPE_BRAVE_API_KEY") || has_env("BRAVE_SEARCH_API_KEY");
                         let tavily_env =
                             has_env("WEBPIPE_TAVILY_API_KEY") || has_env("TAVILY_API_KEY");
-                        let searxng_env = has_env("WEBPIPE_SEARXNG_ENDPOINT");
+                        let searxng_env = has_env("WEBPIPE_SEARXNG_ENDPOINT")
+                            || has_env("WEBPIPE_SEARXNG_ENDPOINTS");
                         if !brave_env && !tavily_env && !searxng_env {
                             let mut payload = serde_json::json!({
                                 "ok": false,
@@ -7005,7 +7495,7 @@ mod mcp {
                                 "error": error_obj(
                                     ErrorCode::NotConfigured,
                                     "no web search providers configured",
-                                    "Set WEBPIPE_BRAVE_API_KEY / WEBPIPE_TAVILY_API_KEY / WEBPIPE_SEARXNG_ENDPOINT, or choose provider explicitly."
+                                    "Set WEBPIPE_BRAVE_API_KEY / WEBPIPE_TAVILY_API_KEY / WEBPIPE_SEARXNG_ENDPOINT(S), or choose provider explicitly."
                                 )
                             });
                             add_envelope_fields(
@@ -7038,15 +7528,28 @@ mod mcp {
                             .and_then(|v| v.trim().parse::<u64>().ok());
                         let provider_totals = { self.stats_lock().search_providers.clone() };
 
+                        let searxng_eps = if searxng_env {
+                            webpipe_local::search::searxng_endpoints_from_env()
+                        } else {
+                            Vec::new()
+                        };
+
                         let mut order: Vec<String> = Vec::new();
                         if brave_env {
                             order.push("brave".to_string());
                         }
+                        // Prefer self-hosted “free-ish” SearXNG before paid providers when available.
+                        if searxng_env {
+                            if searxng_eps.len() > 1 {
+                                for i in 0..searxng_eps.len() {
+                                    order.push(format!("searxng#{i}"));
+                                }
+                            } else {
+                                order.push("searxng".to_string());
+                            }
+                        }
                         if tavily_env {
                             order.push("tavily".to_string());
-                        }
-                        if searxng_env {
-                            order.push("searxng".to_string());
                         }
                         // Budget filter (best-effort): if a budget exists and we've exceeded it, don't select that arm.
                         order.retain(|name| {
@@ -7098,7 +7601,7 @@ mod mcp {
                         let frontier_names = serde_json::json!(sel.frontier);
 
                         let pt0 = std::time::Instant::now();
-                        let (backend_provider, out) = match chosen.as_str() {
+                        let (backend_provider, selected_arm, out) = match chosen.as_str() {
                             "tavily" => {
                                 let provider =
                                     match webpipe_local::search::TavilySearchProvider::from_env(
@@ -7143,7 +7646,7 @@ mod mcp {
                                             None,
                                             qk.as_deref(),
                                         );
-                                        ("tavily", r)
+                                        ("tavily", None, r)
                                     }
                                     Err(e) => {
                                         let msg = e.to_string();
@@ -7179,56 +7682,58 @@ mod mcp {
                                     }
                                 }
                             }
-                            "searxng" => {
-                                let provider =
-                                    match webpipe_local::search::SearxngSearchProvider::from_env(
-                                        client.clone(),
-                                    ) {
-                                        Ok(p) => p,
-                                        Err(e) => {
-                                            let msg = e.to_string();
-                                            self.stats_record_search_provider_qk(
-                                                "searxng",
-                                                false,
-                                                0,
-                                                pt0.elapsed().as_millis() as u64,
-                                                Some(&msg),
-                                                qk.as_deref(),
-                                            );
-                                            let mut payload = serde_json::json!({
-                                                "ok": false,
-                                                "provider": "auto",
-                                                "backend_provider": "searxng",
-                                                "query": query.clone(),
-                                                "max_results": max_results,
-                                                "selection": { "requested_provider": "auto", "auto_mode": "mab", "selected_provider": "searxng", "mab": { "candidates": debug_rows, "frontier": frontier_names, "routing_context_used": routing_context_used, "routing_query_key": qk } },
-                                                "request": { "provider": "auto", "auto_mode": "mab", "query": query.clone(), "max_results": max_results, "language": language, "country": country },
-                                                "error": error_obj(ErrorCode::NotConfigured, msg, "SearXNG was selected but is not configured. Set WEBPIPE_SEARXNG_ENDPOINT, or choose provider explicitly.")
-                                            });
-                                            add_envelope_fields(
-                                                &mut payload,
-                                                "web_search",
-                                                t0.elapsed().as_millis(),
-                                            );
-                                            return Ok(tool_result(payload));
-                                        }
-                                    };
-                                match provider.search(&q).await {
+                            s if s == "searxng" || s.starts_with("searxng#") => {
+                                let arm_idx = parse_searxng_arm(s);
+                                let stats_key = s.to_string();
+
+                                let run = async {
+                                    if let Some(i) = arm_idx {
+                                        let Some(ep) = searxng_eps.get(i) else {
+                                            return Err(WebpipeError::NotSupported(format!(
+                                                "searxng arm index out of range: {i}"
+                                            )));
+                                        };
+                                        webpipe_local::search::searxng_search_at_endpoint(
+                                            &client,
+                                            ep,
+                                            &q,
+                                        )
+                                        .await
+                                    } else if searxng_eps.len() == 1 {
+                                        webpipe_local::search::searxng_search_at_endpoint(
+                                            &client,
+                                            &searxng_eps[0],
+                                            &q,
+                                        )
+                                        .await
+                                    } else {
+                                        let p = webpipe_local::search::SearxngSearchProvider::from_env(
+                                            client.clone(),
+                                        )?;
+                                        p.search(&q).await
+                                    }
+                                };
+
+                                match run.await {
                                     Ok(r) => {
                                         self.stats_record_search_provider_qk(
-                                            "searxng",
+                                            &stats_key,
                                             true,
                                             r.cost_units,
                                             pt0.elapsed().as_millis() as u64,
                                             None,
                                             qk.as_deref(),
                                         );
-                                        ("searxng", r)
+                                        (
+                                            "searxng",
+                                            arm_idx.map(|i| format!("searxng#{i}")),
+                                            r,
+                                        )
                                     }
                                     Err(e) => {
                                         let msg = e.to_string();
                                         self.stats_record_search_provider_qk(
-                                            "searxng",
+                                            &stats_key,
                                             false,
                                             0,
                                             pt0.elapsed().as_millis() as u64,
@@ -7238,7 +7743,7 @@ mod mcp {
                                         let hint = search_failed_hint(
                                             "searxng",
                                             &msg,
-                                            "Auto (mab) selected SearXNG, but it failed. Retry later; reduce max_results; or use provider=brave/tavily.",
+                                            "Auto (mab) selected SearXNG, but it failed. Retry later; reduce max_results; or use urls=[...] to skip search.",
                                         );
                                         let mut payload = serde_json::json!({
                                             "ok": false,
@@ -7250,6 +7755,10 @@ mod mcp {
                                             "request": { "provider": "auto", "auto_mode": "mab", "query": query.clone(), "max_results": max_results, "language": language, "country": country },
                                             "error": error_obj(ErrorCode::SearchFailed, msg, hint)
                                         });
+                                        if let Some(i) = arm_idx {
+                                            payload["selection"]["selected_arm"] =
+                                                serde_json::json!(format!("searxng#{i}"));
+                                        }
                                         add_envelope_fields(
                                             &mut payload,
                                             "web_search",
@@ -7303,7 +7812,7 @@ mod mcp {
                                             None,
                                             qk.as_deref(),
                                         );
-                                        ("brave", r)
+                                        ("brave", None, r)
                                     }
                                     Err(e) => {
                                         let msg = e.to_string();
@@ -7354,6 +7863,9 @@ mod mcp {
                             "timings_ms": { "total": t0.elapsed().as_millis() },
                             "results": out.results
                         });
+                        if let Some(arm) = selected_arm {
+                            payload["selection"]["selected_arm"] = serde_json::json!(arm);
+                        }
                         if backend_provider == "tavily" {
                             payload["warnings"] = serde_json::json!(["tavily_used"]);
                             let codes = warning_codes_from(&["tavily_used"]);
@@ -7381,14 +7893,27 @@ mod mcp {
                     let brave_env =
                         has_env("WEBPIPE_BRAVE_API_KEY") || has_env("BRAVE_SEARCH_API_KEY");
                     let tavily_env = has_env("WEBPIPE_TAVILY_API_KEY") || has_env("TAVILY_API_KEY");
-                    let searxng_env = has_env("WEBPIPE_SEARXNG_ENDPOINT");
+                    let searxng_env = has_env("WEBPIPE_SEARXNG_ENDPOINT")
+                        || has_env("WEBPIPE_SEARXNG_ENDPOINTS");
+
+                    let searxng_eps = if searxng_env {
+                        webpipe_local::search::searxng_endpoints_from_env()
+                    } else {
+                        Vec::new()
+                    };
 
                     let mut order: Vec<String> = Vec::new();
                     if brave_env {
                         order.push("brave".to_string());
                     }
                     if searxng_env {
-                        order.push("searxng".to_string());
+                        if searxng_eps.len() > 1 {
+                            for i in 0..searxng_eps.len() {
+                                order.push(format!("searxng#{i}"));
+                            }
+                        } else {
+                            order.push("searxng".to_string());
+                        }
                     }
                     if tavily_env {
                         order.push("tavily".to_string());
@@ -7405,7 +7930,7 @@ mod mcp {
                             "error": error_obj(
                                 ErrorCode::NotConfigured,
                                 "no web search providers configured",
-                                "Set WEBPIPE_BRAVE_API_KEY / WEBPIPE_TAVILY_API_KEY / WEBPIPE_SEARXNG_ENDPOINT, or choose provider explicitly."
+                            "Set WEBPIPE_BRAVE_API_KEY / WEBPIPE_TAVILY_API_KEY / WEBPIPE_SEARXNG_ENDPOINT(S), or choose provider explicitly."
                             )
                         });
                         add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
@@ -7576,101 +8101,115 @@ mod mcp {
                                     return Err(McpError::internal_error(e.to_string(), None))
                                 }
                             },
-                            "searxng" => {
-                                match webpipe_local::search::SearxngSearchProvider::from_env(
-                                    client.clone(),
-                                ) {
-                                    Ok(p) => match p.search(&q).await {
-                                        Ok(r) => {
-                                            attempts.push(serde_json::json!({"name":"searxng","ok":true,"cost_units":r.cost_units,"elapsed_ms":pt0.elapsed().as_millis()}));
-                                            self.stats_record_search_provider_qk(
-                                                "searxng",
-                                                true,
-                                                r.cost_units,
-                                                pt0.elapsed().as_millis() as u64,
-                                                None,
-                                                qk.as_deref(),
-                                            );
-                                            let mut payload = serde_json::json!({
-                                                "ok": true,
-                                                "provider": "auto",
-                                                "backend_provider": "searxng",
-                                                "query": query.clone(),
-                                                "query_key": Self::query_key(&query),
-                                                "max_results": max_results,
-                                                "request": { "provider": "auto", "auto_mode": auto_mode, "query": q.query, "query_key": Self::query_key(&q.query), "max_results": max_results, "language": q.language, "country": q.country },
-                                                "selection": { "requested_provider": "auto", "selected_provider": "searxng", "auto_mode": auto_mode, "mab": { "candidates": debug_rows0, "frontier": frontier0, "routing_context_used": routing_context_used, "routing_query_key": qk, "attempted_chain": attempted_chain } },
-                                                "providers": attempts,
-                                                "cost_units": r.cost_units,
-                                                "timings_ms": { "total": t0.elapsed().as_millis() },
-                                                "results": r.results,
-                                            });
-                                            if payload["providers"]
-                                                .as_array()
-                                                .map(|a| a.len())
-                                                .unwrap_or(0)
-                                                >= 2
-                                            {
-                                                payload["warnings"] =
-                                                    serde_json::json!(["provider_failover"]);
-                                                let codes =
-                                                    warning_codes_from(&["provider_failover"]);
-                                                payload["warning_codes"] =
-                                                    serde_json::json!(codes.clone());
-                                                payload["warning_hints"] =
-                                                    warning_hints_from(&codes);
-                                            }
-                                            add_envelope_fields(
-                                                &mut payload,
-                                                "web_search",
-                                                t0.elapsed().as_millis(),
-                                            );
-                                            return Ok(tool_result(payload));
+                            s if s == "searxng" || s.starts_with("searxng#") => {
+                                let arm_idx = parse_searxng_arm(s);
+                                let stats_key = s.to_string();
+
+                                let run = async {
+                                    if let Some(i) = arm_idx {
+                                        let Some(ep) = searxng_eps.get(i) else {
+                                            return Err(WebpipeError::NotSupported(format!(
+                                                "searxng arm index out of range: {i}"
+                                            )));
+                                        };
+                                        webpipe_local::search::searxng_search_at_endpoint(
+                                            &client,
+                                            ep,
+                                            &q,
+                                        )
+                                        .await
+                                    } else if searxng_eps.len() == 1 {
+                                        webpipe_local::search::searxng_search_at_endpoint(
+                                            &client,
+                                            &searxng_eps[0],
+                                            &q,
+                                        )
+                                        .await
+                                    } else {
+                                        let p = webpipe_local::search::SearxngSearchProvider::from_env(
+                                            client.clone(),
+                                        )?;
+                                        p.search(&q).await
+                                    }
+                                };
+
+                                match run.await {
+                                    Ok(r) => {
+                                        let mut entry = serde_json::json!({"name":"searxng","ok":true,"cost_units":r.cost_units,"elapsed_ms":pt0.elapsed().as_millis()});
+                                        if let Some(i) = arm_idx {
+                                            entry["arm"] = serde_json::json!(format!("searxng#{i}"));
                                         }
-                                        Err(e) => {
-                                            let msg = e.to_string();
-                                            let elapsed_ms = pt0.elapsed().as_millis() as u64;
-                                            let http_429 = is_http_status(&msg, 429);
-                                            attempts.push(serde_json::json!({"name":"searxng","ok":false,"error":msg.clone(),"elapsed_ms":elapsed_ms}));
-                                            self.stats_record_search_provider_qk(
-                                                "searxng",
-                                                false,
-                                                0,
-                                                elapsed_ms,
-                                                Some(&msg),
-                                                qk.as_deref(),
-                                            );
-                                            let s = summaries_local
-                                                .entry("searxng".to_string())
-                                                .or_default();
-                                            s.calls = s.calls.saturating_add(1);
-                                            s.http_429 = s.http_429.saturating_add(http_429 as u64);
-                                            s.elapsed_ms_sum =
-                                                s.elapsed_ms_sum.saturating_add(elapsed_ms);
+                                        attempts.push(entry);
+                                        self.stats_record_search_provider_qk(
+                                            &stats_key,
+                                            true,
+                                            r.cost_units,
+                                            pt0.elapsed().as_millis() as u64,
+                                            None,
+                                            qk.as_deref(),
+                                        );
+                                        let mut payload = serde_json::json!({
+                                            "ok": true,
+                                            "provider": "auto",
+                                            "backend_provider": "searxng",
+                                            "query": query.clone(),
+                                            "query_key": Self::query_key(&query),
+                                            "max_results": max_results,
+                                            "request": { "provider": "auto", "auto_mode": auto_mode, "query": q.query, "query_key": Self::query_key(&q.query), "max_results": max_results, "language": q.language, "country": q.country },
+                                            "selection": { "requested_provider": "auto", "selected_provider": "searxng", "auto_mode": auto_mode, "mab": { "candidates": debug_rows0, "frontier": frontier0, "routing_context_used": routing_context_used, "routing_query_key": qk, "attempted_chain": attempted_chain } },
+                                            "providers": attempts,
+                                            "cost_units": r.cost_units,
+                                            "timings_ms": { "total": t0.elapsed().as_millis() },
+                                            "results": r.results,
+                                        });
+                                        if let Some(i) = arm_idx {
+                                            payload["selection"]["selected_arm"] =
+                                                serde_json::json!(format!("searxng#{i}"));
                                         }
-                                    },
-                                    Err(WebpipeError::NotConfigured(msg)) => {
+                                        if payload["providers"]
+                                            .as_array()
+                                            .map(|a| a.len())
+                                            .unwrap_or(0)
+                                            >= 2
+                                        {
+                                            payload["warnings"] =
+                                                serde_json::json!(["provider_failover"]);
+                                            let codes =
+                                                warning_codes_from(&["provider_failover"]);
+                                            payload["warning_codes"] =
+                                                serde_json::json!(codes.clone());
+                                            payload["warning_hints"] =
+                                                warning_hints_from(&codes);
+                                        }
+                                        add_envelope_fields(
+                                            &mut payload,
+                                            "web_search",
+                                            t0.elapsed().as_millis(),
+                                        );
+                                        return Ok(tool_result(payload));
+                                    }
+                                    Err(e) => {
+                                        let msg = e.to_string();
                                         let elapsed_ms = pt0.elapsed().as_millis() as u64;
                                         let http_429 = is_http_status(&msg, 429);
-                                        attempts.push(serde_json::json!({"name":"searxng","ok":false,"error":msg.clone(),"elapsed_ms":elapsed_ms}));
+                                        let mut entry = serde_json::json!({"name":"searxng","ok":false,"error":msg.clone(),"elapsed_ms":elapsed_ms});
+                                        if let Some(i) = arm_idx {
+                                            entry["arm"] = serde_json::json!(format!("searxng#{i}"));
+                                        }
+                                        attempts.push(entry);
                                         self.stats_record_search_provider_qk(
-                                            "searxng",
+                                            &stats_key,
                                             false,
                                             0,
                                             elapsed_ms,
                                             Some(&msg),
                                             qk.as_deref(),
                                         );
-                                        let s = summaries_local
-                                            .entry("searxng".to_string())
-                                            .or_default();
+                                        let s = summaries_local.entry(stats_key).or_default();
                                         s.calls = s.calls.saturating_add(1);
                                         s.http_429 = s.http_429.saturating_add(http_429 as u64);
                                         s.elapsed_ms_sum =
                                             s.elapsed_ms_sum.saturating_add(elapsed_ms);
-                                    }
-                                    Err(e) => {
-                                        return Err(McpError::internal_error(e.to_string(), None))
                                     }
                                 }
                             }
@@ -8097,7 +8636,7 @@ mod mcp {
                                 "error": error_obj(
                                     ErrorCode::NotConfigured,
                                     msg,
-                                    "Set WEBPIPE_SEARXNG_ENDPOINT in the webpipe MCP server environment."
+                                    "Set WEBPIPE_SEARXNG_ENDPOINT (or WEBPIPE_SEARXNG_ENDPOINTS) in the webpipe MCP server environment."
                                 )
                             });
                             add_envelope_fields(
@@ -11655,6 +12194,204 @@ mod mcp {
         }
 
         #[tokio::test]
+        async fn web_seed_urls_contract_is_stable_and_bounded() {
+            let svc = WebpipeMcp::new().expect("new");
+            let r = svc
+                .web_seed_urls(Parameters(WebSeedUrlsArgs {
+                    max: Some(2),
+                    include_ids: Some(true),
+                    ids_only: Some(false),
+                }))
+                .await
+                .expect("seed urls");
+            let v = payload_from_call_tool_result(&r);
+            assert_eq!(v["ok"].as_bool(), Some(true));
+            assert_eq!(v["kind"].as_str(), Some("web_seed_urls"));
+            assert_eq!(v["schema_version"].as_u64(), Some(1));
+            assert_eq!(v["max"].as_u64(), Some(2));
+            assert_eq!(v["ids"].as_array().map(|a| a.len()), Some(2));
+            let seeds = v["seeds"].as_array().expect("seeds array");
+            assert_eq!(seeds.len(), 2);
+            assert!(seeds[0].get("url").and_then(|x| x.as_str()).is_some());
+        }
+
+        #[tokio::test]
+        async fn web_seed_search_extract_works_on_local_urls() {
+            use axum::{http::header, routing::get, Router};
+            use std::net::SocketAddr;
+
+            async fn serve(app: Router) -> SocketAddr {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr: SocketAddr = listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                addr
+            }
+
+            // Local “seed docs” with distinctive tokens.
+            let app = Router::new()
+                .route(
+                    "/a",
+                    get(|| async {
+                        (
+                            [(header::CONTENT_TYPE, "text/markdown")],
+                            "# A\n\nseedtoken_a unique_a",
+                        )
+                    }),
+                )
+                .route(
+                    "/b",
+                    get(|| async {
+                        (
+                            [(header::CONTENT_TYPE, "text/markdown")],
+                            "# B\n\nseedtoken_b unique_b",
+                        )
+                    }),
+                );
+            let addr = serve(app).await;
+
+            let svc = WebpipeMcp::new().expect("new");
+            let r = svc
+                .web_seed_search_extract(Parameters(WebSeedSearchExtractArgs {
+                    query: "unique_b".to_string(),
+                    urls: Some(vec![format!("http://{addr}/a"), format!("http://{addr}/b")]),
+                    seed_ids: None,
+                    max_urls: Some(2),
+                    fetch_backend: Some("local".to_string()),
+                    no_network: Some(false),
+                    width: Some(80),
+                    max_chars: Some(10_000),
+                    max_bytes: Some(200_000),
+                    top_chunks: Some(3),
+                    merged_max_per_seed: None,
+                    max_chunk_chars: Some(300),
+                    cache_read: Some(false),
+                    cache_write: Some(false),
+                    cache_ttl_s: None,
+                    include_text: Some(false),
+                    compact: Some(true),
+                }))
+                .await
+                .expect("seed search extract");
+            let v = payload_from_call_tool_result(&r);
+            assert_eq!(v["ok"].as_bool(), Some(true));
+            assert_eq!(v["kind"].as_str(), Some("web_seed_search_extract"));
+            let merged = v["results"]["merged_chunks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(!merged.is_empty());
+            let any = merged.iter().any(|c| {
+                c.get("text")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|t| t.contains("unique_b"))
+            });
+            assert!(any, "expected to find query token in merged chunks");
+        }
+
+        #[test]
+        fn seed_registry_ids_are_unique_and_nonempty() {
+            let mut seen = std::collections::BTreeSet::<&'static str>::new();
+            for s in seed_registry() {
+                assert!(!s.id.trim().is_empty());
+                assert!(!s.url.trim().is_empty());
+                assert!(seen.insert(s.id), "duplicate seed id: {}", s.id);
+            }
+        }
+
+        #[test]
+        fn select_seed_urls_defaults_to_registry_order() {
+            let (picked, unknown) = select_seed_urls(seed_registry(), None, None, 3);
+            assert!(unknown.is_empty());
+            assert_eq!(picked.len(), 3);
+            assert_eq!(picked[0].0, "public-apis");
+            assert_eq!(picked[1].0, "awesome-selfhosted");
+            assert_eq!(picked[2].0, "awesome");
+        }
+
+        #[test]
+        fn select_seed_urls_respects_seed_ids_order_and_reports_unknowns() {
+            let (picked, unknown) = select_seed_urls(
+                seed_registry(),
+                None,
+                Some(vec![
+                    "awesome-python".to_string(),
+                    "nope".to_string(),
+                    "public-apis".to_string(),
+                    "awesome-python".to_string(), // duplicate should be ignored
+                ]),
+                10,
+            );
+            assert_eq!(picked.len(), 2);
+            assert_eq!(picked[0].0, "awesome-python");
+            assert_eq!(picked[1].0, "public-apis");
+            assert_eq!(unknown, vec!["nope".to_string()]);
+        }
+
+        #[test]
+        fn web_seed_urls_ids_only_includes_ids_array() {
+            let svc = WebpipeMcp::new().expect("new");
+            // We don't need async: the tool is async, so use a tokio runtime for a minimal call.
+            let rt = tokio::runtime::Runtime::new().expect("rt");
+            let r = rt
+                .block_on(svc.web_seed_urls(Parameters(WebSeedUrlsArgs {
+                    max: Some(5),
+                    include_ids: Some(true),
+                    ids_only: Some(true),
+                })))
+                .expect("call");
+            let v = payload_from_call_tool_result(&r);
+            assert_eq!(v["ok"].as_bool(), Some(true));
+            assert_eq!(v["kind"].as_str(), Some("web_seed_urls"));
+            assert_eq!(v["ids"].as_array().map(|a| a.len()), Some(5));
+            // ids_only should omit kind/note in seeds entries.
+            let seeds = v["seeds"].as_array().unwrap();
+            assert_eq!(seeds.len(), 5);
+            assert!(seeds[0].get("id").is_some());
+            assert!(seeds[0].get("url").is_some());
+            assert!(seeds[0].get("kind").is_none());
+            assert!(seeds[0].get("note").is_none());
+        }
+
+        #[tokio::test]
+        async fn web_seed_search_extract_rejects_all_unknown_seed_ids() {
+            let svc = WebpipeMcp::new().expect("new");
+            let r = svc
+                .web_seed_search_extract(Parameters(WebSeedSearchExtractArgs {
+                    query: "anything".to_string(),
+                    urls: None,
+                    seed_ids: Some(vec!["nope1".to_string(), "nope2".to_string()]),
+                    max_urls: Some(5),
+                    fetch_backend: Some("local".to_string()),
+                    no_network: Some(true),
+                    width: Some(80),
+                    max_chars: Some(2000),
+                    max_bytes: Some(200_000),
+                    top_chunks: Some(3),
+                    merged_max_per_seed: None,
+                    max_chunk_chars: Some(200),
+                    cache_read: Some(true),
+                    cache_write: Some(false),
+                    cache_ttl_s: None,
+                    include_text: Some(false),
+                    compact: Some(true),
+                }))
+                .await
+                .expect("call");
+            let v = payload_from_call_tool_result(&r);
+            assert_eq!(v["ok"].as_bool(), Some(false));
+            assert_eq!(
+                v["error"]["code"].as_str(),
+                Some(ErrorCode::InvalidParams.as_str())
+            );
+            assert_eq!(
+                v["unknown_seed_ids"].as_array().map(|a| a.len()),
+                Some(2)
+            );
+        }
+
+        #[tokio::test]
         async fn web_search_rejects_empty_query() {
             let _env = EnvGuard::new(&SEARCH_ENV_KEYS);
             let svc = WebpipeMcp::new().expect("new");
@@ -12250,7 +12987,8 @@ async fn main() -> Result<()> {
             let brave_configured =
                 has_env("WEBPIPE_BRAVE_API_KEY") || has_env("BRAVE_SEARCH_API_KEY");
             let tavily_configured = has_env("WEBPIPE_TAVILY_API_KEY") || has_env("TAVILY_API_KEY");
-            let searxng_configured = has_env("WEBPIPE_SEARXNG_ENDPOINT");
+            let searxng_configured =
+                has_env("WEBPIPE_SEARXNG_ENDPOINT") || has_env("WEBPIPE_SEARXNG_ENDPOINTS");
             let firecrawl_configured =
                 has_env("WEBPIPE_FIRECRAWL_API_KEY") || has_env("FIRECRAWL_API_KEY");
             let perplexity_configured =

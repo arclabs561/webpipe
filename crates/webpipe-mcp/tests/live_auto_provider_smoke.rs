@@ -95,7 +95,7 @@ fn webpipe_live_auto_search_smoke_opt_in() {
         assert_eq!(v["provider"].as_str(), Some("auto"));
         assert!(matches!(
             v["backend_provider"].as_str(),
-            Some("brave") | Some("tavily")
+            Some("brave") | Some("tavily") | Some("searxng")
         ));
         assert!(v["results"].is_array());
         assert!(v["results"].as_array().unwrap().len() <= 1);
@@ -104,7 +104,7 @@ fn webpipe_live_auto_search_smoke_opt_in() {
         assert_eq!(v["selection"]["requested_provider"].as_str(), Some("auto"));
         assert!(matches!(
             v["selection"]["selected_provider"].as_str(),
-            Some("brave") | Some("tavily")
+            Some("brave") | Some("tavily") | Some("searxng")
         ));
 
         service.cancel().await?;

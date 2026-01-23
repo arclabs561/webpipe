@@ -39,11 +39,32 @@ fn tavily_endpoint_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn searxng_endpoint_from_env() -> Option<String> {
-    std::env::var("WEBPIPE_SEARXNG_ENDPOINT")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+pub fn searxng_endpoints_from_env() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    // Allow a comma/whitespace-separated list of endpoints for simple load spreading.
+    if let Ok(v) = std::env::var("WEBPIPE_SEARXNG_ENDPOINTS") {
+        for raw in v.split(|c: char| c == ',' || c.is_whitespace()) {
+            let s = raw.trim();
+            if s.is_empty() {
+                continue;
+            }
+            let s = s.to_string();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+
+    // Back-compat: single endpoint.
+    if let Ok(v) = std::env::var("WEBPIPE_SEARXNG_ENDPOINT") {
+        let s = v.trim().to_string();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +82,7 @@ pub struct TavilySearchProvider {
 #[derive(Debug, Clone)]
 pub struct SearxngSearchProvider {
     client: reqwest::Client,
-    endpoint: String,
+    endpoints: Vec<String>,
 }
 
 impl TavilySearchProvider {
@@ -96,19 +117,110 @@ impl BraveSearchProvider {
 
 impl SearxngSearchProvider {
     pub fn from_env(client: reqwest::Client) -> Result<Self> {
-        let endpoint = searxng_endpoint_from_env()
-            .ok_or_else(|| Error::NotConfigured("missing WEBPIPE_SEARXNG_ENDPOINT".to_string()))?;
-        Ok(Self { client, endpoint })
+        let endpoints = searxng_endpoints_from_env();
+        if endpoints.is_empty() {
+            return Err(Error::NotConfigured(
+                "missing WEBPIPE_SEARXNG_ENDPOINT (or WEBPIPE_SEARXNG_ENDPOINTS)".to_string(),
+            ));
+        }
+        Ok(Self { client, endpoints })
     }
 
-    fn endpoint_search(&self) -> String {
+    fn endpoint_search_for(base_endpoint: &str) -> String {
         // Accept either a base URL (…/), or a full /search endpoint.
-        let mut base = self.endpoint.trim().trim_end_matches('/').to_string();
+        let mut base = base_endpoint.trim().trim_end_matches('/').to_string();
         if !base.ends_with("/search") {
             base.push_str("/search");
         }
         base
     }
+
+    fn stable_hash64(query: &SearchQuery) -> u64 {
+        // Stable across runs (unlike HashMap's RandomState).
+        // FNV-1a over a few “routing” fields.
+        let mut h: u64 = 1469598103934665603;
+        for b in query.query.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+        if let Some(lang) = query.language.as_deref() {
+            for b in lang.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(1099511628211);
+            }
+        }
+        if let Some(country) = query.country.as_deref() {
+            for b in country.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(1099511628211);
+            }
+        }
+        h
+    }
+
+    fn pick_endpoint_index(&self, q: &SearchQuery) -> usize {
+        if self.endpoints.is_empty() {
+            return 0;
+        }
+        (Self::stable_hash64(q) as usize) % self.endpoints.len()
+    }
+
+    // endpoint_search removed: we now route via `searxng_search_at_endpoint`.
+}
+
+pub async fn searxng_search_at_endpoint(
+    client: &reqwest::Client,
+    base_endpoint: &str,
+    q: &SearchQuery,
+) -> Result<SearchResponse> {
+    let t0 = Instant::now();
+    let max_results = q.max_results.unwrap_or(10).min(20);
+
+    let endpoint_search = SearxngSearchProvider::endpoint_search_for(base_endpoint);
+    let mut req = client
+        .get(endpoint_search)
+        .query(&[("q", q.query.as_str()), ("format", "json")]);
+
+    // Best-effort hints: SearXNG supports `language` on many instances.
+    if let Some(lang) = q.language.as_deref() {
+        req = req.query(&[("language", lang)]);
+    }
+
+    let resp = req.send().await.map_err(|e| Error::Search(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(Error::Search(format!("searxng search HTTP {status}")));
+    }
+
+    let parsed: SearxngSearchResponse = resp
+        .json()
+        .await
+        .map_err(|e| Error::Search(e.to_string()))?;
+
+    let mut out = Vec::new();
+    if let Some(rs) = parsed.results {
+        for r in rs.into_iter().take(max_results) {
+            let Some(url) = r.url else { continue };
+            out.push(SearchResult {
+                url,
+                title: r.title,
+                snippet: r.content,
+                source: "searxng".to_string(),
+            });
+        }
+    }
+
+    let mut timings_ms = BTreeMap::new();
+    timings_ms.insert("search".to_string(), t0.elapsed().as_millis());
+
+    Ok(SearchResponse {
+        results: out,
+        provider: "searxng".to_string(),
+        // Best-effort: treat SearXNG as “free” in our cost accounting unless the user
+        // wants to map it to a budget externally.
+        cost_units: 0,
+        timings_ms,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,54 +408,10 @@ impl SearchProvider for SearxngSearchProvider {
     }
 
     async fn search(&self, q: &SearchQuery) -> Result<SearchResponse> {
-        let t0 = Instant::now();
-        let max_results = q.max_results.unwrap_or(10).min(20);
-
-        let mut req = self
-            .client
-            .get(self.endpoint_search())
-            .query(&[("q", q.query.as_str()), ("format", "json")]);
-
-        // Best-effort hints: SearXNG supports `language` on many instances.
-        if let Some(lang) = q.language.as_deref() {
-            req = req.query(&[("language", lang)]);
-        }
-
-        let resp = req.send().await.map_err(|e| Error::Search(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::Search(format!("searxng search HTTP {status}")));
-        }
-
-        let parsed: SearxngSearchResponse = resp
-            .json()
-            .await
-            .map_err(|e| Error::Search(e.to_string()))?;
-
-        let mut out = Vec::new();
-        if let Some(rs) = parsed.results {
-            for r in rs.into_iter().take(max_results) {
-                let Some(url) = r.url else { continue };
-                out.push(SearchResult {
-                    url,
-                    title: r.title,
-                    snippet: r.content,
-                    source: "searxng".to_string(),
-                });
-            }
-        }
-
-        let mut timings_ms = BTreeMap::new();
-        timings_ms.insert("search".to_string(), t0.elapsed().as_millis());
-
-        Ok(SearchResponse {
-            results: out,
-            provider: "searxng".to_string(),
-            // Best-effort: treat SearXNG as “free” in our cost accounting unless the user
-            // wants to map it to a budget externally.
-            cost_units: 0,
-            timings_ms,
-        })
+        // Deterministic sharding when multiple endpoints are configured.
+        let idx = self.pick_endpoint_index(q);
+        let base_endpoint = self.endpoints.get(idx).map(|s| s.as_str()).unwrap_or("");
+        searxng_search_at_endpoint(&self.client, base_endpoint, q).await
     }
 }
 
@@ -432,5 +500,31 @@ mod tests {
         "#;
         let parsed: SearxngSearchResponse = serde_json::from_str(js).unwrap();
         assert_eq!(parsed.results.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn searxng_endpoints_from_env_accepts_list_and_dedups() {
+        let _g1 = EnvGuard::set("WEBPIPE_SEARXNG_ENDPOINTS", "http://a, http://b http://a");
+        let _g2 = EnvGuard::set("WEBPIPE_SEARXNG_ENDPOINT", "http://b");
+        let eps = searxng_endpoints_from_env();
+        assert_eq!(eps, vec!["http://a".to_string(), "http://b".to_string()]);
+    }
+
+    #[test]
+    fn searxng_endpoint_sharding_is_deterministic_for_same_query() {
+        let p = SearxngSearchProvider {
+            client: reqwest::Client::new(),
+            endpoints: vec!["http://a".to_string(), "http://b".to_string()],
+        };
+        let q = SearchQuery {
+            query: "hello world".to_string(),
+            max_results: None,
+            language: Some("en".to_string()),
+            country: Some("us".to_string()),
+        };
+        let i1 = p.pick_endpoint_index(&q);
+        let i2 = p.pick_endpoint_index(&q);
+        assert_eq!(i1, i2);
+        assert!(i1 < 2);
     }
 }

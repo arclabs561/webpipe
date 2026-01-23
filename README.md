@@ -28,10 +28,13 @@ webpipe mcp-stdio
 
 Use `mcp.example.json` as a starting point (it intentionally contains **no API keys**).
 
+Keyless workflow tip:
+- Use the MCP tool `web_seed_urls` to get curated “awesome list” seed URLs, then call `web_search_extract` with `urls=[...]` and `url_selection_mode=query_rank`.
+
 Environment variables (optional, provider-dependent):
 - **Brave search**: `WEBPIPE_BRAVE_API_KEY` (or `BRAVE_SEARCH_API_KEY`)
 - **Tavily search**: `WEBPIPE_TAVILY_API_KEY` (or `TAVILY_API_KEY`)
-- **SearXNG search** (self-hosted): `WEBPIPE_SEARXNG_ENDPOINT`
+- **SearXNG search** (self-hosted): `WEBPIPE_SEARXNG_ENDPOINT` (or `WEBPIPE_SEARXNG_ENDPOINTS`)
 - **Firecrawl fetch**: `WEBPIPE_FIRECRAWL_API_KEY` (or `FIRECRAWL_API_KEY`)
 - **Perplexity deep research**: `WEBPIPE_PERPLEXITY_API_KEY` (or `PERPLEXITY_API_KEY`)
 - **ArXiv endpoint override** (debug): `WEBPIPE_ARXIV_ENDPOINT` (default `https://export.arxiv.org/api/query`)

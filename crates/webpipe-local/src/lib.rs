@@ -569,4 +569,81 @@ mod tests {
         // Clean up to avoid leaking env state across tests.
         std::env::remove_var("WEBPIPE_ALLOW_UNSAFE_HEADERS");
     }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cache_key_ignores_sensitive_headers_by_default_but_not_when_opted_in() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let app = Router::new().route(
+            "/",
+            get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "hello") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fetcher = LocalFetcher::new(Some(tmp.path().to_path_buf())).unwrap();
+
+        let base_req = FetchRequest {
+            url: format!("http://{}/", addr),
+            timeout_ms: Some(2_000),
+            max_bytes: Some(100_000),
+            headers: BTreeMap::new(),
+            cache: FetchCachePolicy {
+                read: true,
+                write: true,
+                ttl_s: Some(60),
+            },
+        };
+
+        // Default: sensitive headers must NOT affect the cache key.
+        std::env::remove_var("WEBPIPE_ALLOW_UNSAFE_HEADERS");
+        {
+            let mut req_a = base_req.clone();
+            req_a
+                .headers
+                .insert("Authorization".to_string(), "Bearer A".to_string());
+            let r1 = fetcher.fetch(&req_a).await.unwrap();
+            assert_eq!(r1.source, FetchSource::Network);
+
+            let mut req_b = base_req.clone();
+            req_b
+                .headers
+                .insert("Authorization".to_string(), "Bearer B".to_string());
+            let r2 = fetcher.fetch(&req_b).await.unwrap();
+            assert_eq!(
+                r2.source,
+                FetchSource::Cache,
+                "Authorization should not change cache key by default"
+            );
+        }
+
+        // Opt-in: sensitive headers MAY affect caching (and should avoid reusing the prior cache entry).
+        std::env::set_var("WEBPIPE_ALLOW_UNSAFE_HEADERS", "true");
+        {
+            let mut req_a = base_req.clone();
+            req_a
+                .headers
+                .insert("Authorization".to_string(), "Bearer A".to_string());
+            let r1 = fetcher.fetch(&req_a).await.unwrap();
+            assert_eq!(r1.source, FetchSource::Network);
+
+            let mut req_b = base_req.clone();
+            req_b
+                .headers
+                .insert("Authorization".to_string(), "Bearer B".to_string());
+            let r2 = fetcher.fetch(&req_b).await.unwrap();
+            assert_eq!(
+                r2.source,
+                FetchSource::Network,
+                "Authorization should change cache key when WEBPIPE_ALLOW_UNSAFE_HEADERS=true"
+            );
+        }
+
+        std::env::remove_var("WEBPIPE_ALLOW_UNSAFE_HEADERS");
+    }
 }
