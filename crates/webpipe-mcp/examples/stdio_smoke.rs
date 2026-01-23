@@ -131,6 +131,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(seeds[0].get("note").is_none());
     }
 
+    // Some IDE clients occasionally send no arguments (or null) for tools with optional params.
+    // This should still return a valid payload shape.
+    let seed_urls_no_args = service
+        .call_tool(CallToolRequestParam {
+            name: "web_seed_urls".into(),
+            arguments: None,
+        })
+        .await?;
+    println!("web_seed_urls(no args): {:?}", seed_urls_no_args.is_error);
+    if let Some(s) = first_text(&seed_urls_no_args) {
+        let v: serde_json::Value = serde_json::from_str(s)?;
+        assert_eq!(v["schema_version"].as_u64(), Some(1));
+        assert_eq!(v["kind"].as_str(), Some("web_seed_urls"));
+        assert_eq!(v["ok"].as_bool(), Some(true));
+        assert!(v["seeds"].is_array());
+    }
+
     // Meta should always work offline and without keys.
     let meta = service
         .call_tool(CallToolRequestParam {
