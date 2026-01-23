@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "webpipe_e2e_queries",
+  "notes": "Seed E2E query set. Intended for localhost/stubbed endpoints (CI-safe) and opt-in live runs.",
+  "queries": [
+    {
+      "query_id": "local-docs-route-handlers",
+      "query": "route handlers",
+      "tags": ["docs", "html", "stub"],
+      "url_paths": ["/docs", "/docs/app/getting-started/route-handlers"]
+    },
+    {
+      "query_id": "local-install",
+      "query": "install",
+      "tags": ["docs", "html", "stub"],
+      "url_paths": ["/install", "/install/linux"]
+    }
+  ]
+}
+

@@ -470,4 +470,15 @@ mod tests {
         assert_eq!(rv["kind"].as_str(), Some("webpipe_seed_qrels"));
         assert!(!rv["qrels"].as_array().unwrap().is_empty());
     }
+
+    #[test]
+    fn e2e_queries_fixture_is_parseable_json() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let raw =
+            std::fs::read_to_string(base.join("e2e_queries_v1.json")).expect("e2e_queries_v1.json");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(v["schema_version"].as_u64(), Some(1));
+        assert_eq!(v["kind"].as_str(), Some("webpipe_e2e_queries"));
+        assert!(!v["queries"].as_array().unwrap().is_empty());
+    }
 }

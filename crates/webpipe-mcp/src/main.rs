@@ -5069,6 +5069,16 @@ mod mcp {
             if let Some(ref k) = query_key {
                 payload["query_key"] = serde_json::json!(k);
             }
+            // E2E/debugging: always surface which provider actually supplied results, even when
+            // the requested provider was "auto" or "merge".
+            //
+            // For urls-mode (no search step), we leave this unset (or set to null) rather than
+            // inventing a synthetic provider name.
+            if let Some(p) = search_backend_provider.as_deref() {
+                payload["backend_provider"] = serde_json::json!(p);
+            } else {
+                payload["backend_provider"] = serde_json::Value::Null;
+            }
             if agentic {
                 if compact {
                     let mut stuck_events = 0usize;
