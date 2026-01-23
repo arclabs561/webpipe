@@ -32,6 +32,8 @@ enum Commands {
     EvalMatrixScore(EvalMatrixScoreCmd),
     /// Export eval-matrix JSONL rows into a judge-ready JSONL dataset (optionally joined with qrels).
     EvalMatrixExport(EvalMatrixExportCmd),
+    /// Deterministic baseline judge over exported eval-matrix examples (json).
+    EvalMatrixJudge(EvalMatrixJudgeCmd),
     /// Diagnose configuration/launch issues (json; no secrets).
     Doctor(DoctorCmd),
     /// Print version info.
@@ -254,6 +256,19 @@ struct EvalMatrixExportCmd {
     #[arg(long, default_value_t = 4000)]
     max_text_chars: usize,
     /// Output JSONL path (default: .generated/webpipe-eval-matrix-export-<epoch>.jsonl)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+struct EvalMatrixJudgeCmd {
+    /// Exported examples path produced by `eval-matrix-export` (jsonl).
+    #[arg(long)]
+    examples_artifact: std::path::PathBuf,
+    /// Output JSON path (default: .generated/webpipe-eval-matrix-judge-<epoch>.json)
     #[arg(long)]
     out: Option<std::path::PathBuf>,
     /// Override "now" for deterministic outputs.
@@ -13577,6 +13592,178 @@ async fn main() -> Result<()> {
                 writeln!(f, "{}", serde_json::to_string(&r)?)?;
             }
 
+            println!("{}", out.display());
+        }
+        Commands::EvalMatrixJudge(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    ".generated/webpipe-eval-matrix-judge-{now}.json"
+                ))
+            });
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+
+            let raw = std::fs::read_to_string(&args.examples_artifact)?;
+
+            fn tokenize_ascii(s: &str) -> Vec<String> {
+                // Deterministic, cheap tokenization for overlap checks.
+                let mut out = Vec::new();
+                let mut cur = String::new();
+                for ch in s.chars() {
+                    let c = ch.to_ascii_lowercase();
+                    if c.is_ascii_alphanumeric() {
+                        cur.push(c);
+                    } else {
+                        if cur.len() >= 3 {
+                            out.push(cur.clone());
+                        }
+                        cur.clear();
+                    }
+                }
+                if cur.len() >= 3 {
+                    out.push(cur);
+                }
+                out
+            }
+
+            fn is_low_signal_text(t: &str) -> bool {
+                let s = t.to_ascii_lowercase();
+                // Cheap heuristics: known failure modes for JS apps/auth walls.
+                s.contains("enable javascript")
+                    || s.contains("javascript required")
+                    || s.contains("access denied")
+                    || s.contains("sign in")
+                    || s.contains("captcha")
+                    || s.contains("cloudflare")
+                    || s.contains("loading...")
+            }
+
+            let mut per_example = Vec::new();
+            let mut totals = serde_json::json!({
+                "examples": 0u64,
+                "by_case": {},
+                "metrics": {
+                    "ok": 0u64,
+                    "hit_expected_url": 0u64,
+                    "nonempty_text": 0u64,
+                    "query_overlap": 0u64,
+                    "low_signal": 0u64
+                }
+            });
+
+            for (i, line) in raw.lines().enumerate() {
+                let s = line.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let ex: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+                    anyhow::anyhow!("examples_artifact line {}: invalid json: {}", i + 1, e)
+                })?;
+
+                let case = ex.get("case").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let ok = ex.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                let hit = ex
+                    .get("hit_expected_url")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let query = ex.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let text = ex.get("judge_text").and_then(|v| v.as_str()).unwrap_or("");
+
+                let nonempty_text = !text.trim().is_empty();
+                let low_signal = nonempty_text && is_low_signal_text(text);
+
+                let q_tokens = tokenize_ascii(query);
+                let t_tokens = tokenize_ascii(text);
+                let mut overlap = 0usize;
+                if !q_tokens.is_empty() && !t_tokens.is_empty() {
+                    let tset: std::collections::BTreeSet<&str> =
+                        t_tokens.iter().map(|s| s.as_str()).collect();
+                    for qt in &q_tokens {
+                        if tset.contains(qt.as_str()) {
+                            overlap += 1;
+                        }
+                    }
+                }
+                let query_overlap = overlap >= 1;
+
+                // Baseline pass/fail: must be ok + not low-signal + (hit OR overlap).
+                let pass = ok && nonempty_text && !low_signal && (hit || query_overlap);
+
+                totals["examples"] =
+                    serde_json::json!(totals["examples"].as_u64().unwrap_or(0) + 1);
+                if ok {
+                    totals["metrics"]["ok"] =
+                        serde_json::json!(totals["metrics"]["ok"].as_u64().unwrap_or(0) + 1);
+                }
+                if hit {
+                    totals["metrics"]["hit_expected_url"] = serde_json::json!(
+                        totals["metrics"]["hit_expected_url"].as_u64().unwrap_or(0) + 1
+                    );
+                }
+                if nonempty_text {
+                    totals["metrics"]["nonempty_text"] = serde_json::json!(
+                        totals["metrics"]["nonempty_text"].as_u64().unwrap_or(0) + 1
+                    );
+                }
+                if query_overlap {
+                    totals["metrics"]["query_overlap"] = serde_json::json!(
+                        totals["metrics"]["query_overlap"].as_u64().unwrap_or(0) + 1
+                    );
+                }
+                if low_signal {
+                    totals["metrics"]["low_signal"] = serde_json::json!(
+                        totals["metrics"]["low_signal"].as_u64().unwrap_or(0) + 1
+                    );
+                }
+
+                // Per-case counters
+                if totals["by_case"][case].is_null() {
+                    totals["by_case"][case] = serde_json::json!({
+                        "examples": 0u64,
+                        "pass": 0u64
+                    });
+                }
+                totals["by_case"][case]["examples"] = serde_json::json!(
+                    totals["by_case"][case]["examples"].as_u64().unwrap_or(0) + 1
+                );
+                if pass {
+                    totals["by_case"][case]["pass"] = serde_json::json!(
+                        totals["by_case"][case]["pass"].as_u64().unwrap_or(0) + 1
+                    );
+                }
+
+                per_example.push(serde_json::json!({
+                    "query_id": ex.get("query_id").cloned().unwrap_or(serde_json::Value::Null),
+                    "case": case,
+                    "ok": ok,
+                    "hit_expected_url": hit,
+                    "nonempty_text": nonempty_text,
+                    "low_signal": low_signal,
+                    "query_overlap": query_overlap,
+                    "pass": pass
+                }));
+            }
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_matrix_judge",
+                "generated_at_epoch_s": now,
+                "inputs": {
+                    "examples_artifact": args.examples_artifact
+                },
+                "totals": totals,
+                "per_example": per_example
+            });
+
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
             println!("{}", out.display());
         }
         Commands::Doctor(args) => {
