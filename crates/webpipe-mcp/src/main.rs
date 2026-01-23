@@ -25,6 +25,9 @@ enum Commands {
     /// Run a local search->fetch->extract evaluation harness (writes a JSON artifact).
     #[cfg(feature = "stdio")]
     EvalSearchExtract(EvalSearchExtractCmd),
+    /// Run a small E2E matrix over a versioned query set (writes a JSONL artifact).
+    #[cfg(feature = "stdio")]
+    EvalMatrix(EvalMatrixCmd),
     /// Diagnose configuration/launch issues (json; no secrets).
     Doctor(DoctorCmd),
     /// Print version info.
@@ -164,6 +167,54 @@ struct EvalSearchExtractCmd {
     include_text: bool,
 
     /// Output JSON path (default: .generated/webpipe-eval-search-extract-<epoch>.json)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+struct EvalMatrixCmd {
+    /// E2E query dataset (json), e.g. `crates/webpipe-mcp/fixtures/e2e_queries_v1.json`.
+    #[arg(long)]
+    queries_json: std::path::PathBuf,
+    /// Base URL used to expand `url_paths` entries in the dataset.
+    ///
+    /// Example: http://127.0.0.1:8080
+    #[arg(long)]
+    base_url: String,
+    /// Provider to use for the "search" leg. Allowed: auto, brave, tavily, searxng
+    #[arg(long, default_value = "searxng")]
+    provider: String,
+    /// When provider="auto", choose routing mode. Allowed: fallback, merge, mab
+    #[arg(long, default_value = "fallback")]
+    auto_mode: String,
+    /// How to select `top_chunks` across URLs. Allowed: score, pareto
+    #[arg(long, default_value = "score")]
+    selection_mode: String,
+    /// Which fetch backend to use. Allowed: local, firecrawl
+    #[arg(long, default_value = "local")]
+    fetch_backend: String,
+    /// Max search results to request (default: 1; max: 20).
+    #[arg(long, default_value_t = 1)]
+    max_results: usize,
+    /// Max URLs to process (default: 1; max: 10).
+    #[arg(long, default_value_t = 1)]
+    max_urls: usize,
+    /// Fetch timeout per URL (ms).
+    #[arg(long, default_value_t = 20_000)]
+    timeout_ms: u64,
+    /// Max bytes per URL.
+    #[arg(long, default_value_t = 2_000_000)]
+    max_bytes: u64,
+    /// Across-URL top chunks cap.
+    #[arg(long, default_value_t = 2)]
+    top_chunks: usize,
+    /// Max chars per chunk.
+    #[arg(long, default_value_t = 200)]
+    max_chunk_chars: usize,
+    /// Output JSONL path (default: .generated/webpipe-eval-matrix-<epoch>.jsonl)
     #[arg(long)]
     out: Option<std::path::PathBuf>,
     /// Override "now" for deterministic outputs.
@@ -1032,7 +1083,9 @@ mod mcp {
 
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebFetchArgs {
-        url: String,
+        /// URL to fetch (required).
+        #[serde(default)]
+        url: Option<String>,
         /// Which fetch backend to use (default: local). Allowed: local, firecrawl
         #[serde(default)]
         fetch_backend: Option<String>,
@@ -1068,7 +1121,9 @@ mod mcp {
 
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebExtractArgs {
-        url: String,
+        /// URL to fetch+extract (required).
+        #[serde(default)]
+        url: Option<String>,
         /// Which fetch backend to use (default: local). Allowed: local, firecrawl
         #[serde(default)]
         fetch_backend: Option<String>,
@@ -1135,7 +1190,9 @@ mod mcp {
 
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebSearchArgs {
-        query: String,
+        /// Search query (required).
+        #[serde(default)]
+        query: Option<String>,
         /// Which provider to use (default: brave). Allowed: auto, brave, tavily, searxng
         #[serde(default)]
         provider: Option<String>,
@@ -1156,7 +1213,8 @@ mod mcp {
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct ArxivSearchArgs {
         /// Search query (required).
-        query: String,
+        #[serde(default)]
+        query: Option<String>,
         /// Optional ArXiv categories like "cs.LG", "stat.ML".
         #[serde(default)]
         categories: Option<Vec<String>>,
@@ -1183,7 +1241,8 @@ mod mcp {
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct ArxivEnrichArgs {
         /// ArXiv ID (e.g. "0805.3415") or an arxiv.org/abs URL.
-        id_or_url: String,
+        #[serde(default)]
+        id_or_url: Option<String>,
         /// If true, find best-effort discussion/commentary via web search (bounded).
         #[serde(default)]
         include_discussions: Option<bool>,
@@ -1198,7 +1257,8 @@ mod mcp {
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebCacheSearchExtractArgs {
         /// Search query (required).
-        query: String,
+        #[serde(default)]
+        query: Option<String>,
         /// Max cached documents to inspect (default: 50; max: 500).
         #[serde(default)]
         max_docs: Option<usize>,
@@ -2780,7 +2840,7 @@ mod mcp {
             for (id, url) in urls.iter() {
                 let r = self
                     .web_extract(p(WebExtractArgs {
-                        url: url.clone(),
+                        url: Some(url.clone()),
                         fetch_backend: Some(fetch_backend.clone()),
                         no_network: Some(no_network),
                         width: Some(width),
@@ -3059,11 +3119,11 @@ mod mcp {
             self.stats_inc_tool("arxiv_search");
             let t0 = std::time::Instant::now();
 
-            let query = args.query.trim().to_string();
+            let query = args.query.clone().unwrap_or_default().trim().to_string();
             if query.is_empty() {
                 let mut payload = serde_json::json!({
                     "ok": false,
-                    "query": args.query,
+                    "query": args.query.unwrap_or_default(),
                     "error": error_obj(ErrorCode::InvalidParams, "query must be non-empty", "Pass a non-empty query string.")
                 });
                 add_envelope_fields(&mut payload, "arxiv_search", t0.elapsed().as_millis());
@@ -3175,7 +3235,7 @@ mod mcp {
             self.stats_inc_tool("arxiv_enrich");
             let t0 = std::time::Instant::now();
 
-            let raw = args.id_or_url.trim().to_string();
+            let raw = args.id_or_url.unwrap_or_default().trim().to_string();
             if raw.is_empty() {
                 let mut payload = serde_json::json!({
                     "ok": false,
@@ -3221,7 +3281,7 @@ mod mcp {
                 let q = format!("{} discussion", abs_url);
                 let r = self
                     .web_search(p(WebSearchArgs {
-                        query: q,
+                        query: Some(q),
                         provider: Some("auto".to_string()),
                         auto_mode: Some("mab".to_string()),
                         max_results: Some(max_discussion_urls),
@@ -3531,7 +3591,7 @@ mod mcp {
                 // Use our existing web_search tool logic to keep routing/fallback consistent.
                 let sr = self
                     .web_search(p(WebSearchArgs {
-                        query: q.clone(),
+                        query: Some(q.clone()),
                         provider: Some(requested_provider.clone()),
                         auto_mode: Some(requested_auto_mode.clone()),
                         max_results: Some(max_results),
@@ -3976,7 +4036,7 @@ mod mcp {
                     let query2 = query.trim().to_string();
                     let sr2 = self
                         .web_search(p(WebSearchArgs {
-                            query: query2.clone(),
+                            query: Some(query2.clone()),
                             provider: Some(prov2.clone()),
                             auto_mode: Some(auto2.clone()),
                             max_results: Some(max_results),
@@ -5143,11 +5203,11 @@ mod mcp {
             self.stats_inc_tool("web_cache_search_extract");
             let t0 = std::time::Instant::now();
 
-            let query = args.query.trim().to_string();
+            let query = args.query.clone().unwrap_or_default().trim().to_string();
             if query.is_empty() {
                 let mut payload = serde_json::json!({
                     "ok": false,
-                    "query": args.query,
+                    "query": args.query.unwrap_or_default(),
                     "error": error_obj(ErrorCode::InvalidParams, "query must be a non-empty string", "Pass a non-empty `query`."),
                 });
                 add_envelope_fields(
@@ -6513,7 +6573,7 @@ mod mcp {
             let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
             let no_network = args.no_network.unwrap_or(false);
 
-            let url = args.url;
+            let url = args.url.unwrap_or_default();
             let t0 = std::time::Instant::now();
             if url.trim().is_empty() {
                 let mut payload = serde_json::json!({
@@ -6972,7 +7032,7 @@ mod mcp {
             let client = self.http.clone();
 
             // Keep these as plain values so we can reuse them across fallbacks without moving.
-            let query = args.query;
+            let query = args.query.unwrap_or_default();
             let language = args.language;
             let country = args.country;
 
@@ -8697,7 +8757,7 @@ mod mcp {
             let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
             let no_network = args.no_network.unwrap_or(false);
 
-            let url = args.url;
+            let url = args.url.unwrap_or_default();
             let t0 = std::time::Instant::now();
             if url.trim().is_empty() {
                 let mut payload = serde_json::json!({
@@ -9755,7 +9815,7 @@ mod mcp {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
                 .web_search(p(WebSearchArgs {
-                    query: "q".to_string(),
+                    query: Some("q".to_string()),
                     provider: Some("auto".to_string()),
                     auto_mode: Some("fallback".to_string()),
                     max_results: Some(3),
@@ -9789,7 +9849,7 @@ mod mcp {
             // brave (not configured)
             let r1 = svc
                 .web_search(p(WebSearchArgs {
-                    query: "q1".to_string(),
+                    query: Some("q1".to_string()),
                     provider: Some("brave".to_string()),
                     auto_mode: None,
                     max_results: Some(1),
@@ -9811,7 +9871,7 @@ mod mcp {
             // tavily (not configured)
             let r2 = svc
                 .web_search(p(WebSearchArgs {
-                    query: "q2".to_string(),
+                    query: Some("q2".to_string()),
                     provider: Some("tavily".to_string()),
                     auto_mode: None,
                     max_results: Some(1),
@@ -10516,7 +10576,7 @@ mod mcp {
                 .web_search(p(WebSearchArgs {
                     provider: Some("auto".to_string()),
                     auto_mode: Some("fallback".to_string()),
-                    query: "q".to_string(),
+                    query: Some("q".to_string()),
                     country: None,
                     language: None,
                     max_results: Some(1),
@@ -10594,7 +10654,7 @@ mod mcp {
                 .web_search(p(WebSearchArgs {
                     provider: Some("auto".to_string()),
                     auto_mode: Some("fallback".to_string()),
-                    query: "q".to_string(),
+                    query: Some("q".to_string()),
                     country: None,
                     language: None,
                     max_results: Some(1),
@@ -11730,7 +11790,7 @@ mod mcp {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
                 .web_extract(p(WebExtractArgs {
-                    url,
+                    url: Some(url),
                     fetch_backend: Some("local".to_string()),
                     no_network: Some(false),
                     width: Some(80),
@@ -11794,7 +11854,7 @@ mod mcp {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
                 .web_fetch(p(WebFetchArgs {
-                    url,
+                    url: Some(url),
                     fetch_backend: Some("local".to_string()),
                     no_network: Some(false),
                     timeout_ms: Some(2_000),
@@ -11993,7 +12053,7 @@ mod mcp {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
                 .web_extract(p(WebExtractArgs {
-                    url: "https://example.com/".to_string(),
+                    url: Some("https://example.com/".to_string()),
                     fetch_backend: Some("firecrawl".to_string()),
                     no_network: Some(false),
                     width: Some(80),
@@ -12062,7 +12122,7 @@ mod mcp {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
                 .web_extract(p(WebExtractArgs {
-                    url: "https://example.com/".to_string(),
+                    url: Some("https://example.com/".to_string()),
                     fetch_backend: Some("firecrawl".to_string()),
                     no_network: Some(false),
                     width: Some(80),
@@ -12420,7 +12480,7 @@ mod mcp {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
                 .web_search(Parameters(Some(WebSearchArgs {
-                    query: "   ".to_string(),
+                    query: Some("   ".to_string()),
                     provider: Some("brave".to_string()),
                     auto_mode: None,
                     max_results: Some(5),
@@ -12445,7 +12505,7 @@ mod mcp {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
                 .web_search(Parameters(Some(WebSearchArgs {
-                    query: "q".to_string(),
+                    query: Some("q".to_string()),
                     provider: Some("nope".to_string()),
                     auto_mode: None,
                     max_results: Some(1),
@@ -12470,7 +12530,7 @@ mod mcp {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
                 .web_fetch(Parameters(Some(WebFetchArgs {
-                    url: "   ".to_string(),
+                    url: Some("   ".to_string()),
                     fetch_backend: None,
                     no_network: None,
                     timeout_ms: None,
@@ -12499,7 +12559,7 @@ mod mcp {
             let svc = WebpipeMcp::new().expect("new");
             let r = svc
                 .web_extract(Parameters(Some(WebExtractArgs {
-                    url: "   ".to_string(),
+                    url: Some("   ".to_string()),
                     fetch_backend: None,
                     no_network: None,
                     width: None,
@@ -12997,6 +13057,195 @@ async fn main() -> Result<()> {
             });
 
             std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
+        }
+        #[cfg(feature = "stdio")]
+        Commands::EvalMatrix(args) => {
+            use rmcp::handler::server::wrapper::Parameters;
+
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(".generated/webpipe-eval-matrix-{now}.jsonl"))
+            });
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+
+            let base_url = args.base_url.trim_end_matches('/').to_string();
+            let e2e = eval::load_e2e_queries_v1(&args.queries_json)?;
+
+            let svc = mcp::WebpipeMcp::new().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&out)?);
+
+            let max_results = args.max_results.clamp(1, 20);
+            let max_urls = args.max_urls.clamp(1, 10);
+            let top_chunks = args.top_chunks.min(50).max(1);
+            let max_chunk_chars = args.max_chunk_chars.min(5_000).max(20);
+
+            let call_json = |r: rmcp::model::CallToolResult| -> Result<serde_json::Value> {
+                let s = r
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap_or_default();
+                Ok(serde_json::from_str(&s)?)
+            };
+
+            for q in e2e.queries {
+                let urls: Vec<String> = q
+                    .url_paths
+                    .iter()
+                    .map(|p| format!("{base_url}/{}", p.trim_start_matches('/')))
+                    .collect();
+
+                // Case A: search leg (uses configured providers/endpoints via env)
+                let t0 = std::time::Instant::now();
+                let res_a = svc
+                    .web_search_extract(Parameters(Some(mcp::WebSearchExtractArgs {
+                        query: Some(q.query.clone()),
+                        urls: None,
+                        provider: Some(args.provider.clone()),
+                        auto_mode: Some(args.auto_mode.clone()),
+                        selection_mode: Some(args.selection_mode.clone()),
+                        fetch_backend: Some(args.fetch_backend.clone()),
+                        no_network: Some(false),
+                        max_results: Some(max_results),
+                        max_urls: Some(max_urls),
+                        timeout_ms: Some(args.timeout_ms),
+                        max_bytes: Some(args.max_bytes),
+                        top_chunks: Some(top_chunks),
+                        max_chunk_chars: Some(max_chunk_chars),
+                        include_links: Some(false),
+                        include_text: Some(false),
+                        agentic: Some(false),
+                        url_selection_mode: Some("preserve".to_string()),
+                        cache_read: Some(true),
+                        cache_write: Some(true),
+                        ..Default::default()
+                    })))
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+                let row_a = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_matrix_row",
+                    "generated_at_epoch_s": now,
+                    "case": "search",
+                    "query_id": q.query_id,
+                    "query": q.query,
+                    "tags": q.tags,
+                    "urls": urls,
+                    "elapsed_ms": t0.elapsed().as_millis(),
+                    "result": call_json(res_a)?
+                });
+                use std::io::Write;
+                writeln!(f, "{}", serde_json::to_string(&row_a)?)?;
+
+                // Case B: warm cache via urls-mode (bounded)
+                let t1 = std::time::Instant::now();
+                let res_b = svc
+                    .web_search_extract(Parameters(Some(mcp::WebSearchExtractArgs {
+                        query: row_a.get("query").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        urls: Some(
+                            row_a
+                                .get("urls")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect(),
+                        ),
+                        url_selection_mode: Some("preserve".to_string()),
+                        provider: Some("auto".to_string()),
+                        auto_mode: Some("fallback".to_string()),
+                        selection_mode: Some(args.selection_mode.clone()),
+                        fetch_backend: Some(args.fetch_backend.clone()),
+                        no_network: Some(false),
+                        max_urls: Some(max_urls),
+                        timeout_ms: Some(args.timeout_ms),
+                        max_bytes: Some(args.max_bytes),
+                        top_chunks: Some(top_chunks),
+                        max_chunk_chars: Some(max_chunk_chars),
+                        include_links: Some(false),
+                        include_text: Some(false),
+                        agentic: Some(false),
+                        cache_read: Some(true),
+                        cache_write: Some(true),
+                        ..Default::default()
+                    })))
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let row_b = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_matrix_row",
+                    "generated_at_epoch_s": now,
+                    "case": "warm_urls",
+                    "query_id": row_a["query_id"].clone(),
+                    "query": row_a["query"].clone(),
+                    "tags": row_a["tags"].clone(),
+                    "urls": row_a["urls"].clone(),
+                    "elapsed_ms": t1.elapsed().as_millis(),
+                    "result": call_json(res_b)?
+                });
+                writeln!(f, "{}", serde_json::to_string(&row_b)?)?;
+
+                // Case C: offline replay (urls-mode + no_network=true)
+                let t2 = std::time::Instant::now();
+                let res_c = svc
+                    .web_search_extract(Parameters(Some(mcp::WebSearchExtractArgs {
+                        query: row_a.get("query").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        urls: Some(
+                            row_a
+                                .get("urls")
+                                .and_then(|v| v.as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect(),
+                        ),
+                        url_selection_mode: Some("preserve".to_string()),
+                        provider: Some("auto".to_string()),
+                        auto_mode: Some("fallback".to_string()),
+                        selection_mode: Some(args.selection_mode.clone()),
+                        fetch_backend: Some(args.fetch_backend.clone()),
+                        no_network: Some(true),
+                        max_urls: Some(max_urls),
+                        timeout_ms: Some(args.timeout_ms),
+                        max_bytes: Some(args.max_bytes),
+                        top_chunks: Some(top_chunks),
+                        max_chunk_chars: Some(max_chunk_chars),
+                        include_links: Some(false),
+                        include_text: Some(false),
+                        agentic: Some(false),
+                        cache_read: Some(true),
+                        cache_write: Some(false),
+                        ..Default::default()
+                    })))
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let row_c = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_matrix_row",
+                    "generated_at_epoch_s": now,
+                    "case": "offline_urls",
+                    "query_id": row_a["query_id"].clone(),
+                    "query": row_a["query"].clone(),
+                    "tags": row_a["tags"].clone(),
+                    "urls": row_a["urls"].clone(),
+                    "elapsed_ms": t2.elapsed().as_millis(),
+                    "result": call_json(res_c)?
+                });
+                writeln!(f, "{}", serde_json::to_string(&row_c)?)?;
+            }
+
             println!("{}", out.display());
         }
         Commands::Doctor(args) => {

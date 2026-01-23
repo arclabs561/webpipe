@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -402,14 +403,65 @@ pub async fn eval_fetch(spec: EvalFetchSpec) -> Result<PathBuf> {
 pub fn load_queries(files: &[PathBuf], inline: &[String]) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for p in files {
-        out.extend(read_lines(p)?);
+        if p.extension().and_then(|e| e.to_str()) == Some("json") {
+            // Structured fixture format (v1): see `fixtures/e2e_queries_v1.json`.
+            let v = load_e2e_queries_v1(p)?;
+            out.extend(v.queries.into_iter().map(|q| q.query));
+        } else {
+            out.extend(read_lines(p)?);
+        }
     }
     out.extend(inline.iter().cloned());
     Ok(out)
 }
 
 pub fn load_urls(files: &[PathBuf], inline: &[String]) -> Result<Vec<String>> {
-    load_queries(files, inline)
+    let mut out = Vec::new();
+    for p in files {
+        out.extend(read_lines(p)?);
+    }
+    out.extend(inline.iter().cloned());
+    Ok(out)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct E2eQueriesV1 {
+    pub schema_version: u64,
+    pub kind: String,
+    pub queries: Vec<E2eQueryV1>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct E2eQueryV1 {
+    pub query_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub url_paths: Vec<String>,
+}
+
+pub fn load_e2e_queries_v1(path: &Path) -> Result<E2eQueriesV1> {
+    let raw = fs::read_to_string(path)?;
+    let v: E2eQueriesV1 = serde_json::from_str(&raw)?;
+    if v.schema_version != 1 || v.kind != "webpipe_e2e_queries" {
+        anyhow::bail!("unexpected e2e queries kind/schema_version");
+    }
+    for q in &v.queries {
+        if q.query_id.trim().is_empty() {
+            anyhow::bail!("e2e queries: query_id must be non-empty");
+        }
+        if q.query.trim().is_empty() {
+            anyhow::bail!("e2e queries: query must be non-empty");
+        }
+        if q.tags.iter().any(|t| t.trim().is_empty()) {
+            anyhow::bail!("e2e queries: tags must not contain empty strings");
+        }
+        if q.url_paths.iter().any(|p| p.trim().is_empty()) {
+            anyhow::bail!("e2e queries: url_paths must not contain empty strings");
+        }
+    }
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -474,11 +526,11 @@ mod tests {
     #[test]
     fn e2e_queries_fixture_is_parseable_json() {
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let raw =
-            std::fs::read_to_string(base.join("e2e_queries_v1.json")).expect("e2e_queries_v1.json");
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
-        assert_eq!(v["schema_version"].as_u64(), Some(1));
-        assert_eq!(v["kind"].as_str(), Some("webpipe_e2e_queries"));
-        assert!(!v["queries"].as_array().unwrap().is_empty());
+        let v = load_e2e_queries_v1(&base.join("e2e_queries_v1.json")).expect("e2e_queries_v1.json");
+        assert_eq!(v.schema_version, 1);
+        assert_eq!(v.kind, "webpipe_e2e_queries");
+        assert!(!v.queries.is_empty());
+        assert!(v.queries.iter().all(|q| !q.query_id.trim().is_empty()));
+        assert!(v.queries.iter().all(|q| !q.query.trim().is_empty()));
     }
 }
