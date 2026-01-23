@@ -30,6 +30,8 @@ enum Commands {
     EvalMatrix(EvalMatrixCmd),
     /// Score an eval-matrix JSONL artifact against an E2E qrels file (json).
     EvalMatrixScore(EvalMatrixScoreCmd),
+    /// Export eval-matrix JSONL rows into a judge-ready JSONL dataset (optionally joined with qrels).
+    EvalMatrixExport(EvalMatrixExportCmd),
     /// Diagnose configuration/launch issues (json; no secrets).
     Doctor(DoctorCmd),
     /// Print version info.
@@ -233,6 +235,25 @@ struct EvalMatrixScoreCmd {
     #[arg(long)]
     qrels: std::path::PathBuf,
     /// Output JSON path (default: .generated/webpipe-eval-matrix-score-<epoch>.json)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+struct EvalMatrixExportCmd {
+    /// Matrix artifact path produced by `eval-matrix` (jsonl).
+    #[arg(long)]
+    matrix_artifact: std::path::PathBuf,
+    /// Optional E2E qrels file (json) to attach expected URL needles and a hit label.
+    #[arg(long)]
+    qrels: Option<std::path::PathBuf>,
+    /// Max characters per exported text field (keeps artifacts bounded).
+    #[arg(long, default_value_t = 4000)]
+    max_text_chars: usize,
+    /// Output JSONL path (default: .generated/webpipe-eval-matrix-export-<epoch>.jsonl)
     #[arg(long)]
     out: Option<std::path::PathBuf>,
     /// Override "now" for deterministic outputs.
@@ -13405,6 +13426,157 @@ async fn main() -> Result<()> {
             });
 
             std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
+        }
+        Commands::EvalMatrixExport(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    ".generated/webpipe-eval-matrix-export-{now}.jsonl"
+                ))
+            });
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+
+            let qrels = if let Some(p) = args.qrels.as_ref() {
+                Some(eval::load_e2e_qrels_v1(p)?)
+            } else {
+                None
+            };
+            let mut qrels_by_qid: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            if let Some(ref qrels) = qrels {
+                for q in &qrels.qrels {
+                    qrels_by_qid.insert(q.query_id.clone(), q.expected_url_substrings.clone());
+                }
+            }
+
+            fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
+                if max_chars == 0 {
+                    return ("".to_string(), !s.is_empty());
+                }
+                let mut out = String::new();
+                for (n, ch) in s.chars().enumerate() {
+                    if n >= max_chars {
+                        return (out, true);
+                    }
+                    out.push(ch);
+                }
+                (out, false)
+            }
+
+            fn extract_urls(res: &serde_json::Value) -> std::collections::BTreeSet<String> {
+                let mut out = std::collections::BTreeSet::new();
+                if let Some(top) = res.get("top_chunks").and_then(|v| v.as_array()) {
+                    for c in top {
+                        if let Some(u) = c.get("url").and_then(|v| v.as_str()) {
+                            out.insert(u.to_string());
+                        }
+                    }
+                }
+                if let Some(per_url) = res.get("results").and_then(|v| v.as_array()) {
+                    for r in per_url {
+                        if let Some(u) = r.get("url").and_then(|v| v.as_str()) {
+                            out.insert(u.to_string());
+                        }
+                        if let Some(u) = r.get("final_url").and_then(|v| v.as_str()) {
+                            out.insert(u.to_string());
+                        }
+                    }
+                }
+                out
+            }
+
+            // Read + parse JSONL rows.
+            let raw = std::fs::read_to_string(&args.matrix_artifact)?;
+            let mut out_rows: Vec<serde_json::Value> = Vec::new();
+            for (i, line) in raw.lines().enumerate() {
+                let s = line.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let row: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+                    anyhow::anyhow!("matrix_artifact line {}: invalid json: {}", i + 1, e)
+                })?;
+
+                let query_id = row.get("query_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let case = row.get("case").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let query = row.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if query_id.is_empty() || case.is_empty() {
+                    continue;
+                }
+
+                let tags: Vec<String> = row
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let res = row.get("result").cloned().unwrap_or(serde_json::Value::Null);
+                let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                let backend_provider = res.get("backend_provider").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let urls = extract_urls(&res);
+
+                let expected = qrels_by_qid.get(&query_id).cloned().unwrap_or_default();
+                let matched = if ok {
+                    expected.iter().find(|needle| urls.iter().any(|u| u.contains(needle.as_str()))).cloned()
+                } else {
+                    None
+                };
+                let hit_expected_url = matched.is_some();
+
+                // Build a compact judge text: concatenate top_chunks.text (already bounded by tool),
+                // then truncate here as a safety net.
+                let mut joined = String::new();
+                if let Some(top) = res.get("top_chunks").and_then(|v| v.as_array()) {
+                    for (idx, c) in top.iter().enumerate() {
+                        if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                            if idx > 0 {
+                                joined.push('\n');
+                                joined.push('\n');
+                            }
+                            joined.push_str(t);
+                        }
+                    }
+                }
+                let (judge_text, judge_text_truncated) = truncate_chars(&joined, args.max_text_chars);
+
+                out_rows.push(serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_matrix_example",
+                    "generated_at_epoch_s": now,
+                    "query_id": query_id,
+                    "case": case,
+                    "query": query,
+                    "tags": tags,
+                    "expected_url_substrings": expected,
+                    "hit_expected_url": hit_expected_url,
+                    "matched_substring": matched,
+                    "ok": ok,
+                    "backend_provider": backend_provider,
+                    "observed_url_count": urls.len(),
+                    "judge_text": judge_text,
+                    "judge_text_truncated": judge_text_truncated
+                }));
+            }
+
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&out)?);
+            use std::io::Write;
+            for r in out_rows {
+                writeln!(f, "{}", serde_json::to_string(&r)?)?;
+            }
+
             println!("{}", out.display());
         }
         Commands::Doctor(args) => {
