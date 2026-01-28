@@ -40,6 +40,7 @@ fn webpipe_live_auto_search_smoke_opt_in() {
             .serve(TokioChildProcess::new(
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
+                    // Allow `.env` autoload so `dev/.env` keys work.
                     cmd.env(
                         "WEBPIPE_CACHE_DIR",
                         std::env::temp_dir().join("webpipe-live-cache"),

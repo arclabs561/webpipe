@@ -7,6 +7,17 @@ Local “search → fetch → extract” plumbing, exposed as an **MCP stdio** s
 - explicit limits on bytes/chars/results
 - stable, schema-versioned JSON outputs
 
+## Avoid Cargo build locks (dev ergonomics)
+
+If you run multiple `cargo` commands concurrently, you can hit:
+`Blocking waiting for file lock on build directory`.
+
+For `webpipe` work, you can isolate build output by setting a per-repo target dir:
+
+```bash
+CARGO_TARGET_DIR=target-webpipe cargo test -p webpipe-mcp --tests -- --skip live_
+```
+
 ## Workspace layout
 
 - `crates/webpipe`: **public facade crate** (re-exports `webpipe-core`)
@@ -30,6 +41,173 @@ Use `mcp.example.json` as a starting point (it intentionally contains **no API k
 
 Keyless workflow tip:
 - Use the MCP tool `web_seed_urls` to get curated “awesome list” seed URLs, then call `web_search_extract` with `urls=[...]` and `url_selection_mode=query_rank`.
+
+## Two audiences (how to think about the tools)
+
+There are two “modes” in which `webpipe` is used:
+
+- **Cursor user (MCP tools)**: you (or Cursor agents) call tools like `web_search_extract` directly from chat. The tool response is a **single JSON payload** that Cursor saves/displays as text.
+- **Agent inside one tool call**: a higher-level agent/tool (outside of `webpipe`, or inside your own app) calls `webpipe` tools as steps in a workflow. The same JSON payloads are used, but you typically branch on fields like `warning_codes`, `error.code`, and `top_chunks`.
+
+In both cases, the “structured output” is the JSON object:
+
+- `ok: true|false`
+- `schema_version`, `kind`, `elapsed_ms`
+- optional `warnings` + `warning_codes` + `warning_hints`
+- on error: `error: { code, message, hint, retryable }`
+
+## Tool cookbook (Cursor / MCP users)
+
+These examples are written as **tool arguments** (what you paste into the tool call UI).
+Outputs are JSON-as-text; look at the `ok`, `warning_codes`, and the tool-specific fields described below.
+
+### `webpipe_meta` (what’s configured)
+
+```json
+{}
+```
+
+Look for:
+- `configured.*`: which providers/backends are available
+- `supported.*`: allowed enum values
+- `defaults.*`: what you get if you omit fields
+
+### `web_search_extract` (the main “do the job” tool)
+
+Online query-mode:
+
+```json
+{
+  "query": "latest arxiv papers on tool-using LLM agents",
+  "provider": "auto",
+  "auto_mode": "fallback",
+  "fetch_backend": "local",
+  "agentic": true,
+  "max_results": 5,
+  "max_urls": 3,
+  "top_chunks": 5,
+  "max_chunk_chars": 500
+}
+```
+
+Offline-ish urls-mode (no search; optionally rank chunks by query):
+
+```json
+{
+  "query": "installation steps",
+  "urls": ["https://example.com/docs/install", "https://example.com/docs/getting-started"],
+  "url_selection_mode": "query_rank",
+  "fetch_backend": "local",
+  "no_network": false,
+  "max_urls": 2,
+  "top_chunks": 4
+}
+```
+
+Look for:
+- `top_chunks[]`: the best evidence snippets (bounded)
+- `results[]`: per-URL details
+- `warning_hints`: concrete next moves when extraction is empty/low-signal/blocked
+
+### `web_extract` (single URL, extraction-first)
+
+```json
+{
+  "url": "https://example.com/docs/install",
+  "fetch_backend": "local",
+  "include_text": true,
+  "max_chars": 20000,
+  "include_links": false
+}
+```
+
+Use this when you already know the URL and want extraction, not discovery.
+
+### `web_fetch` (single URL, bytes/text-first)
+
+```json
+{
+  "url": "https://example.com/",
+  "fetch_backend": "local",
+  "include_text": false,
+  "include_headers": false,
+  "max_bytes": 5000000
+}
+```
+
+Use this when you need status/content-type/bytes and only sometimes need bounded text.
+
+### `web_search` (search only)
+
+```json
+{
+  "query": "rmcp mcp server examples",
+  "provider": "auto",
+  "auto_mode": "fallback",
+  "max_results": 10
+}
+```
+
+### `web_cache_search_extract` (no network; cache corpus only)
+
+```json
+{
+  "query": "route handlers",
+  "max_docs": 50,
+  "top_chunks": 5
+}
+```
+
+Use this for deterministic “did we already fetch something relevant?” checks.
+
+### `web_deep_research` (evidence gather + optional synthesis)
+
+Evidence-only mode (most inspectable):
+
+```json
+{
+  "query": "What are the main recent approaches to tool-using LLM agents?",
+  "synthesize": false,
+  "include_evidence": true,
+  "provider": "auto",
+  "fetch_backend": "local",
+  "max_urls": 3,
+  "top_chunks": 5
+}
+```
+
+### `arxiv_search` / `arxiv_enrich`
+
+```json
+{
+  "query": "tool-using agents",
+  "categories": ["cs.AI", "cs.CL"],
+  "per_page": 10
+}
+```
+
+```json
+{
+  "id_or_url": "https://arxiv.org/abs/2401.12345",
+  "include_discussions": true,
+  "max_discussion_urls": 2
+}
+```
+
+## Tool cookbook (agent/workflow authors)
+
+If you’re writing an agent that uses `webpipe` as a subsystem, the most reliable pattern is:
+
+1) **Start bounded**: small `max_results`, `max_urls`, `top_chunks`, `max_chars`.
+2) **Branch on warnings**:
+   - `blocked_by_js_challenge` → try `fetch_backend="firecrawl"` (if configured) or choose a different URL
+   - `empty_extraction` / `main_content_low_signal` → increase `max_bytes`/`max_chars`, or switch backend
+3) **Prefer urls-mode for determinism**: once you have candidate URLs, pass `urls=[...]` and use `url_selection_mode=query_rank`.
+4) **Use cache to get repeatable behavior**:
+   - warm cache with `no_network=false, cache_write=true`
+   - then evaluate with `no_network=true` to eliminate network flakiness
+
+You can treat `ok=false` as “tool call failed” and use `error.hint` as the “next move”.
 
 Environment variables (optional, provider-dependent):
 - **Brave search**: `WEBPIPE_BRAVE_API_KEY` (or `BRAVE_SEARCH_API_KEY`)

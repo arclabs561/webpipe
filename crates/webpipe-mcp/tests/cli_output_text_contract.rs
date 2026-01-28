@@ -3,6 +3,8 @@ fn webpipe_version_text_output_contract() {
     let bin = assert_cmd::cargo::cargo_bin!("webpipe");
     let out = std::process::Command::new(bin)
         .args(["version", "--output", "text"])
+        // Disable `.env` autoload so this contract stays hermetic.
+        .env("WEBPIPE_DOTENV", "0")
         .output()
         .expect("run webpipe version --output text");
 
@@ -26,6 +28,8 @@ fn webpipe_doctor_text_output_contract() {
             "--timeout-ms",
             "1",
         ])
+        // Disable `.env` autoload so this contract stays “no keys”.
+        .env("WEBPIPE_DOTENV", "0")
         // Ensure we don't accidentally inherit keys from the environment.
         .env_remove("WEBPIPE_BRAVE_API_KEY")
         .env_remove("BRAVE_SEARCH_API_KEY")

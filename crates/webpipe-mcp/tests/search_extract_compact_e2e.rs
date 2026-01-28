@@ -27,13 +27,18 @@ async fn call(
         })
         .await
         .expect("call_tool");
-    let text = r
-        .content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.clone())
-        .unwrap_or_default();
-    serde_json::from_str(&text).expect("parse json")
+    // Prefer MCP structured content (stable machine payload). Tool `content` may be Markdown.
+    if let Some(v) = r.structured_content.clone() {
+        return v;
+    }
+    for c in &r.content {
+        if let Some(t) = c.as_text() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t.text) {
+                return v;
+            }
+        }
+    }
+    panic!("expected structured_content or JSON text content");
 }
 
 #[tokio::test]
@@ -59,6 +64,8 @@ async fn web_search_extract_compact_urls_mode_drops_agentic_trace_and_keeps_extr
         .serve(
             TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                 cmd.args(["mcp-stdio"]);
+                // Disable `.env` autoload so this test stays hermetic.
+                cmd.env("WEBPIPE_DOTENV", "0");
                 cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
             }))
             .expect("spawn mcp child"),
@@ -97,6 +104,11 @@ async fn web_search_extract_compact_urls_mode_drops_agentic_trace_and_keeps_extr
     let rs = v["results"].as_array().cloned().unwrap_or_default();
     assert_eq!(rs.len(), 1);
     assert!(rs[0].get("extract").is_some());
+    assert!(rs[0].get("quality").is_some());
+    assert_eq!(
+        rs[0]["extract"]["quality"]["kind"].as_str(),
+        Some("webpipe_extract_quality")
+    );
     // Per-url compact should omit fetch_source/truncated, but keep attempts (null or object) for debuggability.
     assert!(rs[0].get("fetch_source").is_none());
     assert!(rs[0].get("attempts").is_some());

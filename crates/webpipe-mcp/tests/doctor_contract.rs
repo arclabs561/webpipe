@@ -6,6 +6,8 @@ fn webpipe_doctor_contract_json_and_bool_flags() {
     // and still emit well-formed JSON with stable keys.
     let out = std::process::Command::new(bin)
         .args(["doctor", "--check-stdio=false", "--timeout-ms", "1"])
+        // Disable `.env` autoload so this contract stays “no keys”.
+        .env("WEBPIPE_DOTENV", "0")
         // Ensure we don't accidentally inherit keys from the environment.
         .env_remove("WEBPIPE_BRAVE_API_KEY")
         .env_remove("BRAVE_SEARCH_API_KEY")

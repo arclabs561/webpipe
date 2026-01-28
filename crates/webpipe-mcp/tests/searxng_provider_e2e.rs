@@ -27,13 +27,9 @@ async fn call(
         })
         .await
         .expect("call_tool");
-    let text = r
-        .content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.clone())
-        .unwrap_or_default();
-    serde_json::from_str(&text).expect("parse json")
+    r.structured_content
+        .clone()
+        .expect("expected structured_content")
 }
 
 #[tokio::test]
@@ -60,6 +56,8 @@ async fn searxng_provider_e2e_via_stdio_server() {
         .serve(
             TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                 cmd.args(["mcp-stdio"]);
+                // Disable `.env` autoload so this test stays hermetic.
+                cmd.env("WEBPIPE_DOTENV", "0");
                 cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
                 cmd.env("WEBPIPE_SEARXNG_ENDPOINT", &endpoint);
                 // Ensure we don't accidentally use real keys on dev machines.

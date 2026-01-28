@@ -16,9 +16,11 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
 dirs = "5.0"
 rmcp = { version = "0.12.0", optional = true, features = ["macros", "server", "client", "transport-io", "transport-child-process", "schemars"] }
 schemars = { version = "1.2.0", optional = true, features = ["derive"] }
+blake3 = "1.8.3"
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -30,6 +32,10 @@ proptest = "1.9"
 [features]
 default = ["stdio"]
 stdio = ["dep:rmcp", "dep:schemars"]
+# Internal-only eval harness (not part of public/default surface).
+eval = []
+# Optional: VLM/vision utilities (kept out of the public/default surface).
+vlm = []
 vision-gemini = ["webpipe-local/vision-gemini"]
 
 [[bin]]

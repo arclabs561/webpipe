@@ -28,13 +28,18 @@ async fn call(
         })
         .await
         .expect("call_tool");
-    let text = r
-        .content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.clone())
-        .unwrap_or_default();
-    serde_json::from_str(&text).expect("parse json")
+    // Prefer MCP structured content (stable machine payload). Tool `content` may be Markdown.
+    if let Some(v) = r.structured_content.clone() {
+        return v;
+    }
+    for c in &r.content {
+        if let Some(t) = c.as_text() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t.text) {
+                return v;
+            }
+        }
+    }
+    panic!("expected structured_content or JSON text content");
 }
 
 #[tokio::test]
@@ -70,6 +75,8 @@ async fn web_search_extract_firecrawl_fallback_on_low_signal_is_bounded_and_mark
         .serve(
             TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                 cmd.args(["mcp-stdio"]);
+                // Disable `.env` autoload so this test stays hermetic.
+                cmd.env("WEBPIPE_DOTENV", "0");
                 cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
                 cmd.env("WEBPIPE_FIRECRAWL_API_KEY", "test-key");
                 cmd.env(

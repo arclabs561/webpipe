@@ -38,6 +38,8 @@ async fn web_cache_search_extract_finds_warmed_cache_entry() {
         .serve(
             TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                 cmd.args(["mcp-stdio"]);
+                // Disable `.env` autoload so this test stays hermetic.
+                cmd.env("WEBPIPE_DOTENV", "0");
                 cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
             }))
             .expect("spawn mcp child"),
@@ -57,13 +59,9 @@ async fn web_cache_search_extract_finds_warmed_cache_entry() {
             })
             .await
             .expect("call_tool");
-        let text = r
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap_or_default();
-        serde_json::from_str(&text).expect("parse json")
+        r.structured_content
+            .clone()
+            .expect("expected structured_content")
     }
 
     // 1) Warm cache via web_fetch.
@@ -174,13 +172,9 @@ async fn web_cache_search_extract_can_load_persisted_corpus_opt_in() {
             })
             .await
             .expect("call_tool");
-        let text = r
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap_or_default();
-        serde_json::from_str(&text).expect("parse json")
+        r.structured_content
+            .clone()
+            .expect("expected structured_content")
     }
 
     // First process: warm cache and write checkpoint.

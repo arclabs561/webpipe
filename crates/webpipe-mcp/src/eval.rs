@@ -43,6 +43,223 @@ fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
     (out, false)
 }
 
+#[derive(Debug, Clone)]
+pub struct DomainPackSpec {
+    /// Comma-separated domain ids: arxiv, news, code (and future ids).
+    pub domains: Vec<String>,
+    /// Max queries per domain (bounded).
+    pub per_domain: usize,
+    /// Seed for deterministic ordering/selection.
+    pub seed: u64,
+    /// Output path (json).
+    pub out: PathBuf,
+    /// Optional notes to embed in the JSON (for provenance).
+    pub notes: Option<String>,
+}
+
+fn slugify_id(s: &str, max_len: usize) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in s.chars() {
+        let c = ch.to_ascii_lowercase();
+        let ok = c.is_ascii_alphanumeric();
+        if ok {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+        if out.len() >= max_len {
+            break;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "q".to_string()
+    } else {
+        out
+    }
+}
+
+fn xorshift64star_next(state: &mut u64) -> u64 {
+    // Deterministic, tiny RNG (no external deps).
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(2685821657736338717)
+}
+
+fn shuffle_deterministic<T>(items: &mut [T], seed: u64) {
+    if items.len() <= 1 {
+        return;
+    }
+    let mut s = if seed == 0 { 0x9e3779b97f4a7c15 } else { seed };
+    for i in (1..items.len()).rev() {
+        let r = xorshift64star_next(&mut s);
+        let j = (r as usize) % (i + 1);
+        items.swap(i, j);
+    }
+}
+
+fn domain_templates(domain: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    // (tags, seed_urls, query_templates)
+    let (tags, seed_urls, templates): (Vec<&'static str>, Vec<&'static str>, Vec<&'static str>) =
+        match domain {
+            "arxiv" | "research" | "academic" => (
+                vec!["academic", "arxiv", "research", "live"],
+                vec![
+                    "https://arxiv.org/list/cs.AI/recent",
+                    "https://arxiv.org/list/cs.CL/recent",
+                    "https://arxiv.org/list/cs.LG/recent",
+                ],
+                vec![
+                    "recent arxiv papers on tool-using LLM agents",
+                    "arxiv 2025 2026 best new methods for retrieval augmented generation",
+                    "recent arxiv papers on structured output / constrained decoding for LLMs",
+                    "latest arxiv papers on evaluation of LLM reasoning and reliability",
+                    "recent arxiv papers on embeddings, reranking, and retrieval benchmarks",
+                    "arxiv papers on web agents that browse and cite sources",
+                    "recent arxiv papers on information extraction from PDFs and HTML at scale",
+                    "arxiv survey paper on MCP protocol or tool calling interfaces",
+                    "recent arxiv papers on scalable search + ranking systems for LLMs",
+                ],
+            ),
+            "news" => (
+                vec!["news", "live"],
+                vec![
+                    "https://news.ycombinator.com/",
+                    "https://en.wikipedia.org/wiki/Portal:Current_events",
+                ],
+                vec![
+                    "latest AI policy and regulation developments 2025 2026 summary",
+                    "recent changes in major LLM APIs: structured output, reasoning controls, tools",
+                    "recent open source releases for retrieval and embeddings infrastructure",
+                    "breaking news summary with citations for todays top 3 tech stories",
+                    "what changed this week in AI tooling and model providers",
+                    "recent security incidents involving AI supply chain or dependency confusion",
+                    "latest benchmark results for LLMs and how they were measured",
+                ],
+            ),
+            "code" | "github" => (
+                vec!["code", "github", "live"],
+                // Note: seed URLs are *only* a fallback for code.
+                // For code queries, we prefer query-specific search URLs to avoid landing-page chrome.
+                vec!["https://github.com/search?q=mcp&type=repositories"],
+                vec![
+                    "open source MCP server implementations in Rust",
+                    "rmcp rust mcp server examples tool definitions and schema validation",
+                    "best practices for bounded web scraping and extraction in Rust",
+                    "examples of OpenAI-compatible chat completion servers for testing",
+                    "how projects implement JSON-mode / structured outputs across providers",
+                    "open source reranking and embeddings pipelines (semantic search) examples",
+                    "examples of tool calling evaluation harnesses and judge agents",
+                    "repos that implement arxiv search and PDF extraction pipelines",
+                ],
+            ),
+            _other => (
+                vec!["live", "misc"],
+                vec![],
+                vec![
+                    "recent work and best practices",
+                    "what others have done in open source",
+                    "examples and references",
+                ],
+            ),
+        };
+
+    (
+        tags.into_iter().map(|s| s.to_string()).collect(),
+        seed_urls.into_iter().map(|s| s.to_string()).collect(),
+        templates.into_iter().map(|s| s.to_string()).collect(),
+    )
+}
+
+fn url_encode_query_component(s: &str) -> String {
+    // Minimal URL encoding for query components.
+    // - ASCII alnum and -_.~ are left as-is
+    // - space becomes '+'
+    // - everything else percent-encoded as UTF-8 bytes
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        let ch = *b as char;
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' || ch == '~' {
+            out.push(ch);
+        } else if ch == ' ' {
+            out.push('+');
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        }
+    }
+    out
+}
+
+fn code_seed_urls_for_query(q: &str) -> Vec<String> {
+    // For code queries, use query-specific search pages that (usually) contain actual repo lists.
+    // This is more “contentful” than Topics/Trending pages which are heavy on UI chrome.
+    let qq = url_encode_query_component(q.trim());
+    vec![
+        format!("https://github.com/search?q={qq}&type=repositories"),
+        // Secondary index: GitHub "topics" landing for MCP is still useful for discovery.
+        "https://github.com/topics/mcp".to_string(),
+    ]
+}
+
+pub fn generate_domain_pack(spec: DomainPackSpec) -> Result<PathBuf> {
+    let per_domain = spec.per_domain.clamp(1, 50);
+    let mut domains: Vec<String> = spec
+        .domains
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if domains.is_empty() {
+        domains = vec!["arxiv".to_string(), "news".to_string(), "code".to_string()];
+    }
+
+    let mut queries_out: Vec<serde_json::Value> = Vec::new();
+    for d in domains {
+        let (tags, seed_urls, mut templates) = domain_templates(&d);
+        shuffle_deterministic(&mut templates, spec.seed ^ (d.len() as u64));
+        for (i, q) in templates.into_iter().take(per_domain).enumerate() {
+            let slug = slugify_id(&q, 42);
+            let query_id = format!("{d}-{i:02}-{slug}");
+            let url_paths = if d == "code" || d == "github" {
+                code_seed_urls_for_query(&q)
+            } else {
+                seed_urls.clone()
+            };
+            queries_out.push(serde_json::json!({
+                "query_id": query_id,
+                "query": q,
+                "tags": tags,
+                "url_paths": url_paths,
+            }));
+        }
+    }
+
+    let notes = spec.notes.unwrap_or_else(|| {
+        "Domain-generated live query pack (templates; intended for follow-up judging and iteration)."
+            .to_string()
+    });
+
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "kind": "webpipe_e2e_queries",
+        "notes": notes,
+        "queries": queries_out
+    });
+
+    ensure_parent_dir(&spec.out)?;
+    fs::write(&spec.out, serde_json::to_string_pretty(&payload)?)?;
+    Ok(spec.out)
+}
+
 pub struct EvalSearchSpec {
     pub queries: Vec<String>,
     pub providers: Vec<String>, // brave, tavily
@@ -490,7 +707,10 @@ pub fn load_e2e_qrels_v1(path: &Path) -> Result<E2eQrelsV1> {
         if q.expected_url_substrings.is_empty() {
             anyhow::bail!("e2e qrels: expected_url_substrings must be non-empty");
         }
-        if q.expected_url_substrings.iter().any(|s| s.trim().is_empty()) {
+        if q.expected_url_substrings
+            .iter()
+            .any(|s| s.trim().is_empty())
+        {
             anyhow::bail!("e2e qrels: expected_url_substrings must not contain empty strings");
         }
     }
@@ -559,7 +779,8 @@ mod tests {
     #[test]
     fn e2e_queries_fixture_is_parseable_json() {
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let v = load_e2e_queries_v1(&base.join("e2e_queries_v1.json")).expect("e2e_queries_v1.json");
+        let v =
+            load_e2e_queries_v1(&base.join("e2e_queries_v1.json")).expect("e2e_queries_v1.json");
         assert_eq!(v.schema_version, 1);
         assert_eq!(v.kind, "webpipe_e2e_queries");
         assert!(!v.queries.is_empty());

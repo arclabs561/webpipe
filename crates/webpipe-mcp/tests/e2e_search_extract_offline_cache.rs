@@ -19,17 +19,22 @@ async fn call(
         })
         .await
         .expect("call_tool");
-    let text = r
-        .content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.clone())
-        .unwrap_or_default();
-    serde_json::from_str(&text).expect("parse json")
+    // Prefer MCP structured content (stable machine payload). Tool `content` may be Markdown.
+    if let Some(v) = r.structured_content.clone() {
+        return v;
+    }
+    for c in &r.content {
+        if let Some(t) = c.as_text() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t.text) {
+                return v;
+            }
+        }
+    }
+    panic!("expected structured_content or JSON text content");
 }
 
 #[tokio::test]
-async fn webpipe_eval_search_extract_matrix_stubbed_search_and_offline_cache() {
+async fn webpipe_search_extract_stubbed_search_and_offline_cache() {
     // Deterministic localhost server that provides:
     // - "docs" pages for fetch/extract
     // - search-provider shaped endpoints for Brave/Tavily/SearXNG
@@ -142,6 +147,8 @@ async fn webpipe_eval_search_extract_matrix_stubbed_search_and_offline_cache() {
         .serve(
             TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                 cmd.args(["mcp-stdio"]);
+                // Disable `.env` autoload so this contract stays hermetic.
+                cmd.env("WEBPIPE_DOTENV", "0");
                 cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
                 cmd.env("WEBPIPE_SEARXNG_ENDPOINT", &searxng_endpoint);
                 // Ensure we don't accidentally use real keys on dev machines.
@@ -184,7 +191,10 @@ async fn webpipe_eval_search_extract_matrix_stubbed_search_and_offline_cache() {
     .await;
     assert_eq!(v1["ok"].as_bool(), Some(true));
     assert_eq!(v1["request"]["provider"].as_str(), Some("searxng"));
-    assert!(v1["results"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+    assert!(v1["results"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false));
     assert!(v1["search"]["steps"]
         .as_array()
         .map(|a| !a.is_empty())
@@ -243,4 +253,3 @@ async fn webpipe_eval_search_extract_matrix_stubbed_search_and_offline_cache() {
 
     service.cancel().await.expect("cancel");
 }
-

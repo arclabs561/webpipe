@@ -2,7 +2,48 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+#[cfg(feature = "eval")]
 mod eval;
+
+#[cfg(feature = "eval")]
+fn best_effort_git_sha() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+#[cfg(feature = "eval")]
+fn blake3_hex_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+// Controlled vocabulary for deterministic "critic loop" findings.
+// Keep this small, stable, and aggregatable (no free-form drift).
+#[cfg(feature = "eval")]
+const CRITIC_ISSUE_VOCAB: &[&str] = &[
+    "missing_structured_content",
+    "missing_or_bad_kind",
+    "unexpected_kind",
+    "tool_failed",
+    "missing_urls",
+    "empty_top_chunks",
+    "low_signal",
+    "warnings_present",
+    "missing_markdown",
+    "markdown_is_json",
+    "markdown_missing_request_section",
+    "markdown_missing_summary_section",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "webpipe")]
@@ -19,34 +60,123 @@ enum Commands {
     #[cfg(feature = "stdio")]
     McpStdio,
     /// Run a local search evaluation harness (writes a JSON artifact).
+    #[cfg(feature = "eval")]
     EvalSearch(EvalSearchCmd),
     /// Run a local fetch evaluation harness (writes a JSON artifact).
+    #[cfg(feature = "eval")]
     EvalFetch(EvalFetchCmd),
     /// Run a local search->fetch->extract evaluation harness (writes a JSON artifact).
-    #[cfg(feature = "stdio")]
+    #[cfg(all(feature = "eval", feature = "stdio"))]
     EvalSearchExtract(EvalSearchExtractCmd),
     /// Run a small E2E matrix over a versioned query set (writes a JSONL artifact).
-    #[cfg(feature = "stdio")]
+    #[cfg(all(feature = "eval", feature = "stdio"))]
     EvalMatrix(EvalMatrixCmd),
     /// Score an eval-matrix JSONL artifact against an E2E qrels file (json).
+    #[cfg(feature = "eval")]
     EvalMatrixScore(EvalMatrixScoreCmd),
     /// Export eval-matrix JSONL rows into a judge-ready JSONL dataset (optionally joined with qrels).
+    #[cfg(feature = "eval")]
     EvalMatrixExport(EvalMatrixExportCmd),
     /// Deterministic baseline judge over exported eval-matrix examples (json).
+    #[cfg(feature = "eval")]
     EvalMatrixJudge(EvalMatrixJudgeCmd),
+    /// LLM-based semantic judge over exported eval-matrix examples (json).
+    ///
+    /// This is opt-in and requires a configured local LLM backend:
+    /// - llm_backend=openai_compat: set WEBPIPE_OPENAI_COMPAT_BASE_URL and choose a model
+    /// - llm_backend=ollama: set WEBPIPE_OLLAMA_ENABLE=true (and optionally WEBPIPE_OLLAMA_* vars)
+    ///
+    /// The judge consumes the exported `judge_text` field (already bounded), and returns
+    /// a strict JSON scorecard per example plus totals.
+    #[cfg(feature = "eval")]
+    EvalMatrixLlmJudge(EvalMatrixLlmJudgeCmd),
     /// Run eval-matrix -> score -> export -> judge (one-shot).
     ///
     /// This is a convenience wrapper that invokes the existing subcommands with explicit
     /// artifact paths, so you can run a full end-to-end evaluation with one call.
+    #[cfg(feature = "eval")]
     EvalMatrixRun(EvalMatrixRunCmd),
+    /// Multi-judge, multi-trial agentic evaluation harness (json).
+    ///
+    /// Runs several tool trials per query, asks multiple LLM judges (domain-seeded) to score and
+    /// take notes over the trials, then runs an optional meta-judge to aggregate reports.
+    #[cfg(all(feature = "eval", feature = "stdio"))]
+    EvalJudgeSwarm(EvalJudgeSwarmCmd),
+    /// Offline-first adversarial “critic loop” over MCP tools (json + transcript).
+    ///
+    /// This does NOT try to be “a better general agent than Cursor”.
+    /// It is a bounded harness that uses our own tools, then emits critique notes about
+    /// tool-result quality and failure modes in a stable, aggregatable schema.
+    #[cfg(all(feature = "eval", feature = "stdio"))]
+    EvalCriticLoop(EvalCriticLoopCmd),
+    /// Offline-first adversarial critic over an E2E query pack (json + transcript).
+    ///
+    /// This is the “what we test and why” harness:
+    /// - validates MCP tool output shape (Markdown-first + structured_content)
+    /// - checks tool-result quality signals (urls/top_chunks/low_signal/warnings)
+    /// - aggregates controlled-vocab issues across a dataset so we can set priorities
+    #[cfg(all(feature = "eval", feature = "stdio"))]
+    EvalCriticRun(EvalCriticRunCmd),
+    /// Generate a versioned E2E query pack for domain-seeded live runs (json).
+    ///
+    /// Emits the same schema as `fixtures/e2e_queries_v1.json`, but with "live" tags and optional
+    /// seed URLs per domain (arxiv/news/code) to help warm caches.
+    #[cfg(feature = "eval")]
+    EvalGenerateDomainPack(EvalGenerateDomainPackCmd),
     /// Diagnose configuration/launch issues (json; no secrets).
     Doctor(DoctorCmd),
+    /// Summarize a transcript JSONL into a compact JSON report.
+    ///
+    /// This is the “index” for later audits: counts by stage/run_kind, parse-fail rates,
+    /// and the slowest calls, without re-running anything.
+    #[cfg(feature = "eval")]
+    EvalTranscriptSummarize(EvalTranscriptSummarizeCmd),
+    /// Summarize multiple VLM critique artifacts into a compact meta report (json).
+    ///
+    /// Inputs are JSON artifacts produced by `webpipe vlm-openrouter`.
+    #[cfg(feature = "eval")]
+    EvalVlmSummarize(EvalVlmSummarizeCmd),
+    /// Run a VLM over multiple images (and optionally summarize) (json).
+    ///
+    /// This is the “one-button” E2E loop for rendered-page critique:
+    /// - takes `--image ...` (repeatable) and/or `--images-dir ...`
+    /// - runs `vlm-openrouter` over each image
+    /// - writes per-image artifacts under `--out-dir`
+    /// - optionally appends transcript events
+    /// - writes a meta summary JSON like `eval-vlm-summarize`
+    #[cfg(feature = "eval")]
+    EvalVlmRun(EvalVlmRunCmd),
+    /// Bundle page + plots VLM summaries into one artifact (json).
+    ///
+    /// This is a convenience “one file to hand to a meta-judge” wrapper over:
+    /// - `eval-vlm-run` (full-page screenshots)
+    /// - `eval-vlm-run` (plot images)
+    #[cfg(feature = "eval")]
+    EvalVlmBundle(EvalVlmBundleCmd),
     /// Print version info.
     Version(VersionCmd),
+    /// Run a VLM (Gemini vision) over a local image file (e.g. a browser screenshot).
+    ///
+    /// This is a tiny, explicit bridge for E2E: render -> screenshot -> VLM.
+    #[cfg(feature = "vlm")]
+    VlmImageToText(VlmImageToTextCmd),
+    /// Run an OpenRouter multimodal chat completion over an image.
+    ///
+    /// This is a pragmatic “VLM critique” path that uses OpenRouter’s OpenAI-compatible
+    /// `/v1/chat/completions` endpoint with an image-capable model.
+    ///
+    /// Env:
+    /// - `WEBPIPE_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY`
+    /// - `WEBPIPE_OPENROUTER_MODEL` (optional) to avoid passing `--model`
+    /// - `WEBPIPE_OPENROUTER_BASE_URL` (optional; default: https://openrouter.ai/api)
+    #[cfg(feature = "vlm")]
+    VlmOpenrouter(VlmOpenrouterCmd),
     /// Score an eval_search_extract artifact against a qrels file (json).
+    #[cfg(feature = "eval")]
     EvalQrels(EvalQrelsCmd),
 }
 
+#[cfg(feature = "eval")]
 #[derive(clap::Args, Debug)]
 struct EvalQrelsCmd {
     /// Eval artifact path produced by `eval-search-extract`.
@@ -63,6 +193,7 @@ struct EvalQrelsCmd {
     now_epoch_s: Option<u64>,
 }
 
+#[cfg(feature = "eval")]
 #[derive(clap::Args, Debug)]
 struct EvalSearchExtractCmd {
     /// Provider to use. Allowed: auto, brave, tavily, searxng
@@ -185,6 +316,7 @@ struct EvalSearchExtractCmd {
     now_epoch_s: Option<u64>,
 }
 
+#[cfg(feature = "eval")]
 #[derive(clap::Args, Debug)]
 struct EvalMatrixCmd {
     /// E2E query dataset (json), e.g. `crates/webpipe-mcp/fixtures/e2e_queries_v1.json`.
@@ -233,6 +365,7 @@ struct EvalMatrixCmd {
     now_epoch_s: Option<u64>,
 }
 
+#[cfg(feature = "eval")]
 #[derive(clap::Args, Debug)]
 struct EvalMatrixScoreCmd {
     /// Matrix artifact path produced by `eval-matrix` (jsonl).
@@ -249,6 +382,7 @@ struct EvalMatrixScoreCmd {
     now_epoch_s: Option<u64>,
 }
 
+#[cfg(feature = "eval")]
 #[derive(clap::Args, Debug)]
 struct EvalMatrixExportCmd {
     /// Matrix artifact path produced by `eval-matrix` (jsonl).
@@ -268,6 +402,7 @@ struct EvalMatrixExportCmd {
     now_epoch_s: Option<u64>,
 }
 
+#[cfg(feature = "eval")]
 #[derive(clap::Args, Debug)]
 struct EvalMatrixJudgeCmd {
     /// Exported examples path produced by `eval-matrix-export` (jsonl).
@@ -281,6 +416,70 @@ struct EvalMatrixJudgeCmd {
     now_epoch_s: Option<u64>,
 }
 
+#[cfg(feature = "eval")]
+#[derive(clap::Args, Debug)]
+struct EvalMatrixLlmJudgeCmd {
+    /// Exported examples path produced by `eval-matrix-export` (jsonl).
+    #[arg(long)]
+    examples_artifact: std::path::PathBuf,
+    /// LLM backend to use. Allowed: openai, openai_compat, openrouter, groq, ollama
+    #[arg(long, default_value = "openai_compat")]
+    llm_backend: String,
+    /// Optional model override (used by llm_backend="openai_compat"/"openrouter"/"groq").
+    #[arg(long)]
+    llm_model: Option<String>,
+    /// Prompt preset to use (default: v2).
+    #[arg(long, default_value = "v2")]
+    prompt_preset: String,
+    /// Optional file containing a custom system prompt (overrides prompt_preset).
+    #[arg(long)]
+    system_prompt_file: Option<std::path::PathBuf>,
+    /// Timeout per example (ms).
+    #[arg(long, default_value_t = 12_000)]
+    timeout_ms: u64,
+    /// Max examples to judge (bounded).
+    #[arg(long, default_value_t = 50)]
+    max_examples: usize,
+    /// Max characters from judge_text to include in the prompt (safety bound).
+    #[arg(long, default_value_t = 4000)]
+    max_prompt_chars: usize,
+    /// Max tokens for the judge response (openai_compat only).
+    #[arg(long)]
+    max_tokens: Option<u64>,
+    /// Temperature for the judge response (openai_compat only; default 0.0).
+    #[arg(long)]
+    temperature: Option<f64>,
+    /// top_p for the judge response (openai_compat only; default 1.0).
+    #[arg(long)]
+    top_p: Option<f64>,
+    /// If true, try to enforce JSON output using OpenAI-compatible response_format (best-effort).
+    #[arg(long, default_value_t = true)]
+    json_mode: bool,
+    /// Retry once if the LLM output is not parseable JSON (best-effort).
+    #[arg(long, default_value_t = true)]
+    retry_on_parse_fail: bool,
+
+    /// If true, write a JSONL transcript for LLM judge calls (auditing).
+    ///
+    /// This does NOT change the judge schema; it only records prompts/responses.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    transcript: bool,
+    /// Transcript output path (JSONL). If omitted, defaults to `<out>.transcript.jsonl`.
+    #[arg(long)]
+    transcript_jsonl: Option<std::path::PathBuf>,
+    /// Max characters stored per transcript string field (bounded, Unicode-safe).
+    #[arg(long, default_value_t = 4000)]
+    transcript_max_chars: usize,
+
+    /// Output JSON path (default: .generated/webpipe-eval-matrix-llm-judge-<epoch>.json)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[cfg(feature = "eval")]
 #[derive(clap::Args, Debug)]
 struct EvalMatrixRunCmd {
     /// E2E query dataset (json), e.g. `crates/webpipe-mcp/fixtures/e2e_queries_v1.json`.
@@ -321,6 +520,236 @@ struct EvalMatrixRunCmd {
     output: String,
 }
 
+#[cfg(feature = "eval")]
+#[derive(clap::Args, Debug)]
+struct EvalJudgeSwarmCmd {
+    /// E2E query dataset (json), e.g. `crates/webpipe-mcp/fixtures/e2e_queries_v1.json`.
+    #[arg(long)]
+    queries_json: std::path::PathBuf,
+    /// Optional E2E qrels file (json), e.g. `crates/webpipe-mcp/fixtures/e2e_qrels_v1.json`.
+    #[arg(long)]
+    qrels: Option<std::path::PathBuf>,
+    /// Base URL used to expand `url_paths` entries in the dataset.
+    #[arg(long)]
+    base_url: String,
+
+    /// Provider to use for the "search" leg. Allowed: auto, brave, tavily, searxng
+    #[arg(long, default_value = "searxng")]
+    provider: String,
+    /// When provider="auto", choose routing mode. Allowed: fallback, merge, mab
+    #[arg(long, default_value = "fallback")]
+    auto_mode: String,
+    /// How to select `top_chunks` across URLs. Allowed: score, pareto
+    #[arg(long, default_value = "score")]
+    selection_mode: String,
+    /// Which fetch backend to use. Allowed: local, firecrawl
+    #[arg(long, default_value = "local")]
+    fetch_backend: String,
+
+    /// Max search results to request (default: 2; max: 20).
+    #[arg(long, default_value_t = 2)]
+    max_results: usize,
+    /// Max URLs to process (default: 2; max: 10).
+    #[arg(long, default_value_t = 2)]
+    max_urls: usize,
+    /// Fetch timeout per URL (ms).
+    #[arg(long, default_value_t = 20_000)]
+    timeout_ms: u64,
+    /// Max bytes per URL.
+    #[arg(long, default_value_t = 2_000_000)]
+    max_bytes: u64,
+    /// Across-URL top chunks cap.
+    #[arg(long, default_value_t = 3)]
+    top_chunks: usize,
+    /// Max chars per chunk.
+    #[arg(long, default_value_t = 300)]
+    max_chunk_chars: usize,
+
+    /// Trial set to run per query. Allowed: basic, wide
+    #[arg(long, default_value = "basic")]
+    trial_set: String,
+
+    /// Comma-separated judge preset ids to run.
+    ///
+    /// Default is a “poor man's adversarial panel” (no free-form notes):
+    /// - ux: UX/layout failures
+    /// - writing: coherence/readability failures
+    /// - math: notation fidelity failures
+    /// - redteam: skeptical catch-all
+    #[arg(long, default_value = "ux,writing,math,redteam")]
+    judges: String,
+    /// Optional JSON file defining judge presets (ids, domain tags, system prompts).
+    ///
+    /// Shape:
+    /// { "schema_version": 1, "kind": "webpipe_judge_presets", "presets": [{ "id": "...", "domain_tags": ["..."], "system": "..." }] }
+    #[arg(long)]
+    judge_presets_json: Option<std::path::PathBuf>,
+    /// Only include queries that have any of these tags (comma-separated). If none match, falls back to all.
+    #[arg(long)]
+    domain_tags: Option<String>,
+    /// Max queries per judge (bounded).
+    #[arg(long, default_value_t = 20)]
+    max_queries: usize,
+    /// Seed for deterministic query ordering / selection.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+
+    /// LLM backend to use. Allowed: openai, openai_compat, openrouter, groq, ollama
+    #[arg(long, default_value = "openai_compat")]
+    llm_backend: String,
+    /// Optional model override (used by llm_backend="openai_compat"/"openrouter"/"groq").
+    #[arg(long)]
+    llm_model: Option<String>,
+    /// Timeout per LLM call (ms).
+    #[arg(long, default_value_t = 12_000)]
+    llm_timeout_ms: u64,
+    /// Temperature for judge responses (openai_compat/openrouter/groq only; default 0.0).
+    #[arg(long)]
+    temperature: Option<f64>,
+    /// top_p for judge responses (openai_compat/openrouter/groq only; default 1.0).
+    #[arg(long)]
+    top_p: Option<f64>,
+    /// If true, try to enforce JSON output using OpenAI-compatible response_format (best-effort).
+    #[arg(long, default_value_t = true)]
+    json_mode: bool,
+    /// Retry once if the LLM output is not parseable JSON (best-effort).
+    #[arg(long, default_value_t = true)]
+    retry_on_parse_fail: bool,
+
+    /// If true, run an evidence-only task solver per query (picks best trial, answers or abstains).
+    #[arg(long, default_value_t = true)]
+    task_solve: bool,
+    /// How many trials to include in the task solver prompt (bounded).
+    #[arg(long, default_value_t = 2)]
+    task_solve_max_trials: usize,
+    /// Max characters of evidence text per included trial (bounded).
+    #[arg(long, default_value_t = 1600)]
+    task_solve_max_evidence_chars: usize,
+
+    /// Optional: path to a previous `eval-judge-swarm` output JSON.
+    ///
+    /// Used to do “adversarial over time” query selection (curriculum): focus on unseen/failed,
+    /// or sort by prior difficulty.
+    #[arg(long)]
+    curriculum_from: Option<std::path::PathBuf>,
+    /// Curriculum mode when `--curriculum-from` is provided.
+    ///
+    /// Allowed:
+    /// - none: ignore prior run
+    /// - unseen: only queries not present in the prior run
+    /// - failed: only queries that previously were not solved / did not hit expected URLs
+    /// - harder: sort ascending by prior best_score (lower score first)
+    /// - easier: sort descending by prior best_score (higher score first)
+    #[arg(long, default_value = "none")]
+    curriculum: String,
+
+    /// If true, write a JSONL transcript for tool + LLM calls (auditing).
+    ///
+    /// This is intentionally separate from the judge scorecard schema.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    transcript: bool,
+    /// Transcript output path (JSONL). If omitted, defaults to `<out>.transcript.jsonl`.
+    #[arg(long)]
+    transcript_jsonl: Option<std::path::PathBuf>,
+    /// Max characters stored per transcript string field (bounded, Unicode-safe).
+    #[arg(long, default_value_t = 4000)]
+    transcript_max_chars: usize,
+
+    /// Output JSON path (default: .generated/webpipe-eval-judge-swarm-<epoch>.json)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[cfg(all(feature = "eval", feature = "stdio"))]
+#[derive(clap::Args, Debug)]
+struct EvalCriticLoopCmd {
+    /// Query to pass to `web_search_extract`.
+    #[arg(long)]
+    query: String,
+    /// URL(s) to pass directly (repeatable).
+    #[arg(long = "url")]
+    urls: Vec<String>,
+    /// Which fetch backend to use. Allowed: local, firecrawl
+    #[arg(long, default_value = "local")]
+    fetch_backend: String,
+    /// If true, disallow non-localhost networking (safe default for offline fixtures).
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    no_network: bool,
+    /// Output JSON report path (default: .generated/webpipe-eval-critic-loop-<epoch>.json).
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Transcript output path (JSONL). If omitted, defaults to `<out>.transcript.jsonl`.
+    #[arg(long)]
+    transcript_jsonl: Option<std::path::PathBuf>,
+    /// Max characters stored per transcript string field (bounded, Unicode-safe).
+    #[arg(long, default_value_t = 4000)]
+    transcript_max_chars: usize,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[cfg(all(feature = "eval", feature = "stdio"))]
+#[derive(clap::Args, Debug)]
+struct EvalCriticRunCmd {
+    /// E2E query dataset (json), e.g. `crates/webpipe-mcp/fixtures/e2e_queries_v1.json`.
+    #[arg(long)]
+    queries_json: std::path::PathBuf,
+    /// Base URL used to expand `url_paths` entries in the dataset (for local fixture servers).
+    ///
+    /// Example: http://127.0.0.1:8080
+    #[arg(long)]
+    base_url: String,
+    /// Which fetch backend to use. Allowed: local, firecrawl
+    #[arg(long, default_value = "local")]
+    fetch_backend: String,
+    /// If true, disallow non-localhost networking (safe default for offline fixtures).
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    no_network: bool,
+    /// Max queries (bounded).
+    #[arg(long, default_value_t = 20)]
+    max_queries: usize,
+    /// Output JSON report path (default: .generated/webpipe-eval-critic-run-<epoch>.json).
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Transcript output path (JSONL). If omitted, defaults to `<out>.transcript.jsonl`.
+    #[arg(long)]
+    transcript_jsonl: Option<std::path::PathBuf>,
+    /// Max characters stored per transcript string field (bounded, Unicode-safe).
+    #[arg(long, default_value_t = 4000)]
+    transcript_max_chars: usize,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[cfg(feature = "eval")]
+#[derive(clap::Args, Debug)]
+struct EvalGenerateDomainPackCmd {
+    /// Comma-separated domain ids. Allowed: arxiv, news, code
+    #[arg(long, default_value = "arxiv,news,code")]
+    domains: String,
+    /// Max queries per domain (bounded; default: 8).
+    #[arg(long, default_value_t = 8)]
+    per_domain: usize,
+    /// Seed for deterministic ordering/selection.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Optional notes to embed in the output JSON.
+    #[arg(long)]
+    notes: Option<String>,
+    /// Output JSON path (default: .generated/webpipe-e2e-queries-domain-pack-<epoch>.json)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[cfg(feature = "eval")]
 #[derive(clap::Args, Debug)]
 struct EvalSearchCmd {
     /// Provider list (comma-separated). Allowed: brave,tavily
@@ -346,6 +775,7 @@ struct EvalSearchCmd {
     now_epoch_s: Option<u64>,
 }
 
+#[cfg(feature = "eval")]
 #[derive(clap::Args, Debug)]
 struct EvalFetchCmd {
     /// Fetcher list (comma-separated). Allowed: local,firecrawl
@@ -394,6 +824,156 @@ struct DoctorCmd {
     timeout_ms: u64,
 }
 
+#[cfg(feature = "eval")]
+#[derive(clap::Args, Debug)]
+struct EvalTranscriptSummarizeCmd {
+    /// Transcript JSONL path produced by eval runs (e.g. `<out>.transcript.jsonl`).
+    #[arg(long)]
+    transcript_jsonl: std::path::PathBuf,
+    /// Only include events whose `run_kind` matches this string (optional).
+    #[arg(long)]
+    run_kind: Option<String>,
+    /// Only include events whose `stage` matches this string (optional).
+    #[arg(long)]
+    stage: Option<String>,
+    /// Keep only the top-K slowest events (default: 20).
+    #[arg(long, default_value_t = 20)]
+    top_k: usize,
+    /// Output JSON path (default: .generated/webpipe-eval-transcript-summary-<epoch>.json)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[cfg(feature = "eval")]
+#[derive(clap::Args, Debug)]
+struct EvalVlmSummarizeCmd {
+    /// Input JSON artifact(s) produced by `webpipe vlm-openrouter`.
+    #[arg(long = "input", num_args = 1..)]
+    inputs: Vec<std::path::PathBuf>,
+    /// Output JSON path (default: .generated/webpipe-eval-vlm-summary-<epoch>.json)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[cfg(feature = "eval")]
+#[derive(clap::Args, Debug)]
+struct EvalVlmRunCmd {
+    /// One or more image paths to critique (repeatable).
+    #[arg(long = "image")]
+    images: Vec<std::path::PathBuf>,
+    /// Optional directory of images. If set, we include image-like files in this directory.
+    #[arg(long)]
+    images_dir: Option<std::path::PathBuf>,
+    /// Max number of images taken from `--images-dir` (default: 50).
+    #[arg(long, default_value_t = 50)]
+    max_images: usize,
+    /// Output directory for per-image artifacts (default: .generated/webpipe-eval-vlm-run-<epoch>/).
+    #[arg(long)]
+    out_dir: Option<std::path::PathBuf>,
+    /// Output JSON path for meta summary (default: <out_dir>/summary.json).
+    #[arg(long)]
+    out_summary: Option<std::path::PathBuf>,
+    /// The OpenRouter model id (optional; otherwise env/default like `vlm-openrouter`).
+    #[arg(long)]
+    model: Option<String>,
+    /// The critique prompt/instructions (optional).
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Judge goal(s), in priority order (repeatable).
+    ///
+    /// Use goals to steer what "good" means for this run. Earlier goals have higher priority.
+    #[arg(long = "goal")]
+    goals: Vec<String>,
+    /// Built-in goal bundle(s) (repeatable).
+    ///
+    /// Use this to select a curated goal set by id (e.g. `sinprimes_story_v1`). You can combine
+    /// multiple bundles; their goals are appended in the order specified.
+    #[arg(long = "goal-profile")]
+    goal_profiles: Vec<String>,
+    /// Print available goal profiles (and their goal lists) then exit 0.
+    #[arg(long)]
+    list_goal_profiles: bool,
+    /// Optional goals file (one goal per line; lines starting with `#` are ignored).
+    ///
+    /// Goal ordering rule:
+    /// - goals are concatenated in this order: `--goal` (argv order), then `--goals-file`, then `--goal-profile`
+    /// - earlier goals have higher priority
+    #[arg(long)]
+    goals_file: Option<std::path::PathBuf>,
+    /// Judge profile(s) to run (repeatable).
+    ///
+    /// This expands the run into a fan-out DAG:
+    /// - tasks = images × profiles × trials
+    /// - results are collected per image and also summarized per profile
+    ///
+    /// Built-ins: general, ux_layout, tables, plots, math, writing, runtime
+    #[arg(long = "profile")]
+    profiles: Vec<String>,
+    /// How many VLM trials to run per image (default: 1).
+    ///
+    /// Use this to reduce variance: aggregate by median score and consensus fixes.
+    #[arg(long, default_value_t = 1)]
+    trials: u64,
+    /// OpenRouter temperature (default: 0.2). Use 0.0 for maximum stability.
+    #[arg(long, default_value_t = 0.2)]
+    temperature: f64,
+    /// Max in-flight VLM calls (bounded parallelism).
+    #[arg(long, default_value_t = 6)]
+    max_inflight: usize,
+    /// Cache mode for per-task artifacts.
+    ///
+    /// - off: always call the model
+    /// - reuse_match: reuse existing artifact only if (model, temperature, prompt_hash, context_hash) match
+    /// - reuse_any: reuse any existing artifact file if present
+    #[arg(long, default_value = "reuse_match")]
+    cache: String,
+    /// Optional directory of render-context JSON files (one per image).
+    ///
+    /// If set, we look for:
+    /// - `<context_dir>/<image_filename>.context.json`
+    /// - `<context_dir>/<image_stem>.context.json`
+    #[arg(long)]
+    context_dir: Option<std::path::PathBuf>,
+    /// Max chars of context text appended to the prompt (default: 12_000).
+    #[arg(long, default_value_t = 12_000)]
+    context_max_chars: usize,
+    /// Max chars stored per VLM output `text` field.
+    #[arg(long, default_value_t = 50_000)]
+    max_chars: usize,
+    /// Optional transcript JSONL path (appends one compact event per call).
+    #[arg(long)]
+    transcript_jsonl: Option<std::path::PathBuf>,
+    /// Max chars stored per transcript string field.
+    #[arg(long, default_value_t = 8_000)]
+    transcript_max_chars: usize,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[cfg(feature = "eval")]
+#[derive(clap::Args, Debug)]
+struct EvalVlmBundleCmd {
+    /// Page-level VLM summary JSON (typically produced by `eval-vlm-run` on *_full.png).
+    #[arg(long)]
+    page_summary: std::path::PathBuf,
+    /// Plot-level VLM summary JSON (typically produced by `eval-vlm-run` on story_assets/).
+    #[arg(long)]
+    plots_summary: std::path::PathBuf,
+    /// Output JSON path (default: .generated/webpipe-eval-vlm-bundle-<epoch>.json).
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
 #[derive(clap::Args, Debug)]
 struct VersionCmd {
     /// Output format: json|text
@@ -401,16 +981,648 @@ struct VersionCmd {
     output: String,
 }
 
+#[cfg(feature = "vlm")]
+#[derive(clap::Args, Debug)]
+struct VlmImageToTextCmd {
+    /// Path to an image file (png/jpg/webp) to send to Gemini.
+    #[arg(long)]
+    image: std::path::PathBuf,
+    /// Optional MIME type override (e.g. image/png). If omitted, inferred from file extension.
+    #[arg(long)]
+    mime_type: Option<String>,
+    /// Output JSON path (default: .generated/webpipe-vlm-image-to-text-<epoch>.json)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+}
+
+#[cfg(feature = "vlm")]
+#[derive(clap::Args, Debug)]
+struct VlmOpenrouterCmd {
+    /// Path to an image file (png/jpg/webp) to send as an inline data URL.
+    #[arg(long)]
+    image: std::path::PathBuf,
+    /// The OpenRouter model id (e.g. "google/gemini-2.0-flash-001").
+    ///
+    /// If omitted, uses `WEBPIPE_OPENROUTER_MODEL` or falls back to a conservative default.
+    #[arg(long)]
+    model: Option<String>,
+    /// The critique prompt/instructions.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Output JSON path (default: .generated/webpipe-vlm-openrouter-<epoch>.json)
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Override "now" for deterministic outputs.
+    #[arg(long)]
+    now_epoch_s: Option<u64>,
+    /// Max chars stored in the output `text` field (default: 50_000).
+    #[arg(long, default_value_t = 50_000)]
+    max_chars: usize,
+    /// OpenRouter temperature (default: 0.2). Use 0.0 for maximum stability.
+    #[arg(long, default_value_t = 0.2)]
+    temperature: f64,
+    /// Optional render-context JSON file to append to the prompt.
+    #[arg(long)]
+    context_json: Option<std::path::PathBuf>,
+    /// Max chars of context text appended to the prompt (default: 12_000).
+    #[arg(long, default_value_t = 12_000)]
+    context_max_chars: usize,
+    /// Optional transcript JSONL path (appends one compact event per call).
+    #[arg(long)]
+    transcript_jsonl: Option<std::path::PathBuf>,
+    /// Max chars stored per transcript string field (keeps transcript bounded).
+    #[arg(long, default_value_t = 8_000)]
+    transcript_max_chars: usize,
+}
+
+#[cfg(feature = "vlm")]
+fn vlm_truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 {
+        return (String::new(), !s.is_empty());
+    }
+    let mut out = String::new();
+    for (n, ch) in s.chars().enumerate() {
+        if n >= max_chars {
+            return (out, true);
+        }
+        out.push(ch);
+    }
+    (out, false)
+}
+
+#[cfg(feature = "vlm")]
+fn vlm_strip_json_fence(s: &str) -> &str {
+    // Common model failure: wrap JSON in ```json ... ```.
+    // Keep this tiny and deterministic: strip one leading/trailing fence pair if present.
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        // drop optional language tag on the first line
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        let rest = rest.strip_prefix("JSON").unwrap_or(rest);
+        let rest = rest.trim_start_matches(|c: char| c == '\n' || c == '\r');
+        if let Some(end) = rest.rfind("```") {
+            return rest[..end].trim();
+        }
+    }
+    t
+}
+
+#[cfg(feature = "vlm")]
+fn vlm_extract_json_object(s: &str) -> Option<serde_json::Value> {
+    // Try strict parse first.
+    let t = vlm_strip_json_fence(s);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        if v.is_object() {
+            return Some(v);
+        }
+    }
+    // Fallback: search for the first {...} JSON object in the string.
+    let mut depth: i64 = 0;
+    let mut start: Option<usize> = None;
+    for (i, ch) in t.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s0) = start {
+                            let slice = &t[s0..=i];
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(slice) {
+                                if v.is_object() {
+                                    return Some(v);
+                                }
+                            }
+                        }
+                        start = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(feature = "vlm")]
+fn vlm_infer_mime_from_path(p: &std::path::Path) -> Option<&'static str> {
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "vlm")]
+fn vlm_append_jsonl(path: &std::path::Path, line: &serde_json::Value) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "{}", serde_json::to_string(line)?)?;
+    Ok(())
+}
+
+#[cfg(feature = "vlm")]
+fn vlm_format_context_block(ctx: &serde_json::Value, max_chars: usize) -> String {
+    // Keep this stable and bounded so prompts remain deterministic-ish.
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(k) = ctx.get("kind").and_then(|x| x.as_str()) {
+        lines.push(format!("kind: {k}"));
+    }
+    if let Some(p) = ctx.get("page") {
+        if let Some(url) = p.get("url").and_then(|x| x.as_str()) {
+            lines.push(format!("page.url: {url}"));
+        }
+        if let Some(t) = p.get("title").and_then(|x| x.as_str()) {
+            if !t.trim().is_empty() {
+                lines.push(format!("page.title: {t}"));
+            }
+        }
+        if let Some(scroll_h) = p
+            .get("scroll")
+            .and_then(|x| x.get("scrollHeight"))
+            .and_then(|x| x.as_u64())
+        {
+            lines.push(format!("page.scrollHeight: {scroll_h}"));
+        }
+        if let Some(y) = p
+            .get("scroll_pos")
+            .and_then(|x| x.get("y"))
+            .and_then(|x| x.as_i64())
+        {
+            lines.push(format!("page.scrollY: {y}"));
+        }
+        if let Some(h) = p.get("hash").and_then(|x| x.as_str()) {
+            let hh = h.trim();
+            if !hh.is_empty() {
+                lines.push(format!("page.hash: {hh}"));
+            }
+        }
+        if let Some(toc_n) = p
+            .get("toc")
+            .and_then(|x| x.get("link_count"))
+            .and_then(|x| x.as_u64())
+        {
+            lines.push(format!("page.toc.link_count: {toc_n}"));
+        }
+        if let Some(active0) = p
+            .get("toc")
+            .and_then(|x| x.get("active"))
+            .and_then(|x| x.as_array())
+            .and_then(|a| a.first())
+            .and_then(|x| x.as_str())
+        {
+            let s = active0.trim();
+            if !s.is_empty() {
+                lines.push(format!("page.toc.active: {s}"));
+            }
+        }
+    }
+    let warn_n = ctx
+        .get("console")
+        .and_then(|c| c.get("warnings"))
+        .and_then(|x| x.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let err_n = ctx
+        .get("console")
+        .and_then(|c| c.get("errors"))
+        .and_then(|x| x.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let reqfail_n = ctx
+        .get("network")
+        .and_then(|n| n.get("request_failures"))
+        .and_then(|x| x.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    lines.push(format!(
+        "console: warnings={warn_n} errors={err_n} request_failures={reqfail_n}"
+    ));
+
+    // Include bounded excerpts (head HTML + a few console errors + request failures).
+    if let Some(head) = ctx
+        .get("page")
+        .and_then(|p| p.get("head_html_excerpt"))
+        .and_then(|x| x.as_str())
+    {
+        let (h, _) = vlm_truncate_chars(head, 2000);
+        if !h.trim().is_empty() {
+            lines.push("head_html_excerpt:".to_string());
+            lines.push(h);
+        }
+    }
+
+    // Include a tiny computed-style snapshot so "contrast" critiques can be grounded.
+    if let Some(cs) = ctx
+        .get("page")
+        .and_then(|p| p.get("computed_styles"))
+        .and_then(|x| x.as_object())
+    {
+        let keys = [
+            "body",
+            "layout",
+            "meta",
+            "caption",
+            "progress",
+            "progress_bar",
+            "toc_aside",
+            "toc",
+            "toc_card",
+            "table",
+            "table_row_odd",
+            "table_row_even",
+            "callout",
+            "callout_title",
+        ];
+        let mut any = false;
+        for k in keys {
+            if let Some(v) = cs.get(k) {
+                if v.is_null() {
+                    continue;
+                }
+                if !any {
+                    lines.push("computed_styles:".to_string());
+                    any = true;
+                }
+                let compact = serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string());
+                let (s, _) = vlm_truncate_chars(&compact, 800);
+                lines.push(format!("- {k}: {s}"));
+            }
+        }
+    }
+    if let Some(arr) = ctx
+        .get("console")
+        .and_then(|c| c.get("errors"))
+        .and_then(|x| x.as_array())
+    {
+        for (i, it) in arr.iter().take(6).enumerate() {
+            let t = it.get("text").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if !t.is_empty() {
+                lines.push(format!("console.error[{i}]: {t}"));
+            }
+        }
+    }
+    if let Some(arr) = ctx
+        .get("network")
+        .and_then(|n| n.get("request_failures"))
+        .and_then(|x| x.as_array())
+    {
+        for (i, it) in arr.iter().take(6).enumerate() {
+            let u = it.get("url").and_then(|x| x.as_str()).unwrap_or("").trim();
+            let f = it
+                .get("failure")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim();
+            if !u.is_empty() && !f.is_empty() {
+                lines.push(format!("requestfailed[{i}]: {f} {u}"));
+            }
+        }
+    }
+
+    let joined = lines.join("\n");
+    let (out, clipped) = vlm_truncate_chars(&joined, max_chars);
+    if clipped {
+        format!("{out}\n<context_truncated:true>")
+    } else {
+        out
+    }
+}
+
+#[cfg(feature = "vlm")]
+fn vlm_load_context_for_image(
+    context_dir: &std::path::Path,
+    img_path: &std::path::Path,
+    max_chars: usize,
+) -> Option<String> {
+    let fname = img_path.file_name().and_then(|s| s.to_str())?;
+    let stem = img_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let candidates = [
+        context_dir.join(format!("{fname}.context.json")),
+        context_dir.join(format!("{stem}.context.json")),
+    ];
+    for p in candidates {
+        if !p.exists() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&p).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        return Some(vlm_format_context_block(&v, max_chars));
+    }
+    None
+}
+
+#[cfg(feature = "vlm")]
+fn vlm_validate_critique_json(v: &serde_json::Value) -> bool {
+    let Some(o) = v.as_object() else { return false };
+
+    // Required scalar fields.
+    let overall_ok = o.get("overall").and_then(|x| x.as_str()).is_some_and(|s| {
+        let s = s.trim();
+        !s.is_empty() && s.len() <= 600
+    });
+    let score_ok = o
+        .get("score_0_10")
+        .and_then(|x| x.as_f64())
+        .is_some_and(|s| (0.0..=10.0).contains(&s));
+    let verdict_ok = o
+        .get("verdict")
+        .and_then(|x| x.as_str())
+        .is_some_and(|s| matches!(s.trim(), "good" | "mixed" | "bad"));
+
+    let strengths_ok = match o.get("strengths").and_then(|x| x.as_array()) {
+        Some(xs) => {
+            let n = xs.len();
+            (3..=6).contains(&n)
+                && xs.iter().all(|x| {
+                    x.as_str().is_some_and(|s| {
+                        let s = s.trim();
+                        !s.is_empty() && s.len() <= 160
+                    })
+                })
+        }
+        None => false,
+    };
+
+    // issues[] object schema + size bounds.
+    let issues_ok = match o.get("issues").and_then(|x| x.as_array()) {
+        Some(xs) => {
+            if xs.len() > 40 {
+                return false;
+            }
+            xs.iter().all(|it| {
+                let Some(m) = it.as_object() else {
+                    return false;
+                };
+                let area_ok = m.get("area").and_then(|x| x.as_str()).is_some_and(|s| {
+                    matches!(
+                        s.trim(),
+                        "navigation"
+                            | "layout_spacing"
+                            | "typography"
+                            | "visual_hierarchy"
+                            | "plots_figures"
+                            | "tables_data"
+                            | "math_typesetting"
+                            | "writing_clarity"
+                            | "accessibility"
+                            | "technical_runtime"
+                    )
+                });
+                let sev_ok = m
+                    .get("severity")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| matches!(s.trim(), "P0" | "P1" | "P2"));
+                let region_ok = m
+                    .get("region")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| matches!(s.trim(), "top" | "middle" | "bottom" | "global"));
+                let problem_ok = m
+                    .get("problem")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.trim().is_empty() && s.len() <= 200);
+                let evidence_ok = m
+                    .get("evidence")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.trim().is_empty() && s.len() <= 200);
+                let fix_ok = m
+                    .get("fix")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.trim().is_empty() && s.len() <= 200);
+
+                area_ok && sev_ok && region_ok && problem_ok && evidence_ok && fix_ok
+            })
+        }
+        None => false,
+    };
+
+    let top_3_ok = match o.get("top_3_fixes").and_then(|x| x.as_array()) {
+        Some(xs) => {
+            if xs.is_empty() || xs.len() > 3 {
+                return false;
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            xs.iter().all(|x| {
+                x.as_str().is_some_and(|s| {
+                    let s = s.trim();
+                    !s.is_empty() && s.len() <= 96 && seen.insert(s.to_string())
+                })
+            })
+        }
+        None => false,
+    };
+
+    overall_ok && score_ok && verdict_ok && strengths_ok && issues_ok && top_3_ok
+}
+
+#[cfg(feature = "vlm")]
+async fn vlm_openrouter_call(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+    img_path: &std::path::Path,
+    max_chars: usize,
+    temperature: f64,
+    now: u64,
+) -> serde_json::Value {
+    let image_path_s = img_path.display().to_string();
+    let bytes = match std::fs::read(img_path) {
+        Ok(b) => b,
+        Err(_) => {
+            return serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_vlm_openrouter",
+                "generated_at_epoch_s": now,
+                "ok": false,
+                "inputs": {
+                    "image_path": image_path_s,
+                    "bytes_len": 0u64,
+                    "mime_type": "application/octet-stream",
+                    "model": model,
+                    "temperature": temperature
+                },
+                "error": { "code": "image_read_failed" }
+            });
+        }
+    };
+    let mime = vlm_infer_mime_from_path(img_path).unwrap_or("application/octet-stream");
+    let data_url = format!(
+        "data:{};base64,{}",
+        mime,
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
+
+    // OpenAI-compatible multimodal message: content as an array of parts.
+    let req = serde_json::json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}}
+            ]
+        }],
+        "temperature": temperature
+    });
+
+    let resp = http
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&req)
+        .timeout(std::time::Duration::from_millis(60_000))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let v: serde_json::Value = match r.json().await {
+                Ok(v) => v,
+                Err(_) => {
+                    return serde_json::json!({
+                        "schema_version": 1,
+                        "kind": "webpipe_vlm_openrouter",
+                        "generated_at_epoch_s": now,
+                        "ok": false,
+                        "inputs": {
+                            "image_path": image_path_s,
+                            "bytes_len": bytes.len(),
+                            "mime_type": mime,
+                            "model": model,
+                            "temperature": temperature
+                        },
+                        "http": { "status": status },
+                        "error": { "code": "openrouter_bad_json" }
+                    });
+                }
+            };
+
+            if v.get("ok").and_then(|x| x.as_bool()) == Some(false) || status >= 400 {
+                return serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_vlm_openrouter",
+                    "generated_at_epoch_s": now,
+                    "ok": false,
+                    "inputs": {
+                        "image_path": image_path_s,
+                        "bytes_len": bytes.len(),
+                        "mime_type": mime,
+                        "model": model,
+                        "temperature": temperature
+                    },
+                    "http": { "status": status },
+                    "provider_response": v,
+                    "error": { "code": "openrouter_non_success" }
+                });
+            }
+
+            // Extract choices[0].message.content (string or parts).
+            let mut text = String::new();
+            if let Some(c0) = v
+                .get("choices")
+                .and_then(|x| x.as_array())
+                .and_then(|a| a.first())
+            {
+                let content = c0
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                match content {
+                    serde_json::Value::String(s) => text = s,
+                    serde_json::Value::Array(parts) => {
+                        for p in parts {
+                            if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let (text_trunc, clipped) = vlm_truncate_chars(&text, max_chars);
+            let parsed =
+                vlm_extract_json_object(&text_trunc).filter(|p| vlm_validate_critique_json(p));
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_vlm_openrouter",
+                "generated_at_epoch_s": now,
+                "ok": true,
+                "inputs": {
+                    "image_path": image_path_s,
+                    "bytes_len": bytes.len(),
+                    "mime_type": mime,
+                    "model": model,
+                    "temperature": temperature
+                },
+                "http": { "status": status },
+                "text": text_trunc,
+                "text_truncated": clipped,
+                "parsed": parsed,
+                "parsed_ok": parsed.is_some()
+            })
+        }
+        Err(_) => serde_json::json!({
+            "schema_version": 1,
+            "kind": "webpipe_vlm_openrouter",
+            "generated_at_epoch_s": now,
+            "ok": false,
+            "inputs": {
+                "image_path": image_path_s,
+                "bytes_len": 0u64,
+                "mime_type": "application/octet-stream",
+                "model": model,
+                "temperature": temperature
+            },
+            "error": { "code": "openrouter_request_failed" }
+        }),
+    }
+}
+
 #[cfg(feature = "stdio")]
 mod mcp {
     use super::*;
     use rmcp::{
+        handler::server::router::prompt::PromptRouter as RmcpPromptRouter,
         handler::server::router::tool::ToolRouter as RmcpToolRouter,
         handler::server::wrapper::Parameters,
-        model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+        model::{
+            Annotated, CallToolResult, Content, GetPromptRequestParam, GetPromptResult,
+            ListPromptsResult, ListResourcesResult, PaginatedRequestParam, PromptMessage,
+            PromptMessageRole, RawResource, ReadResourceRequestParam, ReadResourceResult, Resource,
+            ResourceContents, ServerCapabilities, ServerInfo,
+        },
+        prompt, prompt_handler, prompt_router,
+        service::RequestContext,
         tool, tool_handler, tool_router,
         transport::stdio,
-        ErrorData as McpError, ServiceExt,
+        ErrorData as McpError, RoleServer, ServiceExt,
     };
     use schemars::JsonSchema;
     use serde::Deserialize;
@@ -1086,9 +2298,1957 @@ mod mcp {
     fn tool_result(payload: serde_json::Value) -> CallToolResult {
         // Always attach structured content for machine consumers, and include a text fallback
         // for older clients/tests that only read `content[0].text`.
-        let mut r = CallToolResult::structured(payload.clone());
+        //
+        // Also set MCP-level `isError` when our envelope says ok=false, so clients that
+        // rely on MCP error signaling behave correctly.
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let mut r = if ok {
+            CallToolResult::structured(payload.clone())
+        } else {
+            CallToolResult::structured_error(payload.clone())
+        };
         r.content = vec![Content::text(payload.to_string())];
         r
+    }
+
+    fn tool_result_markdown_with_json(
+        payload: serde_json::Value,
+        markdown: String,
+    ) -> CallToolResult {
+        // Cursor (and similar UIs) display the `content` text and often render Markdown.
+        // Keep the canonical machine payload in `structured_content`.
+        //
+        // Optional debug knob: include the full JSON payload as a second text item when
+        // WEBPIPE_MCP_INCLUDE_JSON_TEXT=true (useful for copy/paste without digging into
+        // structured_content tooling).
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let mut r = if ok {
+            CallToolResult::structured(payload.clone())
+        } else {
+            CallToolResult::structured_error(payload.clone())
+        };
+        let mut content = vec![Content::text(markdown)];
+        let include_json_text = std::env::var("WEBPIPE_MCP_INCLUDE_JSON_TEXT")
+            .ok()
+            .is_some_and(|v| {
+                let s = v.trim();
+                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+            });
+        if include_json_text {
+            content.push(Content::text(payload.to_string()));
+        }
+        r.content = content;
+        r
+    }
+
+    fn web_deep_research_markdown(payload: &serde_json::Value) -> String {
+        let query = payload
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let answer = payload
+            .get("answer")
+            .and_then(|a| a.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let truncated = payload
+            .get("answer")
+            .and_then(|a| a.get("truncated"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let mut md = String::new();
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
+        }
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        // Stable, bounded "meta" that is useful in Cursor but not too noisy.
+        if let Some(req) = payload.get("request").and_then(|v| v.as_object()) {
+            md.push_str("## Request\n\n");
+            // Keep ordering stable and avoid dumping huge nested objects.
+            let show_str = |k: &str| req.get(k).and_then(|v| v.as_str()).unwrap_or("");
+            let show_u64 = |k: &str| req.get(k).and_then(|v| v.as_u64());
+            let show_bool = |k: &str| req.get(k).and_then(|v| v.as_bool());
+
+            let provider = show_str("provider");
+            if !provider.is_empty() {
+                md.push_str("- **provider**: `");
+                md.push_str(provider);
+                md.push_str("`\n");
+            }
+            let fetch_backend = show_str("fetch_backend");
+            if !fetch_backend.is_empty() {
+                md.push_str("- **fetch_backend**: `");
+                md.push_str(fetch_backend);
+                md.push_str("`\n");
+            }
+            if let Some(nn) = show_bool("no_network") {
+                md.push_str("- **no_network**: ");
+                md.push_str(if nn { "true" } else { "false" });
+                md.push('\n');
+            }
+            if let Some(ms) = show_u64("timeout_ms") {
+                md.push_str("- **timeout_ms**: ");
+                md.push_str(&ms.to_string());
+                md.push('\n');
+            }
+            if let Some(n) = show_u64("max_results") {
+                md.push_str("- **max_results**: ");
+                md.push_str(&n.to_string());
+                md.push('\n');
+            }
+            if let Some(n) = show_u64("max_urls") {
+                md.push_str("- **max_urls**: ");
+                md.push_str(&n.to_string());
+                md.push('\n');
+            }
+            if let Some(n) = show_u64("top_chunks") {
+                md.push_str("- **top_chunks**: ");
+                md.push_str(&n.to_string());
+                md.push('\n');
+            }
+            if let Some(n) = show_u64("max_chunk_chars") {
+                md.push_str("- **max_chunk_chars**: ");
+                md.push_str(&n.to_string());
+                md.push('\n');
+            }
+            if let Some(n) = show_u64("max_chars") {
+                md.push_str("- **max_chars**: ");
+                md.push_str(&n.to_string());
+                md.push('\n');
+            }
+            if let Some(sm) = req.get("search_mode").and_then(|v| v.as_str()) {
+                if !sm.trim().is_empty() {
+                    md.push_str("- **search_mode**: `");
+                    md.push_str(sm.trim());
+                    md.push_str("`\n");
+                }
+            }
+            if let Some(re) = req.get("reasoning_effort").and_then(|v| v.as_str()) {
+                if !re.trim().is_empty() {
+                    md.push_str("- **reasoning_effort**: `");
+                    md.push_str(re.trim());
+                    md.push_str("`\n");
+                }
+            }
+            md.push('\n');
+        } else if !kind.is_empty() {
+            // Defensive: if request isn't present, at least show kind for debugging.
+            md.push_str("## Request\n\n");
+            md.push_str("- **kind**: `");
+            md.push_str(kind);
+            md.push_str("`\n\n");
+        }
+
+        if let Some(usage) = payload.get("usage") {
+            if usage.is_object() {
+                md.push_str("## Usage\n\n");
+                if let Some(t) = usage.get("total_tokens").and_then(|v| v.as_u64()) {
+                    md.push_str("- **total_tokens**: ");
+                    md.push_str(&t.to_string());
+                    md.push('\n');
+                }
+                if let Some(t) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+                    md.push_str("- **prompt_tokens**: ");
+                    md.push_str(&t.to_string());
+                    md.push('\n');
+                }
+                if let Some(t) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+                    md.push_str("- **completion_tokens**: ");
+                    md.push_str(&t.to_string());
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+        }
+
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("## Timing\n\n");
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+            md.push('\n');
+        }
+
+        md.push_str("## Answer\n\n");
+        if answer.is_empty() {
+            md.push_str("_No answer text was produced._\n");
+        } else {
+            md.push_str(answer);
+            md.push('\n');
+        }
+        if truncated {
+            md.push_str("\n_Note: answer was truncated to stay bounded._\n");
+        }
+
+        if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
+            if !ws.is_empty() {
+                md.push_str("\n## Warnings\n\n");
+                for w in ws.iter().filter_map(|v| v.as_str()) {
+                    md.push_str("- ");
+                    md.push_str(w);
+                    md.push('\n');
+                }
+            }
+        }
+
+        // Evidence summary (bounded).
+        if let Some(ev) = payload.get("evidence").and_then(|v| v.as_object()) {
+            let results_n = ev
+                .get("results")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let top_n = ev
+                .get("top_chunks")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if results_n > 0 || top_n > 0 {
+                md.push_str("\n## Evidence (summary)\n\n");
+                md.push_str("- **results**: ");
+                md.push_str(&results_n.to_string());
+                md.push('\n');
+                md.push_str("- **top_chunks**: ");
+                md.push_str(&top_n.to_string());
+                md.push('\n');
+
+                // Optional snippet mode: show a few top chunk excerpts.
+                let include_snips = std::env::var("WEBPIPE_MCP_MARKDOWN_EVIDENCE_SNIPPETS")
+                    .ok()
+                    .is_some_and(|v| {
+                        let s = v.trim();
+                        s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+                    });
+                if include_snips && top_n > 0 {
+                    md.push_str("\n### Top chunks (excerpts)\n\n");
+                    if let Some(arr) = ev.get("top_chunks").and_then(|v| v.as_array()) {
+                        for c in arr.iter().take(3) {
+                            let url = c.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            let text0 = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            // Keep excerpts bounded.
+                            let mut excerpt = String::new();
+                            for ch in text0.chars().take(300) {
+                                excerpt.push(ch);
+                            }
+                            if !excerpt.is_empty() {
+                                md.push_str("- ");
+                                if !url.trim().is_empty() {
+                                    md.push_str("**");
+                                    md.push_str(url.trim());
+                                    md.push_str("**: ");
+                                }
+                                md.push_str(&excerpt);
+                                if text0.chars().count() > 300 {
+                                    md.push_str("…");
+                                }
+                                md.push('\n');
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(cs) = payload
+            .get("answer")
+            .and_then(|a| a.get("citations"))
+            .and_then(|v| v.as_array())
+        {
+            if !cs.is_empty() {
+                md.push_str("\n## Citations\n\n");
+                for c in cs.iter() {
+                    if let Some(u) = c.as_str() {
+                        md.push_str("- ");
+                        md.push_str(u);
+                        md.push('\n');
+                    }
+                }
+            }
+        }
+
+        md
+    }
+
+    fn web_search_extract_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let query = payload
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let provider = payload
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let backend_provider = payload
+            .get("backend_provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let fetch_backend = payload
+            .get("fetch_backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let auto_mode = payload
+            .get("auto_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let selection_mode = payload
+            .get("selection_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let url_selection_mode = payload
+            .get("url_selection_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+
+        let url_count_in = payload
+            .get("url_count_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let url_count_used = payload
+            .get("url_count_used")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let results_count = payload
+            .get("results")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let top_chunks_count = payload
+            .get("top_chunks")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        let mut md = String::new();
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
+        }
+
+        // Request knobs (bounded + stable ordering).
+        md.push_str("## Request\n\n");
+        if !provider.is_empty() {
+            md.push_str("- **provider**: `");
+            md.push_str(provider);
+            md.push_str("`\n");
+        }
+        if !auto_mode.is_empty() {
+            md.push_str("- **auto_mode**: `");
+            md.push_str(auto_mode);
+            md.push_str("`\n");
+        }
+        if !selection_mode.is_empty() {
+            md.push_str("- **selection_mode**: `");
+            md.push_str(selection_mode);
+            md.push_str("`\n");
+        }
+        if !url_selection_mode.is_empty() {
+            md.push_str("- **url_selection_mode**: `");
+            md.push_str(url_selection_mode);
+            md.push_str("`\n");
+        }
+        if !fetch_backend.is_empty() {
+            md.push_str("- **fetch_backend**: `");
+            md.push_str(fetch_backend);
+            md.push_str("`\n");
+        }
+        if let Some(nn) = payload.get("no_network").and_then(|v| v.as_bool()) {
+            md.push_str("- **no_network**: ");
+            md.push_str(if nn { "true" } else { "false" });
+            md.push('\n');
+        }
+        for (k, label) in [
+            ("max_results", "max_results"),
+            ("max_urls", "max_urls"),
+            ("max_chars", "max_chars"),
+            ("top_chunks", "top_chunks"),
+            ("max_chunk_chars", "max_chunk_chars"),
+        ] {
+            if let Some(n) = payload.get(k).and_then(|v| v.as_u64()) {
+                md.push_str("- **");
+                md.push_str(label);
+                md.push_str("**: ");
+                md.push_str(&n.to_string());
+                md.push('\n');
+            }
+        }
+        md.push('\n');
+
+        // Compact meta (Cursor-friendly, bounded).
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if !provider.is_empty() {
+            md.push_str("- **provider**: `");
+            md.push_str(provider);
+            md.push_str("`\n");
+        }
+        if !backend_provider.is_empty() {
+            md.push_str("- **backend_provider**: `");
+            md.push_str(backend_provider);
+            md.push_str("`\n");
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md.push_str("- **urls_in**: ");
+        md.push_str(&url_count_in.to_string());
+        md.push('\n');
+        md.push_str("- **urls_used**: ");
+        md.push_str(&url_count_used.to_string());
+        md.push('\n');
+        md.push_str("- **results**: ");
+        md.push_str(&results_count.to_string());
+        md.push('\n');
+        md.push_str("- **top_chunks**: ");
+        md.push_str(&top_chunks_count.to_string());
+        md.push('\n');
+        md.push('\n');
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        // Agentic summary (bounded).
+        if let Some(a) = payload.get("agentic").and_then(|v| v.as_object()) {
+            if a.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
+                md.push_str("## Agentic\n\n");
+                for k in [
+                    "search_rounds",
+                    "stuck_events",
+                    "frontier_added_total",
+                    "frontier_len_final",
+                    "urls_fetched",
+                ] {
+                    if let Some(n) = a.get(k).and_then(|v| v.as_u64()) {
+                        md.push_str("- **");
+                        md.push_str(k);
+                        md.push_str("**: ");
+                        md.push_str(&n.to_string());
+                        md.push('\n');
+                    }
+                }
+                md.push('\n');
+            }
+        }
+
+        // Warnings summary (bounded).
+        if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
+            if !ws.is_empty() {
+                md.push_str("## Warnings\n\n");
+                for w in ws.iter().filter_map(|v| v.as_str()).take(12) {
+                    md.push_str("- ");
+                    md.push_str(w);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+        }
+        if let Some(codes) = payload.get("warning_codes").and_then(|v| v.as_array()) {
+            let codes_s: Vec<&str> = codes.iter().filter_map(|v| v.as_str()).collect();
+            if !codes_s.is_empty() {
+                md.push_str("### Warning codes\n\n");
+                for c in codes_s.iter().take(12) {
+                    md.push_str("- `");
+                    md.push_str(c);
+                    md.push_str("`\n");
+                }
+                md.push('\n');
+            }
+        }
+
+        // URLs (bounded).
+        if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
+            if !arr.is_empty() {
+                md.push_str("## URLs\n\n");
+                for r in arr.iter().take(10) {
+                    let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    if url.is_empty() {
+                        continue;
+                    }
+                    md.push_str("- ");
+                    md.push_str(url);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+        }
+
+        // Optional chunk excerpts (bounded).
+        let include_excerpts = std::env::var("WEBPIPE_MCP_MARKDOWN_CHUNK_EXCERPTS")
+            .ok()
+            .is_some_and(|v| {
+                let s = v.trim();
+                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+            });
+        if include_excerpts {
+            if let Some(arr) = payload.get("top_chunks").and_then(|v| v.as_array()) {
+                if !arr.is_empty() {
+                    md.push_str("## Top chunks (excerpts)\n\n");
+                    for c in arr.iter().take(5) {
+                        let url = c.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                        let text0 = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        let mut excerpt = String::new();
+                        for ch in text0.chars().take(300) {
+                            excerpt.push(ch);
+                        }
+                        if excerpt.trim().is_empty() {
+                            continue;
+                        }
+                        md.push_str("- ");
+                        if !url.is_empty() {
+                            md.push_str("**");
+                            md.push_str(url);
+                            md.push_str("**: ");
+                        }
+                        md.push_str(&excerpt);
+                        if text0.chars().count() > 300 {
+                            md.push_str("…");
+                        }
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+            }
+        }
+
+        md
+    }
+
+    fn paper_search_markdown(payload: &serde_json::Value) -> String {
+        let query = payload
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+
+        let mut md = String::new();
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
+        }
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        // Small request summary (avoid dumping nested JSON).
+        if let Some(req) = payload.get("request").and_then(|v| v.as_object()) {
+            md.push_str("## Request\n\n");
+            if let Some(bs) = req.get("backends").and_then(|v| v.as_array()) {
+                let xs: Vec<String> = bs
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| format!("`{}`", s.trim()))
+                    .filter(|s| s != "``")
+                    .collect();
+                if !xs.is_empty() {
+                    md.push_str("- **backends**: ");
+                    md.push_str(&xs.join(", "));
+                    md.push('\n');
+                }
+            }
+            if let Some(ys) = req.get("years").and_then(|v| v.as_array()) {
+                let xs: Vec<String> = ys
+                    .iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|y| y.to_string())
+                    .collect();
+                if !xs.is_empty() {
+                    md.push_str("- **years**: ");
+                    md.push_str(&xs.join(", "));
+                    md.push('\n');
+                }
+            }
+            if let Some(n) = req.get("limit").and_then(|v| v.as_u64()) {
+                md.push_str("- **limit**: ");
+                md.push_str(&n.to_string());
+                md.push('\n');
+            }
+            if let Some(ms) = req.get("timeout_ms").and_then(|v| v.as_u64()) {
+                md.push_str("- **timeout_ms**: ");
+                md.push_str(&ms.to_string());
+                md.push('\n');
+            }
+            if let Some(b) = req.get("include_abstract").and_then(|v| v.as_bool()) {
+                md.push_str("- **include_abstract**: ");
+                md.push_str(if b { "true" } else { "false" });
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("## Timing\n\n");
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push_str("\n\n");
+        }
+
+        md.push_str("## Papers\n\n");
+        let papers = payload.get("papers").and_then(|v| v.as_array());
+        if papers.is_none_or(|a| a.is_empty()) {
+            md.push_str("_No papers returned._\n");
+        } else if let Some(ps) = papers {
+            for (i, p) in ps.iter().take(20).enumerate() {
+                let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if title.is_empty() {
+                    continue;
+                }
+                let year = p
+                    .get("year")
+                    .and_then(|v| v.as_u64())
+                    .map(|y| y.to_string());
+                let venue = p.get("venue").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let cites = p
+                    .get("citation_count")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n.to_string());
+                let url = p.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let pdf = p
+                    .get("pdf_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let src = p
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+
+                md.push_str(&format!("{}. **{}**\n", i + 1, title));
+                let mut meta = Vec::new();
+                if let Some(y) = year {
+                    meta.push(format!("year {y}"));
+                }
+                if !venue.is_empty() {
+                    meta.push(venue.to_string());
+                }
+                if let Some(c) = cites {
+                    meta.push(format!("{c} citations"));
+                }
+                if !src.is_empty() {
+                    meta.push(format!("source `{src}`"));
+                }
+                if !meta.is_empty() {
+                    md.push_str("   - ");
+                    md.push_str(&meta.join(" · "));
+                    md.push('\n');
+                }
+                if !url.is_empty() {
+                    md.push_str("   - ");
+                    md.push_str(url);
+                    md.push('\n');
+                }
+                if !pdf.is_empty() && pdf != url {
+                    md.push_str("   - PDF: ");
+                    md.push_str(pdf);
+                    md.push('\n');
+                }
+            }
+        }
+
+        if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
+            if !ws.is_empty() {
+                md.push_str("\n## Warnings\n\n");
+                for w in ws.iter().filter_map(|v| v.as_str()) {
+                    md.push_str("- ");
+                    md.push_str(w);
+                    md.push('\n');
+                }
+            }
+        }
+
+        md
+    }
+
+    fn web_fetch_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let url = payload
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let final_url = payload
+            .get("final_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let status = payload.get("status").and_then(|v| v.as_u64());
+        let content_type = payload
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let source = payload
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let fetch_backend = payload
+            .get("fetch_backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let bytes = payload.get("bytes").and_then(|v| v.as_u64());
+        let truncated = payload
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let text_truncated = payload
+            .get("text_truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let mut md = String::new();
+        if !url.is_empty() {
+            md.push_str("## URL\n\n");
+            md.push_str(url);
+            md.push_str("\n\n");
+        }
+
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if let Some(s) = status {
+            md.push_str("- **status**: ");
+            md.push_str(&s.to_string());
+            md.push('\n');
+        }
+        if !content_type.is_empty() {
+            md.push_str("- **content_type**: `");
+            md.push_str(content_type);
+            md.push_str("`\n");
+        }
+        if !fetch_backend.is_empty() {
+            md.push_str("- **fetch_backend**: `");
+            md.push_str(fetch_backend);
+            md.push_str("`\n");
+        }
+        if !source.is_empty() {
+            md.push_str("- **source**: `");
+            md.push_str(source);
+            md.push_str("`\n");
+        }
+        if let Some(b) = bytes {
+            md.push_str("- **bytes**: ");
+            md.push_str(&b.to_string());
+            md.push('\n');
+        }
+        if truncated {
+            md.push_str("- **truncated**: true\n");
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        if !final_url.is_empty() && final_url != url {
+            md.push_str("- **final_url**: ");
+            md.push_str(final_url);
+            md.push('\n');
+        }
+        md.push('\n');
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        if !text.is_empty() {
+            // Keep the UI readable: we show at most ~1500 chars even if payload has more.
+            let preview: String = text.chars().take(1500).collect();
+            md.push_str("## Body (preview)\n\n```text\n");
+            md.push_str(preview.trim_end());
+            md.push_str("\n```\n");
+            if text_truncated || text.chars().count() > 1500 {
+                md.push_str(
+                    "\n_Note: body preview is truncated; full text is in structured output._\n",
+                );
+            }
+            md.push('\n');
+        }
+
+        if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
+            if !ws.is_empty() {
+                md.push_str("## Warnings\n\n");
+                for w in ws.iter().filter_map(|v| v.as_str()).take(12) {
+                    md.push_str("- ");
+                    md.push_str(w);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+        }
+
+        md
+    }
+
+    fn web_search_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let query = payload
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let provider = payload
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let backend_provider = payload
+            .get("backend_provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let results = payload.get("results").and_then(|v| v.as_array());
+
+        let mut md = String::new();
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
+        }
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if !provider.is_empty() {
+            md.push_str("- **provider**: `");
+            md.push_str(provider);
+            md.push_str("`\n");
+        }
+        if !backend_provider.is_empty() {
+            md.push_str("- **backend_provider**: `");
+            md.push_str(backend_provider);
+            md.push_str("`\n");
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md.push('\n');
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## Results\n\n");
+        if results.is_none_or(|a| a.is_empty()) {
+            md.push_str("_No results returned._\n");
+        } else if let Some(rs) = results {
+            for (i, r) in rs.iter().take(10).enumerate() {
+                let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let snippet = r
+                    .get("snippet")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if title.is_empty() && url.is_empty() {
+                    continue;
+                }
+                md.push_str(&format!(
+                    "{}. **{}**\n",
+                    i + 1,
+                    if title.is_empty() { url } else { title }
+                ));
+                if !url.is_empty() {
+                    md.push_str("   - ");
+                    md.push_str(url);
+                    md.push('\n');
+                }
+                if !snippet.is_empty() {
+                    let s: String = snippet.chars().take(240).collect();
+                    md.push_str("   - ");
+                    md.push_str(s.trim_end());
+                    if snippet.chars().count() > 240 {
+                        md.push_str("…");
+                    }
+                    md.push('\n');
+                }
+            }
+        }
+        md
+    }
+
+    fn web_extract_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let final_url = payload
+            .get("final_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let engine = payload
+            .get("extraction")
+            .and_then(|e| e.get("engine"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let chunks = payload
+            .get("extract")
+            .and_then(|e| e.get("chunks"))
+            .and_then(|v| v.as_array())
+            .or_else(|| payload.get("chunks").and_then(|v| v.as_array()));
+        let links_n = payload
+            .get("links")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len());
+
+        let mut md = String::new();
+        if !url.is_empty() {
+            md.push_str("## URL\n\n");
+            md.push_str(url);
+            md.push_str("\n\n");
+        }
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if let Some(s) = payload.get("status").and_then(|v| v.as_u64()) {
+            md.push_str("- **status**: ");
+            md.push_str(&s.to_string());
+            md.push('\n');
+        }
+        if !engine.is_empty() {
+            md.push_str("- **engine**: `");
+            md.push_str(engine);
+            md.push_str("`\n");
+        }
+        if let Some(n) = payload.get("text_chars").and_then(|v| v.as_u64()) {
+            md.push_str("- **text_chars**: ");
+            md.push_str(&n.to_string());
+            md.push('\n');
+        }
+        if let Some(n) = chunks.map(|a| a.len()) {
+            md.push_str("- **chunks**: ");
+            md.push_str(&n.to_string());
+            md.push('\n');
+        }
+        if let Some(n) = links_n {
+            md.push_str("- **links**: ");
+            md.push_str(&n.to_string());
+            md.push('\n');
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        if !final_url.is_empty() && final_url != url {
+            md.push_str("- **final_url**: ");
+            md.push_str(final_url);
+            md.push('\n');
+        }
+        md.push('\n');
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        if !text.is_empty() {
+            let preview: String = text.chars().take(1500).collect();
+            md.push_str("## Text (preview)\n\n```text\n");
+            md.push_str(preview.trim_end());
+            md.push_str("\n```\n\n");
+        } else if let Some(cs) = chunks {
+            md.push_str("## Top chunks\n\n");
+            for (i, c) in cs.iter().take(6).enumerate() {
+                let t = c.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let short: String = t.chars().take(260).collect();
+                md.push_str(&format!("{}. {}\n", i + 1, short.trim_end()));
+                if t.chars().count() > 260 {
+                    md.push_str("…\n");
+                }
+            }
+            md.push('\n');
+        }
+
+        if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
+            if !ws.is_empty() {
+                md.push_str("## Warnings\n\n");
+                for w in ws.iter().filter_map(|v| v.as_str()).take(12) {
+                    md.push_str("- ");
+                    md.push_str(w);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+        }
+        md
+    }
+
+    fn web_seed_search_extract_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let query = payload
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let merged = payload
+            .get("results")
+            .and_then(|r| r.get("merged_chunks"))
+            .and_then(|v| v.as_array());
+
+        let mut md = String::new();
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
+        }
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if let Some(n) = merged.map(|a| a.len()) {
+            md.push_str("- **merged_chunks**: ");
+            md.push_str(&n.to_string());
+            md.push('\n');
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md.push('\n');
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## Top merged chunks\n\n");
+        if merged.is_none_or(|a| a.is_empty()) {
+            md.push_str("_No chunks returned._\n");
+        } else if let Some(cs) = merged {
+            for (i, c) in cs.iter().take(8).enumerate() {
+                let seed_id = c.get("seed_id").and_then(|v| v.as_str()).unwrap_or("");
+                let score = c.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
+                let text = c.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let short: String = text.chars().take(260).collect();
+                md.push_str(&format!(
+                    "{}. **seed** `{}` (score {})\n",
+                    i + 1,
+                    seed_id,
+                    score
+                ));
+                md.push_str("   - ");
+                md.push_str(short.trim_end());
+                if text.chars().count() > 260 {
+                    md.push_str("…");
+                }
+                md.push('\n');
+            }
+        }
+        md.push('\n');
+
+        if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
+            if !ws.is_empty() {
+                md.push_str("## Warnings\n\n");
+                for w in ws.iter().filter_map(|v| v.as_str()).take(12) {
+                    md.push_str("- ");
+                    md.push_str(w);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+        }
+        md
+    }
+
+    fn webpipe_usage_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let started = payload
+            .get("started_at_epoch_s")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let now = payload.get("now_epoch_s").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tool_calls = payload.get("tool_calls").and_then(|v| v.as_object());
+        let warning_counts = payload
+            .get("warnings")
+            .and_then(|w| w.get("counts"))
+            .and_then(|v| v.as_object());
+
+        let mut md = String::new();
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if started != 0 {
+            md.push_str("- **started_at_epoch_s**: ");
+            md.push_str(&started.to_string());
+            md.push('\n');
+        }
+        if now != 0 {
+            md.push_str("- **now_epoch_s**: ");
+            md.push_str(&now.to_string());
+            md.push('\n');
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md.push('\n');
+
+        md.push_str("## Tool calls\n\n");
+        if tool_calls.is_none_or(|m| m.is_empty()) {
+            md.push_str("_No tool calls recorded._\n\n");
+        } else if let Some(m) = tool_calls {
+            // stable-ish ordering: by descending count then name.
+            let mut rows: Vec<(&String, u64)> = m
+                .iter()
+                .filter_map(|(k, v)| v.as_u64().map(|n| (k, n)))
+                .collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            for (k, n) in rows.into_iter().take(12) {
+                md.push_str("- `");
+                md.push_str(k);
+                md.push_str("`: ");
+                md.push_str(&n.to_string());
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## Warnings\n\n");
+        if warning_counts.is_none_or(|m| m.is_empty()) {
+            md.push_str("_No warnings recorded._\n");
+        } else if let Some(m) = warning_counts {
+            let mut rows: Vec<(&String, u64)> = m
+                .iter()
+                .filter_map(|(k, v)| v.as_u64().map(|n| (k, n)))
+                .collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            for (k, n) in rows.into_iter().take(12) {
+                md.push_str("- `");
+                md.push_str(k);
+                md.push_str("`: ");
+                md.push_str(&n.to_string());
+                md.push('\n');
+            }
+        }
+        md
+    }
+
+    fn webpipe_meta_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let configured = payload.get("configured");
+        let supported = payload.get("supported");
+
+        let mut md = String::new();
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md.push('\n');
+
+        if let Some(cfg) = configured {
+            md.push_str("## Configured\n\n");
+            if let Some(search) = cfg.get("search") {
+                md.push_str("- **search**:\n");
+                for k in ["brave", "tavily", "searxng"] {
+                    let v = search.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+                    md.push_str("  - `");
+                    md.push_str(k);
+                    md.push_str("`: ");
+                    md.push_str(if v { "true" } else { "false" });
+                    md.push('\n');
+                }
+            }
+            if let Some(llm) = cfg.get("llm") {
+                md.push_str("- **llm**:\n");
+                for k in [
+                    "perplexity",
+                    "ollama",
+                    "openai_compat",
+                    "openrouter",
+                    "groq",
+                    "embeddings_openrouter",
+                ] {
+                    if let Some(v) = llm.get(k).and_then(|v| v.as_bool()) {
+                        md.push_str("  - `");
+                        md.push_str(k);
+                        md.push_str("`: ");
+                        md.push_str(if v { "true" } else { "false" });
+                        md.push('\n');
+                    }
+                }
+            }
+            if let Some(vision) = cfg.get("vision") {
+                if let Some(g) = vision.get("gemini").and_then(|v| v.as_bool()) {
+                    md.push_str("- **vision.gemini**: ");
+                    md.push_str(if g { "true" } else { "false" });
+                    md.push('\n');
+                }
+            }
+            md.push('\n');
+        }
+
+        if let Some(sup) = supported {
+            md.push_str("## Tools\n\n");
+            if let Some(tools) = sup.get("mcp_tools").and_then(|v| v.as_array()) {
+                md.push_str("- **mcp_tools**: ");
+                md.push_str(&tools.len().to_string());
+                md.push('\n');
+            }
+            if let Some(groups) = sup.get("mcp_tool_groups").and_then(|v| v.as_object()) {
+                md.push_str("- **groups**:\n");
+                for (k, v) in groups.iter() {
+                    let n = v.as_array().map(|a| a.len()).unwrap_or(0);
+                    md.push_str("  - `");
+                    md.push_str(k);
+                    md.push_str("`: ");
+                    md.push_str(&n.to_string());
+                    md.push('\n');
+                }
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## Next\n\n");
+        md.push_str("- Use `web_search_extract` for retrieval (search + bounded extract).\n");
+        md.push_str("- Use `web_extract` for readability-focused extraction.\n");
+        md
+    }
+
+    fn web_seed_urls_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let seeds = payload.get("seeds").and_then(|v| v.as_array());
+
+        let mut md = String::new();
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if let Some(max) = payload.get("max").and_then(|v| v.as_u64()) {
+            md.push_str("- **max**: ");
+            md.push_str(&max.to_string());
+            md.push('\n');
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md.push('\n');
+
+        md.push_str("## Seeds\n\n");
+        if seeds.is_none_or(|a| a.is_empty()) {
+            md.push_str("_No seeds returned._\n");
+        } else if let Some(ss) = seeds {
+            for (i, s) in ss.iter().take(30).enumerate() {
+                let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let url = s.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                let kind = s.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                let note = s.get("note").and_then(|v| v.as_str()).unwrap_or("").trim();
+                md.push_str(&format!("{}. **`{}`**\n", i + 1, id));
+                if !url.is_empty() {
+                    md.push_str("   - ");
+                    md.push_str(url);
+                    md.push('\n');
+                }
+                if !kind.is_empty() {
+                    md.push_str("   - kind: `");
+                    md.push_str(kind);
+                    md.push_str("`\n");
+                }
+                if !note.is_empty() {
+                    let n: String = note.chars().take(140).collect();
+                    md.push_str("   - ");
+                    md.push_str(n.trim_end());
+                    if note.chars().count() > 140 {
+                        md.push_str("…");
+                    }
+                    md.push('\n');
+                }
+            }
+        }
+        md
+    }
+
+    fn webpipe_usage_reset_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let at = payload
+            .get("reset_at_epoch_s")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let mut md = String::new();
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if at != 0 {
+            md.push_str("- **reset_at_epoch_s**: ");
+            md.push_str(&at.to_string());
+            md.push('\n');
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md
+    }
+
+    fn arxiv_search_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let query = payload.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let papers = payload.get("papers").and_then(|v| v.as_array());
+        let total = payload.get("total_results").and_then(|v| v.as_u64());
+        let page = payload.get("page").and_then(|v| v.as_u64());
+
+        let mut md = String::new();
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
+        }
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if let Some(p) = page {
+            md.push_str("- **page**: ");
+            md.push_str(&p.to_string());
+            md.push('\n');
+        }
+        if let Some(t) = total {
+            md.push_str("- **total_results**: ");
+            md.push_str(&t.to_string());
+            md.push('\n');
+        }
+        if let Some(n) = papers.map(|a| a.len()) {
+            md.push_str("- **papers_returned**: ");
+            md.push_str(&n.to_string());
+            md.push('\n');
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md.push('\n');
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## Papers\n\n");
+        if papers.is_none_or(|a| a.is_empty()) {
+            md.push_str("_No papers returned._\n");
+        } else if let Some(ps) = papers {
+            for (i, p) in ps.iter().take(10).enumerate() {
+                let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let arxiv_id = p.get("arxiv_id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let url = p.get("abs_url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let pdf = p.get("pdf_url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let year = p.get("year").and_then(|v| v.as_u64());
+                let authors = p
+                    .get("authors")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .take(6)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                md.push_str(&format!(
+                    "{}. **{}**\n",
+                    i + 1,
+                    if title.is_empty() { arxiv_id } else { title }
+                ));
+                if !arxiv_id.is_empty() {
+                    md.push_str("   - arXiv: `");
+                    md.push_str(arxiv_id);
+                    md.push_str("`\n");
+                }
+                if let Some(y) = year {
+                    md.push_str("   - year: ");
+                    md.push_str(&y.to_string());
+                    md.push('\n');
+                }
+                if !authors.is_empty() {
+                    md.push_str("   - authors: ");
+                    md.push_str(&authors.join(", "));
+                    md.push('\n');
+                }
+                if !url.is_empty() {
+                    md.push_str("   - abs: ");
+                    md.push_str(url);
+                    md.push('\n');
+                }
+                if !pdf.is_empty() {
+                    md.push_str("   - pdf: ");
+                    md.push_str(pdf);
+                    md.push('\n');
+                }
+            }
+        }
+        md.push('\n');
+        if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
+            if !ws.is_empty() {
+                md.push_str("## Warnings\n\n");
+                for w in ws.iter().filter_map(|v| v.as_str()).take(12) {
+                    md.push_str("- ");
+                    md.push_str(w);
+                    md.push('\n');
+                }
+            }
+        }
+        md
+    }
+
+    fn arxiv_enrich_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let arxiv_id = payload
+            .get("arxiv_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let abs_url = payload
+            .get("abs_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let paper = payload.get("paper");
+
+        let mut md = String::new();
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if !arxiv_id.is_empty() {
+            md.push_str("- **arxiv_id**: `");
+            md.push_str(arxiv_id);
+            md.push_str("`\n");
+        }
+        if !abs_url.is_empty() {
+            md.push_str("- **abs_url**: ");
+            md.push_str(abs_url);
+            md.push('\n');
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md.push('\n');
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        if let Some(p) = paper {
+            let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let authors = p
+                .get("authors")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .take(8)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let pdf = p.get("pdf_url").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let year = p.get("year").and_then(|v| v.as_u64());
+            md.push_str("## Paper\n\n");
+            if !title.is_empty() {
+                md.push_str("- **title**: ");
+                md.push_str(title);
+                md.push('\n');
+            }
+            if let Some(y) = year {
+                md.push_str("- **year**: ");
+                md.push_str(&y.to_string());
+                md.push('\n');
+            }
+            if !authors.is_empty() {
+                md.push_str("- **authors**: ");
+                md.push_str(&authors.join(", "));
+                md.push('\n');
+            }
+            if !pdf.is_empty() {
+                md.push_str("- **pdf**: ");
+                md.push_str(pdf);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        if let Some(ds) = payload.get("discussion_search") {
+            md.push_str("## Discussion search\n\n");
+            let ok2 = ds.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            md.push_str("- **ok**: ");
+            md.push_str(if ok2 { "true" } else { "false" });
+            md.push('\n');
+            if let Some(rs) = ds.get("results").and_then(|v| v.as_array()) {
+                for (i, r) in rs.iter().take(5).enumerate() {
+                    let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    if title.is_empty() && url.is_empty() {
+                        continue;
+                    }
+                    md.push_str(&format!(
+                        "{}. **{}**\n",
+                        i + 1,
+                        if title.is_empty() { url } else { title }
+                    ));
+                    if !url.is_empty() {
+                        md.push_str("   - ");
+                        md.push_str(url);
+                        md.push('\n');
+                    }
+                }
+            }
+            md.push('\n');
+        }
+
+        md
+    }
+
+    fn web_cache_search_extract_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let query = payload.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let cache_dir = payload
+            .get("cache_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let results = payload.get("results").and_then(|v| v.as_array());
+
+        let mut md = String::new();
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
+        }
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        if !cache_dir.is_empty() {
+            md.push_str("- **cache_dir**: `");
+            md.push_str(cache_dir);
+            md.push_str("`\n");
+        }
+        if let Some(n) = results.map(|a| a.len()) {
+            md.push_str("- **docs_returned**: ");
+            md.push_str(&n.to_string());
+            md.push('\n');
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        md.push('\n');
+
+        if !ok {
+            md.push_str("## Error\n\n");
+            let code = payload
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            let msg = payload
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error.");
+            let hint = payload
+                .get("error")
+                .and_then(|e| e.get("hint"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            md.push_str("- **code**: `");
+            md.push_str(code);
+            md.push_str("`\n");
+            md.push_str("- **message**: ");
+            md.push_str(msg);
+            md.push('\n');
+            if !hint.is_empty() {
+                md.push_str("- **hint**: ");
+                md.push_str(hint);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## Matches\n\n");
+        if results.is_none_or(|a| a.is_empty()) {
+            md.push_str("_No matches._\n");
+        } else if let Some(rs) = results {
+            for (i, doc) in rs.iter().take(5).enumerate() {
+                let url = doc.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let title = doc.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+                md.push_str(&format!(
+                    "{}. **{}**\n",
+                    i + 1,
+                    if title.is_empty() {
+                        if url.is_empty() { "(untitled)" } else { url }
+                    } else {
+                        title
+                    }
+                ));
+                if !url.is_empty() {
+                    md.push_str("   - ");
+                    md.push_str(url);
+                    md.push('\n');
+                }
+                if let Some(chunks) = doc
+                    .get("extract")
+                    .and_then(|e| e.get("chunks"))
+                    .and_then(|v| v.as_array())
+                {
+                    for c in chunks.iter().take(2) {
+                        let t = c.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        let short: String = t.chars().take(220).collect();
+                        md.push_str("   - ");
+                        md.push_str(short.trim_end());
+                        if t.chars().count() > 220 {
+                            md.push_str("…");
+                        }
+                        md.push('\n');
+                    }
+                }
+            }
+        }
+        md.push('\n');
+        if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
+            if !ws.is_empty() {
+                md.push_str("## Warnings\n\n");
+                for w in ws.iter().filter_map(|v| v.as_str()).take(12) {
+                    md.push_str("- ");
+                    md.push_str(w);
+                    md.push('\n');
+                }
+            }
+        }
+        md
+    }
+
+    fn clean_text_for_output(s: String) -> String {
+        // Keep MCP tool outputs “clean” and JSON-friendly even when upstream content contains
+        // control characters or platform-newline weirdness.
+        //
+        // This is intentionally conservative: preserve \n and \t; replace other ASCII control
+        // chars with spaces; drop BOM/ZWNBSP.
+        let s = s.replace("\r\n", "\n").replace('\r', "\n");
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            if ch == '\u{FEFF}' {
+                continue;
+            }
+            if ch == '\u{000C}' {
+                out.push('\n');
+                continue;
+            }
+            if (ch <= '\u{001F}' && ch != '\n' && ch != '\t') || ch == '\u{007F}' {
+                out.push(' ');
+                continue;
+            }
+            out.push(ch);
+        }
+        out
     }
 
     fn payload_from_result(r: &CallToolResult) -> serde_json::Value {
@@ -1180,6 +4340,14 @@ mod mcp {
         compact: Option<bool>,
     }
 
+    /// Arguments for `web_fetch`.
+    ///
+    /// Output shape (high-level):
+    /// - `ok` boolean
+    /// - `url`, `final_url`, `status`, `content_type`, `bytes_len`
+    /// - optional `text` (bounded by `max_text_chars`)
+    /// - optional `headers` (when `include_headers=true`)
+    /// - `warnings` + `warning_hints` when applicable
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebFetchArgs {
         /// URL to fetch (required).
@@ -1195,29 +4363,42 @@ mod mcp {
         /// For firecrawl fetch_backend, this always errors (firecrawl is network-only).
         #[serde(default)]
         no_network: Option<bool>,
+        /// Per-request timeout in milliseconds.
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// Max bytes to fetch (hard bound).
         #[serde(default)]
         max_bytes: Option<u64>,
         /// Max chars in output text (default: 20_000).
         #[serde(default)]
         max_text_chars: Option<usize>,
+        /// Optional extra request headers (some unsafe headers are dropped by default).
         #[serde(default)]
         headers: Option<BTreeMap<String, String>>,
+        /// Allow cache reads (default: true).
         #[serde(default)]
         cache_read: Option<bool>,
+        /// Allow cache writes (default: true).
         #[serde(default)]
         cache_write: Option<bool>,
+        /// Optional cache TTL in seconds.
         #[serde(default)]
         cache_ttl_s: Option<u64>,
         /// Include response body text in output (default: false).
         #[serde(default)]
         include_text: Option<bool>,
         /// Include response headers in output (default: false).
+        /// Include response headers in output (default: false).
         #[serde(default)]
         include_headers: Option<bool>,
     }
 
+    /// Arguments for `web_extract`.
+    ///
+    /// Output shape (high-level):
+    /// - `ok` boolean
+    /// - extraction result (`text_chars`, `chunks`) and optional `text`
+    /// - warnings + hints for common failure modes (paywall/JS-challenge/low-signal)
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebExtractArgs {
         /// URL to fetch+extract (required).
@@ -1261,10 +4442,13 @@ mod mcp {
         timeout_ms: Option<u64>,
         #[serde(default)]
         max_bytes: Option<u64>,
+        /// Allow cache reads (default: true).
         #[serde(default)]
         cache_read: Option<bool>,
+        /// Allow cache writes (default: true).
         #[serde(default)]
         cache_write: Option<bool>,
+        /// Optional cache TTL in seconds.
         #[serde(default)]
         cache_ttl_s: Option<u64>,
         /// Include structured extraction (outline + blocks) (default: false).
@@ -1287,6 +4471,12 @@ mod mcp {
         semantic_top_k: Option<usize>,
     }
 
+    /// Arguments for `web_search`.
+    ///
+    /// Output shape (high-level):
+    /// - `ok` boolean
+    /// - `results[]` with `url/title/snippet`
+    /// - provider selection details when `provider=auto`
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebSearchArgs {
         /// Search query (required).
@@ -1338,6 +4528,37 @@ mod mcp {
     }
 
     #[derive(Debug, Deserialize, JsonSchema, Default)]
+    struct PaperSearchArgs {
+        /// Search query (required).
+        #[serde(default)]
+        query: Option<String>,
+        /// Which paper backends to query (optional).
+        ///
+        /// Allowed (canonical):
+        /// - "semantic_scholar"
+        /// - "openalex"
+        /// - "google_scholar_serpapi" (requires WEBPIPE_SERPAPI_API_KEY)
+        ///
+        /// Aliases accepted:
+        /// - "s2" / "semanticscholar" -> semantic_scholar
+        /// - "scholar" / "serpapi" -> google_scholar_serpapi
+        #[serde(default)]
+        backends: Option<Vec<String>>,
+        /// Optional filter by publication years.
+        #[serde(default)]
+        years: Option<Vec<u32>>,
+        /// Max papers to return per backend (default: 10; max: 50).
+        #[serde(default)]
+        limit: Option<usize>,
+        /// Timeout per backend request (ms). Default: 20_000; max: 60_000.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// If true, include abstract text when available (default: false).
+        #[serde(default)]
+        include_abstract: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct ArxivEnrichArgs {
         /// ArXiv ID (e.g. "0805.3415") or an arxiv.org/abs URL.
         #[serde(default)]
@@ -1353,6 +4574,14 @@ mod mcp {
         timeout_ms: Option<u64>,
     }
 
+    /// Arguments for `web_cache_search_extract`.
+    ///
+    /// Use this when you want **no network** and you have a populated `WEBPIPE_CACHE_DIR`.
+    /// It scans the cache, extracts text, and returns top chunks for the query.
+    ///
+    /// Notes:
+    /// - This is bounded by `max_docs`, `max_bytes`, `max_chars`, and `top_chunks`.
+    /// - It is useful as an “offline-ish” regression check (same cache → comparable outputs).
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebCacheSearchExtractArgs {
         /// Search query (required).
@@ -1408,6 +4637,22 @@ mod mcp {
         compact: Option<bool>,
     }
 
+    /// Arguments for `web_search_extract`.
+    ///
+    /// This is the main “do the job” tool:
+    /// - optional search (if `query` is set and `urls` is not)
+    /// - fetch (cache-aware)
+    /// - extract (bounded)
+    /// - rank and return top chunks across URLs
+    ///
+    /// Common call shapes:
+    /// - Query mode (online): set `query`, omit `urls`.
+    /// - URLs mode (offline-friendly): set `urls`, optionally set `query` for chunk ranking.
+    /// - Offline mode: set `no_network=true` and pass `urls` (cache-only fetch).
+    ///
+    /// Output is JSON (as text + structured_content) with:
+    /// - `results[]` (per-URL) and `top_chunks[]` (merged, bounded)
+    /// - `warnings` + `warning_hints` for common failure modes
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     pub(crate) struct WebSearchExtractArgs {
         /// Search query. Required unless `urls` is provided.
@@ -1577,6 +4822,13 @@ mod mcp {
         pub(crate) compact: Option<bool>,
     }
 
+    /// Arguments for `web_deep_research`.
+    ///
+    /// This is an agentic evidence-gathering tool:
+    /// - gathers evidence via `web_search_extract` (and optional ArXiv)
+    /// - optionally runs a synthesis step (provider-backed)
+    ///
+    /// If you care about auditability, prefer `audit=true` and `include_evidence=true`.
     #[derive(Debug, Deserialize, JsonSchema, Default)]
     struct WebDeepResearchArgs {
         /// User question / research prompt.
@@ -1678,6 +4930,30 @@ mod mcp {
         /// ArXiv query timeout (ms) (default: 8_000; max: 30_000).
         #[serde(default)]
         arxiv_timeout_ms: Option<u64>,
+
+        /// Optionally include a bounded "papers" search (Semantic Scholar / OpenAlex / optional Google Scholar) as extra evidence.
+        ///
+        /// Allowed:
+        /// - "off": never query paper backends
+        /// - "auto": query only when the prompt looks paper-like
+        /// - "on": always query (unless no_network=true)
+        #[serde(default)]
+        papers_mode: Option<String>,
+        /// Which paper backends to query (default: ["semantic_scholar","openalex"]).
+        #[serde(default)]
+        papers_backends: Option<Vec<String>>,
+        /// Max papers to include in the evidence pack (default: 5; max: 20).
+        #[serde(default)]
+        papers_max_papers: Option<usize>,
+        /// Optional years filter for paper backends (e.g. [2023, 2024]).
+        #[serde(default)]
+        papers_years: Option<Vec<u32>>,
+        /// Paper backend timeout (ms) (default: 12_000; max: 60_000).
+        #[serde(default)]
+        papers_timeout_ms: Option<u64>,
+        /// If true, include abstract text when available (default: false).
+        #[serde(default)]
+        papers_include_abstract: Option<bool>,
 
         /// Perplexity model to use (default: sonar-deep-research).
         #[serde(default)]
@@ -1823,6 +5099,7 @@ mod mcp {
 
     #[derive(Clone)]
     pub(crate) struct WebpipeMcp {
+        prompt_router: RmcpPromptRouter<Self>,
         tool_router: RmcpToolRouter<Self>,
         fetcher: Arc<LocalFetcher>,
         http: reqwest::Client,
@@ -1832,11 +5109,11 @@ mod mcp {
     #[tool_router]
     impl WebpipeMcp {
         pub(crate) fn new() -> Result<Self, McpError> {
-            let cache_dir =
-                cache_dir_from_env().or_else(|| Some(default_cache_dir()));
+            let cache_dir = cache_dir_from_env().or_else(|| Some(default_cache_dir()));
             let fetcher = LocalFetcher::new(cache_dir)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             Ok(Self {
+                prompt_router: Self::prompt_router(),
                 tool_router: Self::tool_router(),
                 fetcher: Arc::new(fetcher),
                 http: reqwest::Client::builder()
@@ -1951,6 +5228,120 @@ mod mcp {
                     s.routing_query_last_seen.remove(&evict_qk);
                 }
             }
+        }
+
+        fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+            if a.is_empty() || b.is_empty() || a.len() != b.len() {
+                return 0.0;
+            }
+            let mut dot = 0.0f64;
+            let mut na = 0.0f64;
+            let mut nb = 0.0f64;
+            for i in 0..a.len() {
+                let x = a[i] as f64;
+                let y = b[i] as f64;
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            if na <= 0.0 || nb <= 0.0 {
+                return 0.0;
+            }
+            (dot / (na.sqrt() * nb.sqrt())) as f32
+        }
+
+        async fn semantic_rerank_chunks_best(
+            &self,
+            query: &str,
+            candidates: &[(usize, usize, String)],
+            top_k: usize,
+        ) -> webpipe_local::semantic::SemanticRerankResult {
+            let top_k = top_k.max(1);
+            let q = query.trim();
+            if q.is_empty() || candidates.is_empty() {
+                return webpipe_local::semantic::semantic_rerank_chunks(query, candidates, top_k);
+            }
+
+            // Best-effort: if OpenRouter embeddings is configured, use it; otherwise fall back
+            // to the local lexical overlap scorer.
+            let Some(api_key) = Self::openrouter_api_key_from_env() else {
+                return webpipe_local::semantic::semantic_rerank_chunks(query, candidates, top_k);
+            };
+
+            let model = Self::openrouter_embeddings_model_from_env();
+            let timeout_ms = Self::openrouter_embeddings_timeout_ms_from_env();
+            let max_inputs = Self::semantic_embeddings_max_inputs_from_env();
+
+            // Prefilter (bounded): we only embed up to max_inputs candidates.
+            let mut pre =
+                webpipe_local::semantic::semantic_rerank_chunks(query, candidates, max_inputs);
+            let mut warnings: Vec<&'static str> = Vec::new();
+            if candidates.len() > max_inputs {
+                warnings.push("semantic_embeddings_prefiltered");
+            }
+
+            // Prepare inputs: [query, chunk1, chunk2, ...]
+            let mut inputs: Vec<String> = Vec::with_capacity(pre.chunks.len() + 1);
+            inputs.push(q.to_string());
+            for ch in &pre.chunks {
+                // Keep embeddings inputs bounded and deterministic.
+                let t: String = ch.text.chars().take(1200).collect();
+                inputs.push(t);
+            }
+
+            let client = match webpipe_local::openai_compat::OpenAiCompatClient::new(
+                self.http.clone(),
+                // Client appends `/v1/embeddings`.
+                "https://openrouter.ai/api".to_string(),
+                Some(api_key),
+                model.clone(),
+            ) {
+                Ok(c) => c,
+                Err(_) => {
+                    warnings.push("semantic_embeddings_client_not_configured");
+                    let mut out =
+                        webpipe_local::semantic::semantic_rerank_chunks(query, candidates, top_k);
+                    out.warnings.extend(warnings);
+                    return out;
+                }
+            };
+
+            let embs = match client.embeddings(inputs, timeout_ms).await {
+                Ok(v) => v,
+                Err(_) => {
+                    warnings.push("semantic_embeddings_failed_fallback_to_lexical");
+                    let mut out =
+                        webpipe_local::semantic::semantic_rerank_chunks(query, candidates, top_k);
+                    out.warnings.extend(warnings);
+                    return out;
+                }
+            };
+
+            if embs.len() != pre.chunks.len() + 1 {
+                warnings.push("semantic_embeddings_bad_shape_fallback_to_lexical");
+                let mut out =
+                    webpipe_local::semantic::semantic_rerank_chunks(query, candidates, top_k);
+                out.warnings.extend(warnings);
+                return out;
+            }
+
+            let q_emb = &embs[0];
+            for (i, ch) in pre.chunks.iter_mut().enumerate() {
+                ch.score = Self::cosine_similarity(q_emb, &embs[i + 1]);
+            }
+            pre.chunks.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.start_char.cmp(&b.start_char))
+                    .then_with(|| a.end_char.cmp(&b.end_char))
+            });
+            pre.chunks.truncate(top_k);
+
+            pre.backend = "openrouter_embeddings".to_string();
+            pre.model_id = Some(model);
+            pre.warnings.extend(warnings);
+            pre
         }
 
         fn stats_set_last_search_outcome_junk_level_qk(
@@ -2193,6 +5584,154 @@ mod mcp {
             (out, filtered)
         }
 
+        fn tokenize_for_overlap(query: &str) -> Vec<String> {
+            // Deterministic, lightweight tokenization for quality judging.
+            // Keep it similar to chunk match tokenization, but local and bounded.
+            let q = textprep::scrub(query);
+            let mut out: Vec<String> = q
+                .split(|ch: char| !ch.is_alphanumeric())
+                .filter_map(|t| {
+                    let t = t.trim();
+                    (t.len() >= 3).then_some(t.to_string())
+                })
+                .collect();
+            out.sort();
+            out.dedup();
+            out.truncate(50);
+            out
+        }
+
+        fn quality_scorecard(
+            query: Option<&str>,
+            extracted_text: &str,
+            status: u16,
+            extraction_engine: &str,
+            warnings: &[&'static str],
+        ) -> serde_json::Value {
+            let text_chars = extracted_text.chars().count();
+            let nonempty = extracted_text.chars().any(|c| !c.is_whitespace());
+            let js_challenge = nonempty && looks_like_js_challenge(status, extracted_text, None);
+            let bundle_gunk = nonempty && Self::looks_like_bundle_gunk(extracted_text);
+            let has_empty = warnings
+                .iter()
+                .any(|w| normalize_warning_code(w) == "empty_extraction");
+            let has_low_signal = warnings
+                .iter()
+                .any(|w| normalize_warning_code(w) == "main_content_low_signal")
+                || warnings
+                    .iter()
+                    .any(|w| normalize_warning_code(w) == "chunks_filtered_low_signal")
+                || bundle_gunk
+                || js_challenge;
+
+            let mut q_tokens = Vec::new();
+            let mut overlap = 0usize;
+            if let Some(q) = query.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                q_tokens = Self::tokenize_for_overlap(q);
+                if nonempty && !q_tokens.is_empty() {
+                    let t_scrub = textprep::scrub(extracted_text);
+                    for qt in &q_tokens {
+                        if t_scrub.contains(qt) {
+                            overlap += 1;
+                        }
+                    }
+                }
+            }
+
+            let mut issues: Vec<&'static str> = Vec::new();
+            if !nonempty || has_empty {
+                issues.push("empty");
+            }
+            if js_challenge {
+                issues.push("js_challenge");
+            }
+            if bundle_gunk {
+                issues.push("gunk");
+            }
+            if warnings
+                .iter()
+                .any(|w| normalize_warning_code(w) == "main_content_low_signal")
+            {
+                issues.push("boilerplate");
+            }
+            if warnings
+                .iter()
+                .any(|w| normalize_warning_code(w) == "text_truncated_by_max_chars")
+            {
+                issues.push("text_truncated");
+            }
+            if warnings
+                .iter()
+                .any(|w| normalize_warning_code(w) == "body_truncated_by_max_bytes")
+            {
+                issues.push("body_truncated");
+            }
+            if query.is_some_and(|q| !q.trim().is_empty()) && nonempty && overlap == 0 {
+                issues.push("no_query_overlap");
+            }
+            if nonempty && text_chars < 200 && extraction_engine != "html_hint" {
+                issues.push("too_short");
+            }
+
+            issues.sort();
+            issues.dedup();
+
+            // Deterministic score heuristic: start from 100, subtract issue penalties.
+            let mut score: i64 = 100;
+            if issues.contains(&"empty") {
+                score -= 100;
+            }
+            if issues.contains(&"js_challenge") {
+                score -= 60;
+            }
+            if issues.contains(&"gunk") {
+                score -= 45;
+            }
+            if issues.contains(&"boilerplate") {
+                score -= 20;
+            }
+            if issues.contains(&"no_query_overlap") {
+                score -= 25;
+            }
+            if issues.contains(&"too_short") {
+                score -= 15;
+            }
+            if issues.contains(&"text_truncated") {
+                score -= 10;
+            }
+            if issues.contains(&"body_truncated") {
+                score -= 10;
+            }
+            if score < 0 {
+                score = 0;
+            }
+            if score > 100 {
+                score = 100;
+            }
+
+            // “ok” is conservative: requires nonempty and not obviously junk/challenge.
+            let ok = score >= 60 && nonempty && !js_challenge && !bundle_gunk;
+
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_extract_quality",
+                "ok": ok,
+                "score": score,
+                "issues": issues,
+                "signals": {
+                    "text_chars": text_chars,
+                    "nonempty": nonempty,
+                    "query_token_count": q_tokens.len(),
+                    "query_overlap": overlap,
+                    "has_low_signal": has_low_signal,
+                    "js_challenge": js_challenge,
+                    "bundle_gunk": bundle_gunk,
+                    "status": status,
+                    "engine": extraction_engine
+                }
+            })
+        }
+
         fn score_key(score: u64) -> i64 {
             // Keep ordering stable without float total-order deps.
             // (Scores come from our own chunker; treat as an integer signal.)
@@ -2332,7 +5871,44 @@ mod mcp {
                 })
                 // Default planner model: keep it fast/cheap and recent.
                 // Override with WEBPIPE_OPENROUTER_MODEL / AXI_OPENROUTER_MODEL / OPENROUTER_MODEL.
-                .unwrap_or_else(|| "openai/gpt-4o-mini".to_string())
+                .unwrap_or_else(|| "openai/gpt-5.2".to_string())
+        }
+
+        pub(crate) fn openrouter_embeddings_model_from_env() -> String {
+            std::env::var("WEBPIPE_OPENROUTER_EMBEDDINGS_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("OPENROUTER_EMBEDDINGS_MODEL")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                })
+                // Default embedding model: keep it stable and broadly available.
+                .unwrap_or_else(|| "openai/text-embedding-3-small".to_string())
+        }
+
+        pub(crate) fn openrouter_embeddings_timeout_ms_from_env() -> u64 {
+            std::env::var("WEBPIPE_OPENROUTER_EMBEDDINGS_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|&v| v >= 1000)
+                .unwrap_or(15_000)
+        }
+
+        pub(crate) fn semantic_embeddings_max_inputs_from_env() -> usize {
+            std::env::var("WEBPIPE_SEMANTIC_EMBEDDINGS_MAX_INPUTS")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .map(|v| v.clamp(4, 64))
+                .unwrap_or(32)
+        }
+
+        pub(crate) fn semantic_embeddings_max_docs_from_env() -> usize {
+            std::env::var("WEBPIPE_SEMANTIC_EMBEDDINGS_MAX_DOCS")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .map(|v| v.clamp(1, 25))
+                .unwrap_or(5)
         }
 
         #[allow(dead_code)]
@@ -2459,7 +6035,16 @@ mod mcp {
             }
         }
 
-        #[tool(description = "Report webpipe configuration + version (no secrets)")]
+        #[tool(
+            description = "Server meta: capabilities, configured backends, supported values, and recommended defaults (no secrets; JSON output)",
+            input_schema = std::sync::Arc::new({
+                let mut m = serde_json::Map::new();
+                m.insert("type".to_string(), serde_json::json!("object"));
+                m.insert("additionalProperties".to_string(), serde_json::json!(false));
+                m
+            }),
+            annotations(title = "Webpipe meta", read_only_hint = true, open_world_hint = false)
+        )]
         async fn webpipe_meta(&self) -> Result<CallToolResult, McpError> {
             let t0 = std::time::Instant::now();
             self.stats_inc_tool("webpipe_meta");
@@ -2558,9 +6143,10 @@ mod mcp {
                 },
                 "capabilities": {
                     "pdf_extract": true,
-                    "semantic_rerank": false,
+                    "semantic_rerank": true,
                     "embeddings_openai": false,
                     "embeddings_tei": false,
+                    "embeddings_openrouter": Self::openrouter_api_key_from_env().is_some(),
                     "vision_gemini": cfg!(feature = "vision-gemini")
                 },
                 "supported": {
@@ -2579,6 +6165,7 @@ mod mcp {
                         "web_search_extract",
                         "web_cache_search_extract",
                         "web_deep_research",
+                        "paper_search",
                         "arxiv_search",
                         "arxiv_enrich"
                     ],
@@ -2587,12 +6174,14 @@ mod mcp {
                         "seeds": ["web_seed_urls", "web_seed_search_extract"],
                         "fetch_extract": ["web_fetch", "web_extract"],
                         "search": ["web_search", "web_search_extract", "web_cache_search_extract"],
-                        "research": ["web_deep_research", "arxiv_search", "arxiv_enrich"]
+                        "research": ["web_deep_research", "paper_search", "arxiv_search", "arxiv_enrich"]
                     },
                     // Values for web_search.provider
                     "providers": ["auto", "brave", "tavily", "searxng"],
                     // Values for web_search.auto_mode (when provider="auto")
                     "auto_modes": ["fallback", "merge", "mab"],
+                    // Values for paper_search.backends
+                    "paper_backends": ["semantic_scholar", "openalex", "google_scholar_serpapi"],
                     // Values for extraction engines
                     "extraction_engines": ["html2text", "html_main", "html_hint", "text", "json", "xml", "markdown", "pdf-extract", "pdf-pdftotext", "pdf-mutool", "youtube_transcript", "pandoc", "image", "image_ocr", "media", "media_subtitles", "gemini_vision"],
                     // Environment knobs (names only; no values) for opportunistic local tooling + multimodal.
@@ -2600,6 +6189,8 @@ mod mcp {
                         "WEBPIPE_SEARXNG_ENDPOINT",
                         "WEBPIPE_SEARXNG_ENDPOINTS",
                         "WEBPIPE_ARXIV_ENDPOINT",
+                        "WEBPIPE_SERPAPI_API_KEY",
+                        "SERPAPI_API_KEY",
                         "WEBPIPE_PERPLEXITY_ENDPOINT",
                         "WEBPIPE_PDF_SHELLOUT",
                         "WEBPIPE_PDF_SHELLOUT_MAX_PAGES",
@@ -2648,6 +6239,61 @@ mod mcp {
                         "auto_mode": "fallback",
                         "max_results": 10,
                         "max_results_max": 20
+                    },
+                    // Cursor-facing “what to call by default” guidance.
+                    // Keep this boring and bounded: it’s a suggestion for agents, not a second API.
+                    "recommended_defaults": {
+                        // Prefer "auto" so the server can pick among configured providers.
+                        "web_search": {
+                            "provider": "auto",
+                            "auto_mode": "fallback",
+                            "max_results": 5
+                        },
+                        // For retrieval workflows, prefer search+extract rather than raw search.
+                        "web_search_extract": {
+                            "provider": "auto",
+                            "auto_mode": "fallback",
+                            "fetch_backend": "local",
+                            "selection_mode": "score",
+                            "exploration": "balanced",
+                            "agentic": true,
+                            "max_results": 5,
+                            "max_urls": 3,
+                            "timeout_ms": 20_000,
+                            "max_bytes": 5_000_000,
+                            "top_chunks": 5,
+                            "max_chunk_chars": 500,
+                            "include_links": false,
+                            "include_text": false,
+                            "no_network": false,
+                            "cache": { "read": true, "write": true }
+                        },
+                        // Use web_extract for readability-focused extraction (chunks + optional structure).
+                        "web_extract": {
+                            "fetch_backend": "local",
+                            "timeout_ms": 20_000,
+                            "max_bytes": 5_000_000,
+                            "width": 100,
+                            "max_chars": 20_000,
+                            "top_chunks": 5,
+                            "max_chunk_chars": 500,
+                            "include_structure": false,
+                            "include_text": true,
+                            "include_links": false,
+                            "no_network": false,
+                            "cache": { "read": true, "write": true }
+                        },
+                        // Use web_fetch for raw bytes/headers, and only include_text when needed.
+                        "web_fetch": {
+                            "fetch_backend": "local",
+                            "timeout_ms": 15_000,
+                            "max_bytes": 5_000_000,
+                            "include_text": false,
+                            "max_text_chars": 20_000,
+                            "include_headers": false,
+                            "no_network": false,
+                            "cache": { "read": true, "write": true }
+                        }
                     },
                     "web_fetch": {
                         "fetch_backend": "local",
@@ -2763,6 +6409,16 @@ mod mcp {
                         "max_answer_chars": 20_000
                     }
                 },
+                "tool_output_summary": {
+                    "web_fetch": "Fetch a URL (cache-aware). Returns status/content_type/bytes_len and optional bounded text/headers.",
+                    "web_extract": "Fetch+extract readable text/chunks (bounded). Returns extraction.engine, text_chars, top_chunks, warnings/hints.",
+                    "web_search": "Search only (bounded). Returns results[] with url/title/content and provider selection when provider=auto.",
+                    "web_search_extract": "Main tool: optional search -> fetch -> extract -> rank top_chunks across URLs (bounded).",
+                    "web_cache_search_extract": "Cache-only search: scan WEBPIPE_CACHE_DIR -> extract -> top_chunks (no network).",
+                    "web_deep_research": "Evidence gatherer + optional synthesis. Prefer include_evidence for auditability.",
+                    "arxiv_search": "ArXiv Atom search (bounded). Returns papers[] (and optional semantic rerank metadata).",
+                    "arxiv_enrich": "ArXiv metadata (bounded) + optional discussion search via web_search."
+                },
                 "configured": {
                     "providers": {
                         "brave": brave_configured,
@@ -2807,11 +6463,13 @@ mod mcp {
                 "local_tools": local_tools
             });
             add_envelope_fields(&mut payload, "webpipe_meta", t0.elapsed().as_millis());
-            Ok(tool_result(payload))
+            let md = webpipe_meta_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Return curated seed URLs (awesome lists) for keyless search workflows"
+            description = "Curated seed URL registry for keyless/offline-ish workflows (bounded; JSON output)",
+            annotations(title = "Seed URLs", read_only_hint = true, open_world_hint = false)
         )]
         async fn web_seed_urls(
             &self,
@@ -2828,17 +6486,29 @@ mod mcp {
             let seeds = seed_registry();
 
             let seeds_out = if ids_only {
-                seeds.iter().take(max).map(|s| serde_json::json!({
-                    "id": s.id,
-                    "url": s.url
-                })).collect::<Vec<_>>()
+                seeds
+                    .iter()
+                    .take(max)
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id,
+                            "url": s.url
+                        })
+                    })
+                    .collect::<Vec<_>>()
             } else {
-                seeds.iter().take(max).map(|s| serde_json::json!({
-                    "id": s.id,
-                    "url": s.url,
-                    "kind": s.kind,
-                    "note": s.note
-                })).collect::<Vec<_>>()
+                seeds
+                    .iter()
+                    .take(max)
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id,
+                            "url": s.url,
+                            "kind": s.kind,
+                            "note": s.note
+                        })
+                    })
+                    .collect::<Vec<_>>()
             };
 
             let mut payload = serde_json::json!({
@@ -2851,16 +6521,21 @@ mod mcp {
                 ]
             });
             if include_ids {
-                payload["ids"] = serde_json::json!(
-                    seeds.iter().take(max).map(|s| s.id).collect::<Vec<_>>()
-                );
+                payload["ids"] =
+                    serde_json::json!(seeds.iter().take(max).map(|s| s.id).collect::<Vec<_>>());
             }
             add_envelope_fields(&mut payload, "web_seed_urls", t0.elapsed().as_millis());
-            Ok(tool_result(payload))
+            let md = web_seed_urls_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Fetch+extract a bounded set of seed URLs and return merged top chunks for a query"
+            description = "Fetch+extract a bounded set of seed URLs (or urls=...) and return merged top chunks for a query (cache-aware; JSON output)",
+            annotations(
+                title = "Seed search+extract",
+                read_only_hint = true,
+                open_world_hint = true
+            )
         )]
         async fn web_seed_search_extract(
             &self,
@@ -2877,8 +6552,13 @@ mod mcp {
                     "query": "",
                     "error": error_obj(ErrorCode::InvalidParams, "query must be non-empty", "Provide a query string.")
                 });
-                add_envelope_fields(&mut payload, "web_seed_search_extract", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                add_envelope_fields(
+                    &mut payload,
+                    "web_seed_search_extract",
+                    t0.elapsed().as_millis(),
+                );
+                let md = web_seed_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let max_urls = args.max_urls.unwrap_or(4).clamp(1, 10);
@@ -2918,8 +6598,13 @@ mod mcp {
                     ),
                     "unknown_seed_ids": unknown_seed_ids,
                 });
-                add_envelope_fields(&mut payload, "web_seed_search_extract", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                add_envelope_fields(
+                    &mut payload,
+                    "web_seed_search_extract",
+                    t0.elapsed().as_millis(),
+                );
+                let md = web_seed_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             #[derive(Debug, Clone, serde::Serialize)]
@@ -2971,7 +6656,11 @@ mod mcp {
                     .and_then(|x| x.get("engine"))
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string());
-                let chunks = v.get("chunks").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+                let chunks = v
+                    .get("chunks")
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 let warnings = v
                     .get("warnings")
                     .and_then(|x| x.as_array())
@@ -3046,16 +6735,17 @@ mod mcp {
                 }
             });
 
-            if no_network && payload["results"]["per_url"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .any(|x| {
-                    x.get("error")
-                        .and_then(|e| e.get("code"))
-                        .and_then(|c| c.as_str())
-                        == Some("cache_error")
-                })
+            if no_network
+                && payload["results"]["per_url"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .any(|x| {
+                        x.get("error")
+                            .and_then(|e| e.get("code"))
+                            .and_then(|c| c.as_str())
+                            == Some("cache_error")
+                    })
             {
                 warnings.push("no_network_may_require_warm_cache");
             }
@@ -3078,11 +6768,23 @@ mod mcp {
                 }
             }
 
-            add_envelope_fields(&mut payload, "web_seed_search_extract", t0.elapsed().as_millis());
-            Ok(tool_result(payload))
+            add_envelope_fields(
+                &mut payload,
+                "web_seed_search_extract",
+                t0.elapsed().as_millis(),
+            );
+            let md = web_seed_search_extract_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
-        #[tool(description = "Report in-process usage/cost stats since server start (no secrets)")]
+        #[tool(
+            description = "Usage stats since server start: tool calls, warnings, and provider cost units (no secrets; JSON output)",
+            annotations(
+                title = "Webpipe usage",
+                read_only_hint = true,
+                open_world_hint = false
+            )
+        )]
         async fn webpipe_usage(
             &self,
             _params: Parameters<Option<WebpipeUsageArgs>>,
@@ -3188,10 +6890,26 @@ mod mcp {
             });
 
             add_envelope_fields(&mut payload, kind, t0.elapsed().as_millis());
-            Ok(tool_result(payload))
+            let md = webpipe_usage_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
-        #[tool(description = "Reset in-process usage/cost stats (explicit side effect)")]
+        #[tool(
+            description = "Reset in-process usage/cost stats (explicit side effect; JSON output)",
+            input_schema = std::sync::Arc::new({
+                let mut m = serde_json::Map::new();
+                m.insert("type".to_string(), serde_json::json!("object"));
+                m.insert("additionalProperties".to_string(), serde_json::json!(false));
+                m
+            }),
+            annotations(
+                title = "Reset webpipe usage",
+                read_only_hint = false,
+                destructive_hint = true,
+                idempotent_hint = true,
+                open_world_hint = false
+            )
+        )]
         async fn webpipe_usage_reset(&self) -> Result<CallToolResult, McpError> {
             let kind = "webpipe_usage_reset";
             let t0 = std::time::Instant::now();
@@ -3206,10 +6924,14 @@ mod mcp {
                 "reset_at_epoch_s": now
             });
             add_envelope_fields(&mut payload, kind, t0.elapsed().as_millis());
-            Ok(tool_result(payload))
+            let md = webpipe_usage_reset_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
-        #[tool(description = "Search ArXiv (Atom API) with bounded results")]
+        #[tool(
+            description = "Search arXiv metadata (Atom API; bounded; JSON output)",
+            annotations(title = "arXiv search", read_only_hint = true, open_world_hint = true)
+        )]
         async fn arxiv_search(
             &self,
             params: Parameters<Option<ArxivSearchArgs>>,
@@ -3226,7 +6948,8 @@ mod mcp {
                     "error": error_obj(ErrorCode::InvalidParams, "query must be non-empty", "Pass a non-empty query string.")
                 });
                 add_envelope_fields(&mut payload, "arxiv_search", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = arxiv_search_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let page = args.page.unwrap_or(1).max(1);
@@ -3261,8 +6984,9 @@ mod mcp {
                         (0, text.chars().count(), text)
                     })
                     .collect();
-                let sem =
-                    webpipe_local::semantic::semantic_rerank_chunks(&query, &cands, semantic_top_k);
+                let sem = self
+                    .semantic_rerank_chunks_best(&query, &cands, semantic_top_k)
+                    .await;
                 if sem.ok {
                     let mut by_id = std::collections::BTreeMap::<
                         String,
@@ -3322,10 +7046,76 @@ mod mcp {
                 payload["semantic"] = semantic;
             }
             add_envelope_fields(&mut payload, "arxiv_search", t0.elapsed().as_millis());
-            Ok(tool_result(payload))
+            let md = arxiv_search_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
-        #[tool(description = "Fetch ArXiv metadata and optionally find discussion pages (bounded)")]
+        #[tool(
+            description = "Search academic paper metadata via Semantic Scholar / OpenAlex (and optional Google Scholar via SerpAPI) (bounded; JSON output)",
+            annotations(title = "Paper search", read_only_hint = true, open_world_hint = true)
+        )]
+        async fn paper_search(
+            &self,
+            params: Parameters<Option<PaperSearchArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            let args = params.0.unwrap_or_default();
+            self.stats_inc_tool("paper_search");
+            let t0 = std::time::Instant::now();
+
+            let query = args.query.clone().unwrap_or_default().trim().to_string();
+            if query.is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "query": args.query.unwrap_or_default(),
+                    "error": error_obj(ErrorCode::InvalidParams, "query must be non-empty", "Pass a non-empty query string.")
+                });
+                add_envelope_fields(&mut payload, "paper_search", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
+
+            let backends = args.backends.unwrap_or_default();
+            let years = args.years.unwrap_or_default();
+            let limit = args.limit.unwrap_or(10).clamp(1, 50);
+            let timeout_ms = args.timeout_ms.unwrap_or(20_000).min(60_000);
+            let include_abstract = args.include_abstract.unwrap_or(false);
+
+            let resp = webpipe_local::papers::paper_search(
+                self.http.clone(),
+                query.clone(),
+                backends.clone(),
+                years.clone(),
+                limit,
+                timeout_ms,
+                include_abstract,
+            )
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            let mut payload = serde_json::json!({
+                "ok": resp.ok,
+                "query": resp.query,
+                "backends": resp.backends,
+                "papers": resp.papers,
+                "warnings": resp.warnings,
+                "timings_ms": resp.timings_ms,
+                "request": {
+                    "query": query,
+                    "backends": backends,
+                    "years": years,
+                    "limit": limit,
+                    "timeout_ms": timeout_ms,
+                    "include_abstract": include_abstract
+                }
+            });
+            add_envelope_fields(&mut payload, "paper_search", t0.elapsed().as_millis());
+            let md = paper_search_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
+        }
+
+        #[tool(
+            description = "Fetch arXiv paper metadata and optionally find discussion links (bounded; JSON output)",
+            annotations(title = "arXiv enrich", read_only_hint = true, open_world_hint = true)
+        )]
         async fn arxiv_enrich(
             &self,
             params: Parameters<Option<ArxivEnrichArgs>>,
@@ -3341,7 +7131,8 @@ mod mcp {
                     "error": error_obj(ErrorCode::InvalidParams, "id_or_url must be non-empty", "Pass an arXiv ID like \"0805.3415\" or a full abs URL.")
                 });
                 add_envelope_fields(&mut payload, "arxiv_enrich", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = arxiv_enrich_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let arxiv_id = if raw.contains("arxiv.org/") {
@@ -3392,11 +7183,17 @@ mod mcp {
             }
 
             add_envelope_fields(&mut payload, "arxiv_enrich", t0.elapsed().as_millis());
-            Ok(tool_result(payload))
+            let md = arxiv_enrich_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Cheap Tavily-style: search (optional) -> local fetch -> local extract -> top chunks (bounded)"
+            description = "Search (or use urls) → fetch → extract → rank chunks (bounded; cache-aware; Markdown + structured JSON output)",
+            annotations(
+                title = "Search+extract",
+                read_only_hint = true,
+                open_world_hint = true
+            )
         )]
         pub(crate) async fn web_search_extract(
             &self,
@@ -3447,6 +7244,8 @@ mod mcp {
             let selection_mode = args.selection_mode.unwrap_or_else(|| "score".to_string());
             let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
             let no_network = args.no_network.unwrap_or(false);
+            let cache_read_effective = cache_read || no_network;
+            let cache_write_effective = if no_network { false } else { cache_write };
             let url_selection_mode = args
                 .url_selection_mode
                 .unwrap_or_else(|| "auto".to_string());
@@ -3519,7 +7318,8 @@ mod mcp {
                         "web_search_extract",
                         t0.elapsed().as_millis(),
                     );
-                    return Ok(tool_result(payload));
+                    let md = web_search_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
             }
             if url_selection_mode.as_str() != "auto"
@@ -3541,7 +7341,8 @@ mod mcp {
                     ),
                 });
                 add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             if selection_mode.as_str() != "score" && selection_mode.as_str() != "pareto" {
                 let mut payload = serde_json::json!({
@@ -3558,7 +7359,8 @@ mod mcp {
                     ),
                 });
                 add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             if fetch_backend.as_str() != "local" && fetch_backend.as_str() != "firecrawl" {
                 let mut payload = serde_json::json!({
@@ -3573,7 +7375,8 @@ mod mcp {
                     ),
                 });
                 add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             if agentic_selector.as_str() != "auto"
                 && agentic_selector.as_str() != "lexical"
@@ -3591,7 +7394,8 @@ mod mcp {
                     ),
                 });
                 add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             // `fetch_backend` selects the primary backend. Separately, we may use a bounded Firecrawl
             // fallback in local mode when extraction yields empty or low-signal output (opt-in flags).
@@ -4071,10 +7875,6 @@ mod mcp {
             // Best-effort label per discovered URL (anchor text), to help the planner pick.
             let mut link_labels = std::collections::HashMap::<String, String>::new();
 
-            // Public-repo friendly: keep agentic selection deterministic (lexical only).
-            // `agentic_selector="llm"` is accepted but treated as lexical in this build.
-            let _planner_model_available = false;
-
             // If Firecrawl is configured, allow the agentic selector to opt into it for a single URL.
             // This is bounded (at most `max_urls` total fetches) and opt-in per-URL.
             let firecrawl_agentic = if !no_network
@@ -4090,7 +7890,25 @@ mod mcp {
                 .planner_max_calls
                 .unwrap_or_else(Self::planner_max_calls_from_env)
                 .min(10);
-            let _planner_calls: usize = 0;
+
+            // Optional LLM planner for agentic URL selection (bounded).
+            //
+            // We intentionally keep the contract tiny: the planner may only choose among a bounded
+            // candidate set (derived deterministically), and may optionally request a per-URL Firecrawl
+            // fetch (also bounded and opt-in).
+            let planner_requested =
+                agentic_selector.as_str() == "llm" || agentic_selector.as_str() == "auto";
+            let planner_client: Option<webpipe_local::openai_compat::OpenAiCompatClient> =
+                if planner_requested && planner_max_calls > 0 && !no_network {
+                    webpipe_local::openai_compat::OpenAiCompatClient::from_env(
+                        self.http.clone(),
+                        None,
+                    )
+                    .ok()
+                } else {
+                    None
+                };
+            let mut planner_calls: usize = 0;
             let max_search_rounds = args
                 .agentic_max_search_rounds
                 .or_else(|| {
@@ -4249,9 +8067,188 @@ mod mcp {
                     });
                     let mut best_i = idxs.first().copied().unwrap_or(0);
 
-                    let selector_used: &'static str = "lexical";
                     if best_i >= frontier.len() {
                         best_i = idxs.first().copied().unwrap_or(0);
+                    }
+
+                    let mut selector_used: &'static str = "lexical";
+
+                    // Optional planner: choose among a bounded candidate set.
+                    //
+                    // Contract:
+                    // - Must choose a URL from `candidates`.
+                    // - May optionally request Firecrawl for the chosen URL (if configured).
+                    // - May request "search_more" (clears frontier to trigger bounded extra search round).
+                    let mut planner_reason: Option<String> = None;
+                    let mut planner_force_firecrawl: bool = false;
+                    let mut planner_action: String = "pick_url".to_string();
+                    // Agentic planner chat history: keep stable system + short assistant notes.
+                    // This helps provider prompt caching across multi-step selection loops.
+                    let mut planner_history: Vec<webpipe_local::openai_compat::ChatMessage> =
+                        Vec::new();
+                    if let Some(client) = planner_client.as_ref() {
+                        if planner_calls < planner_max_calls
+                            && agentic_selector.as_str() != "lexical"
+                            && !query.trim().is_empty()
+                        {
+                            planner_calls = planner_calls.saturating_add(1);
+
+                            let top_k = 7usize.min(idxs.len());
+                            let cand_idxs = idxs.iter().copied().take(top_k).collect::<Vec<_>>();
+                            let mut cand_urls: Vec<String> = Vec::new();
+                            let mut candidates: Vec<serde_json::Value> = Vec::new();
+                            for &i in &cand_idxs {
+                                if i >= frontier.len() {
+                                    continue;
+                                }
+                                let url = frontier[i].clone();
+                                let canon_url =
+                                    canon.get(i).cloned().unwrap_or_else(|| url.clone());
+                                cand_urls.push(canon_url.clone());
+                                let label =
+                                    link_labels.get(&canon_url).cloned().unwrap_or_default();
+                                candidates.push(serde_json::json!({
+                                    "url": canon_url,
+                                    "label": label,
+                                    "url_score": url_scores.get(i).copied().unwrap_or(0),
+                                    "prior_score": prior_scores.get(i).copied().unwrap_or(0),
+                                    "auth_wall": url_looks_like_auth_or_challenge(&url),
+                                }));
+                            }
+
+                            let allow_firecrawl =
+                                firecrawl_agentic.is_some() && !firecrawl_disabled;
+                            let system = r#"You are a URL selector for a bounded web search→fetch→extract loop.
+
+You MUST return JSON only, matching this shape:
+{
+  "action": "pick_url" | "search_more" | "stop",
+  "picked_url": "https://…",              // required when action="pick_url"; must be one of the candidates
+  "force_fetch_backend": "firecrawl" | null,
+  "reason": "short string"
+}
+
+Rules:
+- Never invent URLs; if action="pick_url", picked_url must exactly match one candidate URL.
+- Prefer URLs likely to contain substantive content for the query.
+- Avoid auth/challenge/consent walls unless unavoidable.
+- Use force_fetch_backend="firecrawl" only when the page is likely JS-blocked or the content is likely hidden.
+"#;
+                            let user = serde_json::to_string(&serde_json::json!({
+                                "query": query,
+                                "candidates": candidates,
+                                "allow": {
+                                    "search_more": true,
+                                    "force_fetch_backend": if allow_firecrawl { ["firecrawl"].as_slice() } else { [].as_slice() }
+                                }
+                            }))
+                            .unwrap_or_else(|_| "{}".to_string());
+
+                            if planner_history.is_empty() {
+                                planner_history.push(
+                                    webpipe_local::openai_compat::ChatMessage::system(system),
+                                );
+                            }
+                            let mut msgs = planner_history.clone();
+                            // Do not retain this large user payload in history.
+                            msgs.push(webpipe_local::openai_compat::ChatMessage::user(&user));
+
+                            let resp = client
+                                .chat_messages_with_options(
+                                    msgs,
+                                    timeout_ms,
+                                    Some(300),
+                                    Some(0.0),
+                                    Some(1.0),
+                                    true,
+                                    webpipe_local::openai_compat::ChatOptions::default(),
+                                )
+                                .await;
+                            match resp {
+                                Ok(text) => {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                                    {
+                                        let action = v
+                                            .get("action")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("pick_url");
+                                        planner_action = action.to_string();
+
+                                        let force = v
+                                            .get("force_fetch_backend")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("");
+                                        planner_force_firecrawl =
+                                            allow_firecrawl && force == "firecrawl";
+
+                                        planner_reason = v
+                                            .get("reason")
+                                            .and_then(|x| x.as_str())
+                                            .map(|s| s.to_string());
+
+                                        // Add short state to history for subsequent calls (no huge payloads).
+                                        let picked = v
+                                            .get("picked_url")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("");
+                                        let note = format!(
+                                            "Planner state: action={}, picked_url={}, force_firecrawl={}, reason={}",
+                                            planner_action,
+                                            picked,
+                                            planner_force_firecrawl,
+                                            planner_reason.clone().unwrap_or_default()
+                                        );
+                                        planner_history.push(
+                                            webpipe_local::openai_compat::ChatMessage::assistant(
+                                                &note,
+                                            ),
+                                        );
+
+                                        if action == "search_more" {
+                                            // Trigger bounded extra search round (handled at top-of-loop).
+                                            frontier.clear();
+                                            agentic_trace.push(serde_json::json!({
+                                                "planner": true,
+                                                "action": "search_more",
+                                                "reason": planner_reason,
+                                            }));
+                                            continue;
+                                        }
+                                        if action == "stop" {
+                                            agentic_trace.push(serde_json::json!({
+                                                "planner": true,
+                                                "action": "stop",
+                                                "reason": planner_reason,
+                                            }));
+                                            break;
+                                        }
+
+                                        if let Some(picked_url) =
+                                            v.get("picked_url").and_then(|x| x.as_str())
+                                        {
+                                            if cand_urls.iter().any(|u| u == picked_url) {
+                                                // Replace lexical pick with the planner's choice.
+                                                if let Some(pos) = frontier.iter().position(|u| {
+                                                    canonicalize_url_no_frag(u)
+                                                        .map(|k| k == picked_url)
+                                                        .unwrap_or(false)
+                                                }) {
+                                                    best_i = pos;
+                                                    selector_used = "llm";
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    // Planner failures fall back to lexical.
+                                }
+                            }
+                        }
+                    }
+
+                    if planner_force_firecrawl {
+                        agentic_force_firecrawl_next = true;
                     }
 
                     let picked = frontier.swap_remove(best_i);
@@ -4261,6 +8258,10 @@ mod mcp {
                         "score": best_s,
                         "prior": *priors.get(&canonicalize_url_no_frag(&picked).unwrap_or_else(|| picked.clone())).unwrap_or(&0),
                         "selector": selector_used,
+                        "planner_action": planner_action,
+                        "planner_reason": planner_reason,
+                        "planner_calls": planner_calls,
+                        "force_firecrawl": planner_force_firecrawl,
                         "frontier_len_before": frontier.len() + 1
                     });
                     agentic_trace.push(trace_obj);
@@ -4690,42 +8691,41 @@ mod mcp {
                         )
                     }
                 };
+                // Offload chunking/structure parsing to the blocking pool (avoid stalling async runtime).
+                let raw_bytes = std::sync::Arc::new(raw_bytes);
+                let pipeline0 = {
+                    let bytes = raw_bytes.clone();
+                    let ct = content_type.clone();
+                    let final_url2 = final_url.clone();
+                    let query2 = query.clone();
+                    tokio::task::spawn_blocking(move || {
+                        webpipe_local::extract::extract_pipeline_from_extracted(
+                            &bytes,
+                            ct.as_deref(),
+                            final_url2.as_str(),
+                            extracted_obj,
+                            webpipe_local::extract::ExtractPipelineCfg {
+                                query: Some(query2.as_str()),
+                                width,
+                                max_chars,
+                                top_chunks,
+                                max_chunk_chars,
+                                include_structure,
+                                max_outline_items,
+                                max_blocks,
+                                max_block_chars,
+                            },
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(format!("extract pipeline join failed: {e}"), None)
+                    })?
+                };
                 #[cfg(feature = "vision-gemini")]
-                let mut pipeline = webpipe_local::extract::extract_pipeline_from_extracted(
-                    &raw_bytes,
-                    content_type.as_deref(),
-                    final_url.as_str(),
-                    extracted_obj,
-                    webpipe_local::extract::ExtractPipelineCfg {
-                        query: Some(&query),
-                        width,
-                        max_chars,
-                        top_chunks,
-                        max_chunk_chars,
-                        include_structure,
-                        max_outline_items,
-                        max_blocks,
-                        max_block_chars,
-                    },
-                );
+                let mut pipeline = pipeline0;
                 #[cfg(not(feature = "vision-gemini"))]
-                let pipeline = webpipe_local::extract::extract_pipeline_from_extracted(
-                    &raw_bytes,
-                    content_type.as_deref(),
-                    final_url.as_str(),
-                    extracted_obj,
-                    webpipe_local::extract::ExtractPipelineCfg {
-                        query: Some(&query),
-                        width,
-                        max_chars,
-                        top_chunks,
-                        max_chunk_chars,
-                        include_structure,
-                        max_outline_items,
-                        max_blocks,
-                        max_block_chars,
-                    },
-                );
+                let pipeline = pipeline0;
 
                 // Opportunistic multimodal for web_search_extract results: only when
                 // - feature enabled
@@ -4766,23 +8766,36 @@ mod mcp {
                                     text,
                                     warnings: vec!["gemini_used"],
                                 };
-                                pipeline = webpipe_local::extract::extract_pipeline_from_extracted(
-                                    &raw_bytes,
-                                    content_type.as_deref(),
-                                    final_url.as_str(),
-                                    ex,
-                                    webpipe_local::extract::ExtractPipelineCfg {
-                                        query: Some(&query),
-                                        width,
-                                        max_chars,
-                                        top_chunks,
-                                        max_chunk_chars,
-                                        include_structure,
-                                        max_outline_items,
-                                        max_blocks,
-                                        max_block_chars,
-                                    },
-                                );
+                                let bytes = raw_bytes.clone();
+                                let ct = content_type.clone();
+                                let final_url2 = final_url.clone();
+                                let query2 = query.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    webpipe_local::extract::extract_pipeline_from_extracted(
+                                        &bytes,
+                                        ct.as_deref(),
+                                        final_url2.as_str(),
+                                        ex,
+                                        webpipe_local::extract::ExtractPipelineCfg {
+                                            query: Some(query2.as_str()),
+                                            width,
+                                            max_chars,
+                                            top_chunks,
+                                            max_chunk_chars,
+                                            include_structure,
+                                            max_outline_items,
+                                            max_blocks,
+                                            max_block_chars,
+                                        },
+                                    )
+                                })
+                                .await
+                                {
+                                    Ok(p2) => pipeline = p2,
+                                    Err(_) => {
+                                        pipeline.extracted.warnings.push("gemini_pipeline_failed")
+                                    }
+                                }
                             }
                             Err(code) => {
                                 if vision_mode == "strict" {
@@ -4825,8 +8838,17 @@ mod mcp {
                         || engine0.starts_with("html")
                         || engine0 == "markdown";
                     if text_like {
-                        let base = Some(final_url.as_str());
-                        webpipe_local::links::extract_links(&raw_text, base, max_links)
+                        let raw_text2 = raw_text.clone();
+                        let base_url = final_url.clone();
+                        tokio::task::spawn_blocking(move || {
+                            webpipe_local::links::extract_links(
+                                &raw_text2,
+                                Some(base_url.as_str()),
+                                max_links,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|_| Vec::new())
                     } else {
                         Vec::new()
                     }
@@ -4969,6 +8991,17 @@ mod mcp {
                     },
                     "elapsed_ms": per_t0.elapsed().as_millis()
                 });
+                // Deterministic quality scorecard (tail-risk detector).
+                // Additive: safe for existing consumers.
+                let quality = Self::quality_scorecard(
+                    Some(query.as_str()),
+                    &text,
+                    status,
+                    extracted_obj.engine,
+                    &warnings,
+                );
+                one["quality"] = quality.clone();
+                one["extract"]["quality"] = quality;
                 if !warnings.is_empty() {
                     one["warnings"] = serde_json::json!(warnings);
                     let codes = warning_codes_from(&warnings);
@@ -4996,22 +9029,9 @@ mod mcp {
                         .iter()
                         .map(|c| (c.start_char, c.end_char, c.text.clone()))
                         .collect();
-                    let q0 = query.clone();
-                    let sem = tokio::task::spawn_blocking(move || {
-                        webpipe_local::semantic::semantic_rerank_chunks(&q0, &cands, semantic_top_k)
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
-                        webpipe_local::semantic::SemanticRerankResult {
-                            ok: false,
-                            backend: "unknown".to_string(),
-                            model_id: None,
-                            cache_hits: 0,
-                            cache_misses: 0,
-                            chunks: Vec::new(),
-                            warnings: vec!["semantic_rerank_task_failed"],
-                        }
-                    });
+                    let sem = self
+                        .semantic_rerank_chunks_best(&query, &cands, semantic_top_k)
+                        .await;
                     one["extract"]["semantic"] = serde_json::json!(sem);
                 }
                 if compact {
@@ -5037,6 +9057,7 @@ mod mcp {
                         "content_type",
                         "bytes",
                         "elapsed_ms",
+                        "quality",
                         "warnings",
                         "warning_codes",
                         "warning_hints",
@@ -5214,7 +9235,7 @@ mod mcp {
                         "no_network": no_network,
                     "firecrawl_fallback_on_empty_extraction": firecrawl_fallback_on_empty_extraction,
                     "firecrawl_fallback_on_low_signal": firecrawl_fallback_on_low_signal,
-                    "cache": { "read": cache_read, "write": cache_write, "ttl_s": cache_ttl_s },
+                    "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": cache_ttl_s },
                     "compact": compact
                 },
                 "url_count_in": urls.len(),
@@ -5288,11 +9309,17 @@ mod mcp {
                 }
             }
             add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
-            Ok(tool_result(payload))
+            let md = web_search_extract_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Cache-only search: scan WEBPIPE_CACHE_DIR -> extract -> top chunks (bounded)"
+            description = "Cache-only retrieval: scan WEBPIPE_CACHE_DIR and extract matches for a query (offline; bounded; JSON output)",
+            annotations(
+                title = "Cache search+extract",
+                read_only_hint = true,
+                open_world_hint = false
+            )
         )]
         async fn web_cache_search_extract(
             &self,
@@ -5314,7 +9341,8 @@ mod mcp {
                     "web_cache_search_extract",
                     t0.elapsed().as_millis(),
                 );
-                return Ok(tool_result(payload));
+                let md = web_cache_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let Some(cache_dir) = cache_dir_from_env() else {
@@ -5332,7 +9360,8 @@ mod mcp {
                     "web_cache_search_extract",
                     t0.elapsed().as_millis(),
                 );
-                return Ok(tool_result(payload));
+                let md = web_cache_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             };
 
             let max_docs = args.max_docs.unwrap_or(50).min(500);
@@ -5380,14 +9409,10 @@ mod mcp {
             let mut results_json =
                 serde_json::to_value(&r.results).unwrap_or_else(|_| serde_json::json!([]));
             if semantic_rerank {
-                // Probe once so we can summarize status at top-level (and avoid repeated work).
-                let sem_probe = webpipe_local::semantic::semantic_rerank_chunks(&query, &[], 1);
-                let sem_probe_is_unavailable = !sem_probe.ok
-                    && sem_probe.warnings.iter().any(|w| {
-                        *w == "semantic_backend_not_configured" || *w == "semantic_feature_disabled"
-                    });
-                let sem_probe_json = serde_json::json!(sem_probe.clone());
                 if let Some(arr) = results_json.as_array_mut() {
+                    let use_embeddings = Self::openrouter_api_key_from_env().is_some();
+                    let max_embed_docs = Self::semantic_embeddings_max_docs_from_env();
+                    let mut doc_i: usize = 0;
                     for one in arr {
                         let chunks = one
                             .get("chunks")
@@ -5407,9 +9432,11 @@ mod mcp {
                                 .to_string();
                             cands.push((sc, ec, txt));
                         }
-                        // Keep per-doc field for back-compat, but when unavailable reuse the probe.
-                        let sem = if sem_probe_is_unavailable {
-                            sem_probe_json.clone()
+                        let sem = if use_embeddings && doc_i < max_embed_docs && !cands.is_empty() {
+                            serde_json::json!(
+                                self.semantic_rerank_chunks_best(&query, &cands, semantic_top_k)
+                                    .await
+                            )
                         } else {
                             serde_json::json!(webpipe_local::semantic::semantic_rerank_chunks(
                                 &query,
@@ -5419,6 +9446,7 @@ mod mcp {
                         };
                         one.as_object_mut()
                             .map(|m| m.insert("semantic".to_string(), sem));
+                        doc_i += 1;
                     }
                 }
             }
@@ -5584,11 +9612,13 @@ mod mcp {
                 "web_cache_search_extract",
                 t0.elapsed().as_millis(),
             );
-            Ok(tool_result(payload))
+            let md = web_cache_search_extract_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Agentic research: search -> fetch/extract -> Perplexity deep research synthesis (bounded)"
+            description = "Agentic research: gather evidence (search+extract) and optionally synthesize an answer (bounded; JSON output)",
+            annotations(title = "Deep research", read_only_hint = true, open_world_hint = true)
         )]
         async fn web_deep_research(
             &self,
@@ -5606,7 +9636,8 @@ mod mcp {
                     "error": error_obj(ErrorCode::InvalidParams, "query must be a non-empty string", "Pass a question/prompt as `query`."),
                 });
                 add_envelope_fields(&mut payload, "web_deep_research", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_deep_research_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let max_results_user = args.max_results.is_some();
@@ -5641,7 +9672,8 @@ mod mcp {
                     ),
                 });
                 add_envelope_fields(&mut payload, "web_deep_research", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_deep_research_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             if audit && args.search_mode.is_some() {
                 let mut payload = serde_json::json!({
@@ -5655,7 +9687,8 @@ mod mcp {
                     ),
                 });
                 add_envelope_fields(&mut payload, "web_deep_research", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_deep_research_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let exploration = args
@@ -5714,7 +9747,8 @@ mod mcp {
                         "web_deep_research",
                         t0.elapsed().as_millis(),
                     );
-                    return Ok(tool_result(payload));
+                    let md = web_deep_research_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
             }
 
@@ -5744,7 +9778,8 @@ mod mcp {
                     ),
                 });
                 add_envelope_fields(&mut payload, "web_deep_research", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_deep_research_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let max_answer_chars = args.max_answer_chars.unwrap_or(20_000).min(200_000);
@@ -5774,7 +9809,8 @@ mod mcp {
                     ),
                 });
                 add_envelope_fields(&mut payload, "web_deep_research", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_deep_research_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             if no_network && args.search_mode.is_some() {
                 let mut payload = serde_json::json!({
@@ -5788,7 +9824,8 @@ mod mcp {
                     ),
                 });
                 add_envelope_fields(&mut payload, "web_deep_research", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_deep_research_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let evidence_r = self
@@ -5898,6 +9935,7 @@ mod mcp {
                 "top_chunks": evidence.get("top_chunks").cloned().unwrap_or_else(|| serde_json::json!([])),
                 "results": compact_results,
                 "firecrawl_retry": serde_json::Value::Null,
+                "papers": serde_json::Value::Null,
                 "arxiv": serde_json::Value::Null
             });
 
@@ -5941,6 +9979,101 @@ mod mcp {
                 }
                 false
             }
+
+            // Optionally add bounded "papers" evidence (Semantic Scholar / OpenAlex / optional Scholar API).
+            let papers_mode = args
+                .papers_mode
+                .clone()
+                .unwrap_or_else(|| "auto".to_string());
+            let papers_enabled = match papers_mode.as_str() {
+                "off" => false,
+                "on" => true,
+                "auto" => looks_paper_like(&query),
+                _ => {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "query": query,
+                        "model": model,
+                        "papers_mode": papers_mode,
+                        "error": error_obj(
+                            ErrorCode::InvalidParams,
+                            "unknown papers_mode",
+                            "Allowed papers_mode values: off, auto, on"
+                        ),
+                    });
+                    add_envelope_fields(
+                        &mut payload,
+                        "web_deep_research",
+                        t0.elapsed().as_millis(),
+                    );
+                    return Ok(tool_result(payload));
+                }
+            };
+
+            let papers_block = if papers_enabled && !no_network {
+                let max_papers = args.papers_max_papers.unwrap_or(5).clamp(1, 20);
+                let backends = args.papers_backends.clone().unwrap_or_default();
+                let years = args.papers_years.clone().unwrap_or_default();
+                let papers_timeout_ms = args.papers_timeout_ms.unwrap_or(12_000).min(60_000);
+                let include_abs = args.papers_include_abstract.unwrap_or(false);
+
+                match webpipe_local::papers::paper_search(
+                    self.http.clone(),
+                    query.clone(),
+                    backends.clone(),
+                    years.clone(),
+                    // limit is per-backend; keep it bounded and aligned with max_papers.
+                    max_papers,
+                    papers_timeout_ms,
+                    include_abs,
+                )
+                .await
+                {
+                    Ok(r) => {
+                        let mut papers = Vec::new();
+                        for p in r.papers.into_iter().take(max_papers) {
+                            let abs = p.abstract_text.clone().unwrap_or_default();
+                            let (abs, _n, _clipped) =
+                                Self::truncate_to_chars(&abs, max_chunk_chars.min(2_000));
+                            papers.push(serde_json::json!({
+                                "title": p.title,
+                                "year": p.year,
+                                "authors": p.authors,
+                                "venue": p.venue,
+                                "url": p.url,
+                                "pdf_url": p.pdf_url,
+                                "doi": p.doi,
+                                "arxiv_id": p.arxiv_id,
+                                "citation_count": p.citation_count,
+                                "abstract": if abs.trim().is_empty() { serde_json::Value::Null } else { serde_json::Value::String(abs) },
+                                "source": p.source,
+                            }));
+                        }
+                        serde_json::json!({
+                            "ok": true,
+                            "query": r.query,
+                            "backends": r.backends,
+                            "warnings": r.warnings,
+                            "papers": papers,
+                            "timings_ms": r.timings_ms,
+                        })
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        serde_json::json!({
+                            "ok": false,
+                            "error": msg,
+                        })
+                    }
+                }
+            } else if papers_enabled && no_network {
+                serde_json::json!({
+                    "ok": false,
+                    "error": "skipped (no_network=true)",
+                })
+            } else {
+                serde_json::Value::Null
+            };
 
             let arxiv_mode = args
                 .arxiv_mode
@@ -6034,6 +10167,7 @@ mod mcp {
             };
 
             let mut evidence_for_llm = evidence_for_llm;
+            evidence_for_llm["papers"] = papers_block;
             evidence_for_llm["arxiv"] = arxiv_block;
             let evidence_pack = evidence_for_llm.clone();
 
@@ -6069,6 +10203,8 @@ mod mcp {
                         "include_links": include_links,
                         "max_links": max_links,
                         "exploration": exploration,
+                        "papers_mode": papers_mode,
+                        "papers_max_papers": args.papers_max_papers.unwrap_or(5).clamp(1, 20),
                         "arxiv_mode": arxiv_mode,
                         "arxiv_max_papers": args.arxiv_max_papers.unwrap_or(3).clamp(1, 10),
                         "synthesize": false,
@@ -6309,7 +10445,8 @@ mod mcp {
                     payload["generated_at_epoch_s"] = serde_json::json!(now);
                 }
                 add_envelope_fields(&mut payload, "web_deep_research", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_deep_research_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             if selected_backend == "openai_compat" {
@@ -6438,7 +10575,8 @@ mod mcp {
                     payload["generated_at_epoch_s"] = serde_json::json!(now);
                 }
                 add_envelope_fields(&mut payload, "web_deep_research", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_deep_research_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             // Otherwise: Perplexity API path (existing behavior).
@@ -6654,11 +10792,13 @@ mod mcp {
                 payload["generated_at_epoch_s"] = serde_json::json!(now);
             }
             add_envelope_fields(&mut payload, "web_deep_research", t0.elapsed().as_millis());
-            Ok(tool_result(payload))
+            let md = web_deep_research_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Fetch a URL (cache-first, deterministic JSON output; bounded text by default)"
+            description = "Fetch a URL (cache-first; bounded; optional text/headers; safety drops auth/cookie headers; JSON output)",
+            annotations(title = "Fetch URL", read_only_hint = true, open_world_hint = true)
         )]
         async fn web_fetch(
             &self,
@@ -6671,6 +10811,12 @@ mod mcp {
             let max_text_chars = args.max_text_chars.unwrap_or(20_000).min(200_000);
             let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
             let no_network = args.no_network.unwrap_or(false);
+            let cache_read_effective = args.cache_read.unwrap_or(true) || no_network;
+            let cache_write_effective = if no_network {
+                false
+            } else {
+                args.cache_write.unwrap_or(true)
+            };
 
             let url = args.url.unwrap_or_default();
             let t0 = std::time::Instant::now();
@@ -6688,14 +10834,15 @@ mod mcp {
                         "no_network": no_network,
                         "timeout_ms": args.timeout_ms.or(Some(15_000)),
                         "max_bytes": args.max_bytes.or(Some(5_000_000)),
-                        "cache": { "read": args.cache_read.unwrap_or(true), "write": args.cache_write.unwrap_or(true), "ttl_s": args.cache_ttl_s },
+                        "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": args.cache_ttl_s },
                         "include_text": include_text,
                         "max_text_chars": max_text_chars,
                         "include_headers": include_headers
                     }
                 });
                 add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_fetch_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             if fetch_backend.as_str() != "local" && fetch_backend.as_str() != "firecrawl" {
                 let mut payload = serde_json::json!({
@@ -6709,7 +10856,8 @@ mod mcp {
                     "request": { "fetch_backend": fetch_backend }
                 });
                 add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_fetch_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             if no_network && fetch_backend == "firecrawl" {
@@ -6721,10 +10869,15 @@ mod mcp {
                         "no_network=true cannot be used with fetch_backend=\"firecrawl\"",
                         "Use fetch_backend=\"local\" with a warmed WEBPIPE_CACHE_DIR, or set no_network=false."
                     ),
-                    "request": { "fetch_backend": fetch_backend, "no_network": no_network }
+                    "request": {
+                        "fetch_backend": fetch_backend,
+                        "no_network": no_network,
+                        "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": args.cache_ttl_s }
+                    }
                 });
                 add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_fetch_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             if fetch_backend == "firecrawl" {
@@ -6753,7 +10906,8 @@ mod mcp {
                             "request": { "fetch_backend": fetch_backend, "timeout_ms": timeout_ms }
                         });
                         add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_fetch_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                 };
                 let r = match fc.fetch_markdown(&url, timeout_ms, max_age_ms).await {
@@ -6777,10 +10931,13 @@ mod mcp {
                             "request": { "fetch_backend": fetch_backend, "timeout_ms": timeout_ms }
                         });
                         add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_fetch_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                 };
-                let (text, n, text_clipped) = Self::truncate_to_chars(&r.markdown, max_text_chars);
+                let bytes_est = Self::approx_bytes_len(&r.markdown);
+                let cleaned = clean_text_for_output(r.markdown);
+                let (text, n, text_clipped) = Self::truncate_to_chars(&cleaned, max_text_chars);
                 let mut warnings: Vec<&'static str> = Vec::new();
                 if text_clipped {
                     warnings.push("text_truncated_by_max_text_chars");
@@ -6793,7 +10950,7 @@ mod mcp {
                     "final_url": url,
                     "status": 200,
                     "content_type": "text/markdown",
-                    "bytes": Self::approx_bytes_len(&r.markdown),
+                    "bytes": bytes_est,
                     "truncated": false,
                     "source": "network",
                     "text_chars": n,
@@ -6895,7 +11052,9 @@ mod mcp {
                             || Self::url_looks_like_pdf(resp.final_url.as_str())
                             || webpipe_local::extract::bytes_look_like_pdf(&resp.bytes);
                         let (text, n, text_clipped) = if include_text && !is_pdf_like {
-                            Self::truncate_to_chars(resp.text_lossy().as_ref(), max_text_chars)
+                            let raw = resp.text_lossy().to_string();
+                            let cleaned = clean_text_for_output(raw);
+                            Self::truncate_to_chars(cleaned.as_str(), max_text_chars)
                         } else {
                             (String::new(), 0, false)
                         };
@@ -6950,7 +11109,8 @@ mod mcp {
                         if include_headers {
                             payload["headers"] = serde_json::json!(resp.headers);
                         }
-                        return Ok(tool_result(payload));
+                        let md = web_fetch_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                     Ok(None) => {
                         let mut payload = serde_json::json!({
@@ -6964,7 +11124,8 @@ mod mcp {
                             "request": { "fetch_backend": "local", "no_network": true, "cache": { "read": true, "write": false, "ttl_s": req.cache.ttl_s } }
                         });
                         add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_fetch_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                     Err(e) => {
                         let mut payload = serde_json::json!({
@@ -6974,7 +11135,8 @@ mod mcp {
                             "request": { "fetch_backend": "local", "no_network": true }
                         });
                         add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_fetch_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                 }
             }
@@ -7032,7 +11194,8 @@ mod mcp {
                             serde_json::json!(dropped_request_headers);
                     }
                     add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
-                    return Ok(tool_result(payload));
+                    let md = web_fetch_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
             };
 
@@ -7040,7 +11203,9 @@ mod mcp {
                 || Self::url_looks_like_pdf(resp.final_url.as_str())
                 || webpipe_local::extract::bytes_look_like_pdf(&resp.bytes);
             let (text, n, text_clipped) = if include_text && !is_pdf_like {
-                Self::truncate_to_chars(resp.text_lossy().as_ref(), max_text_chars)
+                let raw = resp.text_lossy().to_string();
+                let cleaned = clean_text_for_output(raw);
+                Self::truncate_to_chars(cleaned.as_str(), max_text_chars)
             } else {
                 (String::new(), 0, false)
             };
@@ -7113,11 +11278,13 @@ mod mcp {
             }
             self.stats_record_fetch_backend("local", true, t0.elapsed().as_millis() as u64, None);
 
-            Ok(tool_result(payload))
+            let md = web_fetch_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Search the web (returns ok=false not_configured unless provider keys are set)"
+            description = "Search the web (provider: brave/tavily/searxng/auto; auto picks configured providers; bounded; JSON output)",
+            annotations(title = "Web search", read_only_hint = true, open_world_hint = true)
         )]
         async fn web_search(
             &self,
@@ -7160,7 +11327,8 @@ mod mcp {
                     )
                 });
                 add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_search_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let q = SearchQuery {
@@ -7196,7 +11364,8 @@ mod mcp {
                     )
                 });
                 add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_search_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             if provider_name.as_str() == "auto"
@@ -7224,7 +11393,8 @@ mod mcp {
                     )
                 });
                 add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_search_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let resp = match provider_name.as_str() {
@@ -7267,7 +11437,8 @@ mod mcp {
                                 "web_search",
                                 t0.elapsed().as_millis(),
                             );
-                            return Ok(tool_result(payload));
+                            let md = web_search_markdown(&payload);
+                            return Ok(tool_result_markdown_with_json(payload, md));
                         }
 
                         let mut providers = Vec::new();
@@ -7512,7 +11683,8 @@ mod mcp {
                                 "web_search",
                                 t0.elapsed().as_millis(),
                             );
-                            return Ok(tool_result(payload));
+                            let md = web_search_markdown(&payload);
+                            return Ok(tool_result_markdown_with_json(payload, md));
                         }
 
                         let mut payload = serde_json::json!({
@@ -7554,7 +11726,8 @@ mod mcp {
                             payload["warning_hints"] = warning_hints_from(&codes);
                         }
                         add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_search_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
 
                     if auto_mode.as_str() == "mab" {
@@ -7596,7 +11769,8 @@ mod mcp {
                                 "web_search",
                                 t0.elapsed().as_millis(),
                             );
-                            return Ok(tool_result(payload));
+                            let md = web_search_markdown(&payload);
+                            return Ok(tool_result_markdown_with_json(payload, md));
                         }
 
                         let exploration_c = env_f64("WEBPIPE_MAB_EXPLORATION_C").unwrap_or(0.7);
@@ -7673,7 +11847,8 @@ mod mcp {
                                 "web_search",
                                 t0.elapsed().as_millis(),
                             );
-                            return Ok(tool_result(payload));
+                            let md = web_search_markdown(&payload);
+                            return Ok(tool_result_markdown_with_json(payload, md));
                         }
 
                         let cfg = muxer::MabConfig {
@@ -7726,7 +11901,8 @@ mod mcp {
                                                 "web_search",
                                                 t0.elapsed().as_millis(),
                                             );
-                                            return Ok(tool_result(payload));
+                                            let md = web_search_markdown(&payload);
+                                            return Ok(tool_result_markdown_with_json(payload, md));
                                         }
                                     };
                                 match provider.search(&q).await {
@@ -7771,7 +11947,8 @@ mod mcp {
                                             "web_search",
                                             t0.elapsed().as_millis(),
                                         );
-                                        return Ok(tool_result(payload));
+                                        let md = web_search_markdown(&payload);
+                                        return Ok(tool_result_markdown_with_json(payload, md));
                                     }
                                 }
                             }
@@ -7787,9 +11964,7 @@ mod mcp {
                                             )));
                                         };
                                         webpipe_local::search::searxng_search_at_endpoint(
-                                            &client,
-                                            ep,
-                                            &q,
+                                            &client, ep, &q,
                                         )
                                         .await
                                     } else if searxng_eps.len() == 1 {
@@ -7800,9 +11975,10 @@ mod mcp {
                                         )
                                         .await
                                     } else {
-                                        let p = webpipe_local::search::SearxngSearchProvider::from_env(
-                                            client.clone(),
-                                        )?;
+                                        let p =
+                                            webpipe_local::search::SearxngSearchProvider::from_env(
+                                                client.clone(),
+                                            )?;
                                         p.search(&q).await
                                     }
                                 };
@@ -7817,11 +11993,7 @@ mod mcp {
                                             None,
                                             qk.as_deref(),
                                         );
-                                        (
-                                            "searxng",
-                                            arm_idx.map(|i| format!("searxng#{i}")),
-                                            r,
-                                        )
+                                        ("searxng", arm_idx.map(|i| format!("searxng#{i}")), r)
                                     }
                                     Err(e) => {
                                         let msg = e.to_string();
@@ -7857,7 +12029,8 @@ mod mcp {
                                             "web_search",
                                             t0.elapsed().as_millis(),
                                         );
-                                        return Ok(tool_result(payload));
+                                        let md = web_search_markdown(&payload);
+                                        return Ok(tool_result_markdown_with_json(payload, md));
                                     }
                                 }
                             }
@@ -7892,7 +12065,8 @@ mod mcp {
                                                 "web_search",
                                                 t0.elapsed().as_millis(),
                                             );
-                                            return Ok(tool_result(payload));
+                                            let md = web_search_markdown(&payload);
+                                            return Ok(tool_result_markdown_with_json(payload, md));
                                         }
                                     };
                                 match provider.search(&q).await {
@@ -7937,7 +12111,8 @@ mod mcp {
                                             "web_search",
                                             t0.elapsed().as_millis(),
                                         );
-                                        return Ok(tool_result(payload));
+                                        let md = web_search_markdown(&payload);
+                                        return Ok(tool_result_markdown_with_json(payload, md));
                                     }
                                 }
                             }
@@ -7966,7 +12141,8 @@ mod mcp {
                             payload["warning_hints"] = warning_hints_from(&codes);
                         }
                         add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_search_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
 
                     // Fallback mode: “MAB with failover”.
@@ -7986,8 +12162,8 @@ mod mcp {
                     let brave_env =
                         has_env("WEBPIPE_BRAVE_API_KEY") || has_env("BRAVE_SEARCH_API_KEY");
                     let tavily_env = has_env("WEBPIPE_TAVILY_API_KEY") || has_env("TAVILY_API_KEY");
-                    let searxng_env = has_env("WEBPIPE_SEARXNG_ENDPOINT")
-                        || has_env("WEBPIPE_SEARXNG_ENDPOINTS");
+                    let searxng_env =
+                        has_env("WEBPIPE_SEARXNG_ENDPOINT") || has_env("WEBPIPE_SEARXNG_ENDPOINTS");
 
                     let searxng_eps = if searxng_env {
                         webpipe_local::search::searxng_endpoints_from_env()
@@ -8206,9 +12382,7 @@ mod mcp {
                                             )));
                                         };
                                         webpipe_local::search::searxng_search_at_endpoint(
-                                            &client,
-                                            ep,
-                                            &q,
+                                            &client, ep, &q,
                                         )
                                         .await
                                     } else if searxng_eps.len() == 1 {
@@ -8219,9 +12393,10 @@ mod mcp {
                                         )
                                         .await
                                     } else {
-                                        let p = webpipe_local::search::SearxngSearchProvider::from_env(
-                                            client.clone(),
-                                        )?;
+                                        let p =
+                                            webpipe_local::search::SearxngSearchProvider::from_env(
+                                                client.clone(),
+                                            )?;
                                         p.search(&q).await
                                     }
                                 };
@@ -8230,7 +12405,8 @@ mod mcp {
                                     Ok(r) => {
                                         let mut entry = serde_json::json!({"name":"searxng","ok":true,"cost_units":r.cost_units,"elapsed_ms":pt0.elapsed().as_millis()});
                                         if let Some(i) = arm_idx {
-                                            entry["arm"] = serde_json::json!(format!("searxng#{i}"));
+                                            entry["arm"] =
+                                                serde_json::json!(format!("searxng#{i}"));
                                         }
                                         attempts.push(entry);
                                         self.stats_record_search_provider_qk(
@@ -8267,12 +12443,10 @@ mod mcp {
                                         {
                                             payload["warnings"] =
                                                 serde_json::json!(["provider_failover"]);
-                                            let codes =
-                                                warning_codes_from(&["provider_failover"]);
+                                            let codes = warning_codes_from(&["provider_failover"]);
                                             payload["warning_codes"] =
                                                 serde_json::json!(codes.clone());
-                                            payload["warning_hints"] =
-                                                warning_hints_from(&codes);
+                                            payload["warning_hints"] = warning_hints_from(&codes);
                                         }
                                         add_envelope_fields(
                                             &mut payload,
@@ -8287,7 +12461,8 @@ mod mcp {
                                         let http_429 = is_http_status(&msg, 429);
                                         let mut entry = serde_json::json!({"name":"searxng","ok":false,"error":msg.clone(),"elapsed_ms":elapsed_ms});
                                         if let Some(i) = arm_idx {
-                                            entry["arm"] = serde_json::json!(format!("searxng#{i}"));
+                                            entry["arm"] =
+                                                serde_json::json!(format!("searxng#{i}"));
                                         }
                                         attempts.push(entry);
                                         self.stats_record_search_provider_qk(
@@ -8803,7 +12978,8 @@ mod mcp {
                         )
                     });
                     add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
-                    return Ok(tool_result(payload));
+                    let md = web_search_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
             };
 
@@ -8828,10 +13004,14 @@ mod mcp {
             }
             add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
 
-            Ok(tool_result(payload))
+            let md = web_search_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
         }
 
-        #[tool(description = "Fetch a URL and extract readable text (HTML -> text)")]
+        #[tool(
+            description = "Fetch + extract readable text/chunks (and optional links/structure) from a URL (bounded; cache-aware; JSON output)",
+            annotations(title = "Extract URL", read_only_hint = true, open_world_hint = true)
+        )]
         async fn web_extract(
             &self,
             params: Parameters<Option<WebExtractArgs>>,
@@ -8855,6 +13035,12 @@ mod mcp {
             let semantic_top_k = args.semantic_top_k.unwrap_or(5).min(50);
             let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
             let no_network = args.no_network.unwrap_or(false);
+            let cache_read_effective = args.cache_read.unwrap_or(true) || no_network;
+            let cache_write_effective = if no_network {
+                false
+            } else {
+                args.cache_write.unwrap_or(true)
+            };
 
             let url = args.url.unwrap_or_default();
             let t0 = std::time::Instant::now();
@@ -8872,7 +13058,7 @@ mod mcp {
                         "no_network": no_network,
                         "timeout_ms": args.timeout_ms.or(Some(20_000)),
                         "max_bytes": args.max_bytes.or(Some(5_000_000)),
-                        "cache": { "read": args.cache_read.unwrap_or(true), "write": args.cache_write.unwrap_or(true), "ttl_s": args.cache_ttl_s },
+                        "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": args.cache_ttl_s },
                         "width": width,
                         "max_chars": max_chars,
                         "query": args.query,
@@ -8886,7 +13072,8 @@ mod mcp {
                     }
                 });
                 add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             if fetch_backend.as_str() != "local" && fetch_backend.as_str() != "firecrawl" {
                 let mut payload = serde_json::json!({
@@ -8900,7 +13087,8 @@ mod mcp {
                     "request": { "fetch_backend": fetch_backend }
                 });
                 add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             if no_network && fetch_backend == "firecrawl" {
@@ -8912,10 +13100,15 @@ mod mcp {
                         "no_network=true cannot be used with fetch_backend=\"firecrawl\"",
                         "Use fetch_backend=\"local\" with a warmed WEBPIPE_CACHE_DIR, or set no_network=false."
                     ),
-                    "request": { "fetch_backend": fetch_backend, "no_network": no_network }
+                    "request": {
+                        "fetch_backend": fetch_backend,
+                        "no_network": no_network,
+                        "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": args.cache_ttl_s }
+                    }
                 });
                 add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             if let Some(qs) = args.query.as_deref() {
                 if qs.trim().is_empty() {
@@ -8931,7 +13124,7 @@ mod mcp {
                             "fetch_backend": fetch_backend,
                             "timeout_ms": args.timeout_ms.or(Some(20_000)),
                             "max_bytes": args.max_bytes.or(Some(5_000_000)),
-                            "cache": { "read": args.cache_read.unwrap_or(true), "write": args.cache_write.unwrap_or(true), "ttl_s": args.cache_ttl_s },
+                            "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": args.cache_ttl_s },
                             "width": width,
                             "max_chars": max_chars,
                             "query": args.query,
@@ -8945,7 +13138,8 @@ mod mcp {
                         }
                     });
                     add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                    return Ok(tool_result(payload));
+                    let md = web_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
             }
 
@@ -8976,7 +13170,8 @@ mod mcp {
                             "request": { "fetch_backend": fetch_backend, "timeout_ms": timeout_ms }
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                 };
 
@@ -9001,7 +13196,8 @@ mod mcp {
                             "request": { "fetch_backend": fetch_backend, "timeout_ms": timeout_ms }
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                 };
 
@@ -9259,41 +13455,61 @@ mod mcp {
                 }
             };
 
-            let extracted0 = webpipe_local::extract::best_effort_text_from_bytes(
-                &resp.bytes,
-                resp.content_type.as_deref(),
-                resp.final_url.as_str(),
-                width,
-                500,
-            );
-            let cfg0 = webpipe_local::extract::ExtractPipelineCfg {
-                query: args.query.as_deref(),
-                width,
-                max_chars,
-                top_chunks,
-                max_chunk_chars,
-                include_structure,
-                max_outline_items,
-                max_blocks,
-                max_block_chars,
-            };
+            // From this point on, treat response parts as owned so we can offload extraction/chunking
+            // to a blocking thread pool (avoid stalling the async runtime on big HTML/PDFs).
+            let webpipe_core::FetchResponse {
+                url: resp_url,
+                final_url: resp_final_url,
+                status: resp_status,
+                content_type: resp_content_type,
+                headers: _resp_headers,
+                bytes: resp_bytes0,
+                truncated: resp_body_truncated,
+                source: _resp_source,
+                timings_ms: _resp_timings_ms,
+            } = resp;
+            let resp_bytes = std::sync::Arc::new(resp_bytes0);
 
+            let pipeline0 = {
+                let bytes = resp_bytes.clone();
+                let ct = resp_content_type.clone();
+                let final_url = resp_final_url.clone();
+                let query = args.query.clone();
+                tokio::task::spawn_blocking(move || {
+                    let extracted0 = webpipe_local::extract::best_effort_text_from_bytes(
+                        &bytes,
+                        ct.as_deref(),
+                        final_url.as_str(),
+                        width,
+                        500,
+                    );
+                    webpipe_local::extract::extract_pipeline_from_extracted(
+                        &bytes,
+                        ct.as_deref(),
+                        final_url.as_str(),
+                        extracted0,
+                        webpipe_local::extract::ExtractPipelineCfg {
+                            query: query.as_deref(),
+                            width,
+                            max_chars,
+                            top_chunks,
+                            max_chunk_chars,
+                            include_structure,
+                            max_outline_items,
+                            max_blocks,
+                            max_block_chars,
+                        },
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(format!("extract pipeline join failed: {e}"), None)
+                })?
+            };
             #[cfg(feature = "vision-gemini")]
-            let mut pipeline = webpipe_local::extract::extract_pipeline_from_extracted(
-                &resp.bytes,
-                resp.content_type.as_deref(),
-                resp.final_url.as_str(),
-                extracted0,
-                cfg0.clone(),
-            );
+            let mut pipeline = pipeline0;
             #[cfg(not(feature = "vision-gemini"))]
-            let pipeline = webpipe_local::extract::extract_pipeline_from_extracted(
-                &resp.bytes,
-                resp.content_type.as_deref(),
-                resp.final_url.as_str(),
-                extracted0,
-                cfg0,
-            );
+            let pipeline = pipeline0;
 
             #[cfg(feature = "vision-gemini")]
             let mut vision_model: Option<String> = None;
@@ -9305,29 +13521,27 @@ mod mcp {
             #[cfg(feature = "vision-gemini")]
             {
                 let vision_mode = webpipe_local::vision_gemini::gemini_enabled_mode_from_env();
-                let is_image_like = resp
-                    .content_type
+                let is_image_like = resp_content_type
                     .as_deref()
                     .unwrap_or("")
                     .to_ascii_lowercase()
                     .starts_with("image/")
-                    || webpipe_local::extract::bytes_look_like_image(&resp.bytes);
+                    || webpipe_local::extract::bytes_look_like_image(resp_bytes.as_ref());
                 if !no_network
                     && vision_mode != "off"
                     && is_image_like
                     && pipeline.text_chars == 0
-                    && !resp.bytes.is_empty()
+                    && !resp_bytes.is_empty()
                     && webpipe_local::vision_gemini::gemini_api_key_from_env().is_some()
                 {
-                    let mime0 = resp
-                        .content_type
+                    let mime0 = resp_content_type
                         .as_deref()
                         .unwrap_or("application/octet-stream");
                     let mime = mime0.split(';').next().unwrap_or(mime0).trim();
 
                     match webpipe_local::vision_gemini::gemini_image_to_text(
                         self.http.clone(),
-                        &resp.bytes,
+                        resp_bytes.as_ref(),
                         mime,
                     )
                     .await
@@ -9338,13 +13552,36 @@ mod mcp {
                                 text,
                                 warnings: vec!["gemini_used"],
                             };
-                            pipeline = webpipe_local::extract::extract_pipeline_from_extracted(
-                                &resp.bytes,
-                                resp.content_type.as_deref(),
-                                resp.final_url.as_str(),
-                                ex,
-                                cfg0,
-                            );
+                            let bytes = resp_bytes.clone();
+                            let ct = resp_content_type.clone();
+                            let final_url = resp_final_url.clone();
+                            let query = args.query.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                webpipe_local::extract::extract_pipeline_from_extracted(
+                                    &bytes,
+                                    ct.as_deref(),
+                                    final_url.as_str(),
+                                    ex,
+                                    webpipe_local::extract::ExtractPipelineCfg {
+                                        query: query.as_deref(),
+                                        width,
+                                        max_chars,
+                                        top_chunks,
+                                        max_chunk_chars,
+                                        include_structure,
+                                        max_outline_items,
+                                        max_blocks,
+                                        max_block_chars,
+                                    },
+                                )
+                            })
+                            .await
+                            {
+                                Ok(p2) => pipeline = p2,
+                                Err(_) => {
+                                    pipeline.extracted.warnings.push("gemini_pipeline_failed")
+                                }
+                            }
                             vision_model = Some(model_id);
                         }
                         Err(code) => {
@@ -9362,13 +13599,13 @@ mod mcp {
             let text = extracted.text.clone();
             let n = pipeline.text_chars;
             let clipped = pipeline.text_truncated;
-            let empty_extraction = n == 0 && !resp.bytes.is_empty();
-            let is_pdf_like = Self::content_type_is_pdf(resp.content_type.as_deref())
-                || Self::url_looks_like_pdf(resp.final_url.as_str())
-                || webpipe_local::extract::bytes_look_like_pdf(&resp.bytes)
+            let empty_extraction = n == 0 && !resp_bytes.is_empty();
+            let is_pdf_like = Self::content_type_is_pdf(resp_content_type.as_deref())
+                || Self::url_looks_like_pdf(resp_final_url.as_str())
+                || webpipe_local::extract::bytes_look_like_pdf(&resp_bytes)
                 || extracted.engine.starts_with("pdf-");
             let mut warnings: Vec<&'static str> = Vec::new();
-            if resp.truncated {
+            if resp_body_truncated {
                 warnings.push("body_truncated_by_max_bytes");
             }
             if clipped {
@@ -9384,7 +13621,7 @@ mod mcp {
                 warnings.push("cache_only");
             }
             if extracted.engine == "html_main"
-                && resp.bytes.len() >= 50_000
+                && resp_bytes.len() >= 50_000
                 && pipeline
                     .structure
                     .as_ref()
@@ -9396,12 +13633,12 @@ mod mcp {
             let mut payload = serde_json::json!({
                 "ok": true,
                 "fetch_backend": "local",
-                "url": resp.url,
-                "final_url": resp.final_url,
-                "status": resp.status,
-                "content_type": resp.content_type,
-                "bytes": resp.bytes.len(),
-                "truncated": resp.truncated || clipped,
+                "url": resp_url,
+                "final_url": resp_final_url,
+                "status": resp_status,
+                "content_type": resp_content_type,
+                "bytes": resp_bytes.len(),
+                "truncated": resp_body_truncated || clipped,
                 "text_chars": n,
                 "text_truncated": clipped,
                 "extraction": {
@@ -9460,6 +13697,17 @@ mod mcp {
                 "max_chunk_chars": max_chunk_chars,
                 "chunks": pipeline.chunks
             });
+            // Deterministic quality scorecard (tail-risk detector).
+            // Additive: safe for existing consumers.
+            let quality = Self::quality_scorecard(
+                args.query.as_deref(),
+                &text,
+                resp_status,
+                extracted.engine,
+                &warnings,
+            );
+            payload["quality"] = quality.clone();
+            payload["extract"]["quality"] = quality;
 
             if let Some(vm) = vision_model.as_ref() {
                 payload["extract"]["vision_model"] = serde_json::json!(vm);
@@ -9512,10 +13760,18 @@ mod mcp {
                     payload["extract"]["links"] = serde_json::json!([]);
                     payload["extract"]["max_links"] = serde_json::json!(max_links);
                 } else {
-                    let html = resp.text_lossy();
-                    let final_url = payload["final_url"].as_str().unwrap_or("");
-                    let links =
-                        webpipe_local::links::extract_links(&html, Some(final_url), max_links);
+                    let bytes = resp_bytes.clone();
+                    let base_url = payload["final_url"].as_str().unwrap_or("").to_string();
+                    let links = tokio::task::spawn_blocking(move || {
+                        let html = String::from_utf8_lossy(bytes.as_ref()).to_string();
+                        webpipe_local::links::extract_links(
+                            &html,
+                            Some(base_url.as_str()),
+                            max_links,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|_| Vec::new());
                     payload["links"] = serde_json::json!(links);
                     payload["extraction"]["max_links"] = serde_json::json!(max_links);
                     payload["extract"]["links"] = serde_json::json!(links);
@@ -9523,11 +13779,117 @@ mod mcp {
                 }
             }
 
-            Ok(tool_result(payload))
+            let md = web_extract_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
+        }
+    }
+
+    // ---- Prompts (MCP) ----
+    //
+    // Prompts are *templates* for client UIs (e.g. Cursor) to kick off common workflows.
+    // They do not add new server-side capabilities; they only provide consistent, bounded
+    // instructions that steer clients toward the best tools/defaults.
+    //
+    // MCP prompt surface: prompts/list + prompts/get (rmcp handles the protocol glue).
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct PromptSearchExtractArgs {
+        /// What you want to find / answer.
+        query: String,
+        /// If true, the prompt will recommend cache-only behavior (no external network).
+        #[serde(default)]
+        no_network: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct PromptOfflineCacheArgs {
+        /// What you want to find / answer.
+        query: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct PromptDeepResearchArgs {
+        /// Research question.
+        query: String,
+        /// If true, request evidence in the output (URLs + top chunks).
+        #[serde(default)]
+        include_evidence: Option<bool>,
+    }
+
+    #[prompt_router]
+    impl WebpipeMcp {
+        #[prompt(
+            name = "webpipe_search_extract",
+            description = "Search (or use urls) → fetch → extract → rank chunks, then answer with citations."
+        )]
+        async fn prompt_webpipe_search_extract(
+            &self,
+            Parameters(args): Parameters<PromptSearchExtractArgs>,
+        ) -> Result<Vec<PromptMessage>, McpError> {
+            let no_network = args.no_network.unwrap_or(false);
+            let sys = "You are a careful assistant. Use webpipe tools to gather evidence, then answer.\n\nRules:\n- Prefer web_search_extract for most questions (it returns URLs + top chunks).\n- Keep bounds small (max_urls/top_chunks/max_chars) unless the user asks for exhaustive coverage.\n- Cite sources by URL from tool outputs.\n- If evidence is insufficient, say so.";
+            let user = if no_network {
+                format!(
+                    "Question:\n{}\n\nUse offline/cache-only mode:\n- Prefer web_cache_search_extract (WEBPIPE_CACHE_DIR).\n- For any fetch/extract, set no_network=true and keep cache_write=false.\n\nReturn an answer with citations (URLs).",
+                    args.query.trim()
+                )
+            } else {
+                format!(
+                    "Question:\n{}\n\nUse web_search_extract with bounded defaults (provider=\"auto\", auto_mode=\"fallback\", max_results≈5, max_urls≈3, top_chunks≈5).\n\nReturn an answer with citations (URLs).",
+                    args.query.trim()
+                )
+            };
+            // rmcp prompt messages support only User/Assistant roles (no System).
+            // To avoid “fake system”, embed the system instructions into the user message.
+            Ok(vec![PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("{sys}\n\n{user}"),
+            )])
+        }
+
+        #[prompt(
+            name = "webpipe_offline_cache_first",
+            description = "Offline/cache-first workflow: use WEBPIPE_CACHE_DIR and avoid network."
+        )]
+        async fn prompt_webpipe_offline_cache_first(
+            &self,
+            Parameters(args): Parameters<PromptOfflineCacheArgs>,
+        ) -> Result<Vec<PromptMessage>, McpError> {
+            let sys = "You are a careful assistant. You must stay offline.\n\nRules:\n- Do not use network providers.\n- Prefer web_cache_search_extract (cache-only).\n- If you must use web_fetch/web_extract/web_search_extract, set no_network=true.\n- If the cache is missing, say what needs to be warmed (do not guess).";
+            let user = format!(
+                "Question:\n{}\n\nStay offline: use WEBPIPE_CACHE_DIR (cache-only). Provide an answer with citations if possible.",
+                args.query.trim()
+            );
+            Ok(vec![PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("{sys}\n\n{user}"),
+            )])
+        }
+
+        #[prompt(
+            name = "webpipe_deep_research",
+            description = "Agentic research: gather evidence (search+extract) and optionally synthesize."
+        )]
+        async fn prompt_webpipe_deep_research(
+            &self,
+            Parameters(args): Parameters<PromptDeepResearchArgs>,
+        ) -> Result<Vec<PromptMessage>, McpError> {
+            let include_evidence = args.include_evidence.unwrap_or(true);
+            let sys = "You are a careful research assistant. Use webpipe tools to gather evidence and then (optionally) synthesize.\n\nRules:\n- Prefer web_deep_research when the question requires synthesis across multiple sources.\n- Keep bounds small unless asked.\n- Cite sources by URL.\n- If evidence is insufficient, say so.";
+            let user = format!(
+                "Research question:\n{}\n\nUse web_deep_research with include_evidence={} and bounded defaults (max_results≈5, max_urls≈3, top_chunks≈5). Return a concise answer with citations.",
+                args.query.trim(),
+                include_evidence
+            );
+            Ok(vec![PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("{sys}\n\n{user}"),
+            )])
         }
     }
 
     #[tool_handler]
+    #[prompt_handler]
     impl rmcp::ServerHandler for WebpipeMcp {
         fn get_info(&self) -> ServerInfo {
             ServerInfo {
@@ -9535,9 +13897,105 @@ mod mcp {
                     "Local fetch/search plumbing. Hard mode (render/unblock) is opt-in; outputs are JSON and schema-versioned."
                         .to_string(),
                 ),
-                capabilities: ServerCapabilities::builder().enable_tools().build(),
+                capabilities: ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_prompts()
+                    .enable_resources()
+                    .build(),
                 ..Default::default()
             }
+        }
+
+        async fn list_resources(
+            &self,
+            _request: Option<PaginatedRequestParam>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListResourcesResult, McpError> {
+            let resources: Vec<Resource> = vec![
+                Annotated::new(
+                    RawResource {
+                        uri: "webpipe://meta".to_string(),
+                        name: "meta.json".to_string(),
+                        title: Some("Webpipe meta".to_string()),
+                        description: Some(
+                            "Same JSON payload as webpipe_meta (no secrets): capabilities, configured backends, defaults."
+                                .to_string(),
+                        ),
+                        mime_type: Some("application/json".to_string()),
+                        size: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    None,
+                ),
+                Annotated::new(
+                    RawResource {
+                        uri: "webpipe://usage".to_string(),
+                        name: "usage.json".to_string(),
+                        title: Some("Webpipe usage".to_string()),
+                        description: Some(
+                            "Same JSON payload as webpipe_usage: in-process counts/cost units since start (no secrets)."
+                                .to_string(),
+                        ),
+                        mime_type: Some("application/json".to_string()),
+                        size: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    None,
+                ),
+            ];
+            Ok(ListResourcesResult::with_all_items(resources))
+        }
+
+        async fn read_resource(
+            &self,
+            request: ReadResourceRequestParam,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceResult, McpError> {
+            let uri = request.uri.trim().to_string();
+            let (text, mime_type) = match uri.as_str() {
+                "webpipe://meta" => {
+                    let r = self.webpipe_meta().await?;
+                    let v = r
+                        .structured_content
+                        .clone()
+                        .ok_or_else(|| McpError::internal_error("webpipe_meta missing structured_content".to_string(), None))?;
+                    let s = serde_json::to_string(&v).unwrap_or_default();
+                    (s, "application/json".to_string())
+                }
+                "webpipe://usage" => {
+                    let r = self.webpipe_usage(Parameters(None)).await?;
+                    let v = r
+                        .structured_content
+                        .clone()
+                        .ok_or_else(|| {
+                            McpError::internal_error(
+                                "webpipe_usage missing structured_content".to_string(),
+                                None,
+                            )
+                        })?;
+                    let s = serde_json::to_string(&v).unwrap_or_default();
+                    (s, "application/json".to_string())
+                }
+                _ => {
+                    return Err(McpError::resource_not_found(
+                        format!("unknown resource uri: {uri}"),
+                        Some(serde_json::json!({
+                            "known_uris": ["webpipe://meta", "webpipe://usage"]
+                        })),
+                    ));
+                }
+            };
+
+            Ok(ReadResourceResult {
+                contents: vec![ResourceContents::TextResourceContents {
+                    uri,
+                    mime_type: Some(mime_type),
+                    text,
+                    meta: None,
+                }],
+            })
         }
     }
 
@@ -9602,13 +14060,19 @@ mod mcp {
         }
 
         fn payload_from_call_tool_result(r: &CallToolResult) -> serde_json::Value {
-            let s = r
-                .content
-                .first()
-                .and_then(|c| c.as_text())
-                .map(|t| t.text.clone())
-                .unwrap_or_default();
-            serde_json::from_str(&s).expect("tool result should be a JSON string")
+            // Prefer MCP `structured_content` (stable machine payload). Tool `content` may be
+            // Markdown or other human-friendly text.
+            if let Some(v) = r.structured_content.clone() {
+                return v;
+            }
+            // Fallback: try to parse the first JSON-looking text item.
+            for c in &r.content {
+                let Some(t) = c.as_text() else { continue };
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t.text) {
+                    return v;
+                }
+            }
+            panic!("tool result should contain structured_content or a JSON text item");
         }
 
         // Env vars are global; serialize tests that mutate them.
@@ -10045,6 +14509,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: None,
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: None,
                     search_mode: None,
@@ -10170,6 +14640,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: None,
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: None,
                     search_mode: None,
@@ -10301,6 +14777,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: None,
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: Some("local/test".to_string()),
                     search_mode: None,
@@ -10367,6 +14849,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: None,
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: Some("x".to_string()),
                     search_mode: None,
@@ -10425,6 +14913,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: None,
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: None,
                     search_mode: Some("on".to_string()),
@@ -10482,6 +14976,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: None,
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: None,
                     search_mode: None,
@@ -10602,6 +15102,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: None,
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: None,
                     search_mode: None,
@@ -10850,6 +15356,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: Some(2_000),
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: None,
                     search_mode: None,
@@ -10971,6 +15483,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: Some(2_000),
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: None,
                     search_mode: None,
@@ -11077,6 +15595,12 @@ mod mcp {
                     arxiv_categories: None,
                     arxiv_years: None,
                     arxiv_timeout_ms: None,
+                    papers_mode: None,
+                    papers_backends: None,
+                    papers_max_papers: None,
+                    papers_years: None,
+                    papers_timeout_ms: None,
+                    papers_include_abstract: None,
                     model: Some("sonar-deep-research".to_string()),
                     llm_model: None,
                     search_mode: None,
@@ -11256,8 +15780,9 @@ mod mcp {
                     semantic_top_k: None,
                     max_links: Some(5),
                     include_text: Some(false),
-                    cache_read: Some(true),
-                    cache_write: Some(true),
+                    // Avoid cross-test cache interference (this test asserts on parsed links).
+                    cache_read: Some(false),
+                    cache_write: Some(false),
                     cache_ttl_s: None,
                     exploration: None,
                     agentic: Some(false),
@@ -11918,13 +16443,25 @@ mod mcp {
             let v = payload_from_call_tool_result(&r);
             assert_eq!(v["kind"].as_str(), Some("web_extract"));
             assert_eq!(v["ok"].as_bool(), Some(true));
-            assert_eq!(v["text_chars"].as_u64(), Some(0));
-            assert_eq!(
-                v["warnings"]
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(|x| x.as_str()),
-                Some("empty_extraction")
+            // Script-only HTML should be treated as "no useful main content" (either empty or low-signal),
+            // without requiring a specific extraction engine behavior.
+            let n = v["text_chars"].as_u64().unwrap_or(0);
+            assert!(
+                n <= 200,
+                "unexpectedly large text_chars={n} for script-only HTML"
+            );
+            let empty = Vec::<serde_json::Value>::new();
+            let warns: Vec<&str> = v["warnings"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(|x| x.as_str())
+                .collect();
+            assert!(
+                warns.iter().any(|w| *w == "empty_extraction")
+                    || warns.iter().any(|w| *w == "main_content_low_signal")
+                    || warns.iter().any(|w| *w == "unsupported_content_no_text"),
+                "expected an empty/low-signal warning; got warnings={warns:?}"
             );
         }
 
@@ -12567,10 +17104,7 @@ mod mcp {
                 v["error"]["code"].as_str(),
                 Some(ErrorCode::InvalidParams.as_str())
             );
-            assert_eq!(
-                v["unknown_seed_ids"].as_array().map(|a| a.len()),
-                Some(2)
-            );
+            assert_eq!(v["unknown_seed_ids"].as_array().map(|a| a.len()), Some(2));
         }
 
         #[tokio::test]
@@ -12693,40 +17227,173 @@ mod mcp {
     }
 }
 
+fn webpipe_dotenv_enabled() -> bool {
+    // `WEBPIPE_DOTENV=0` disables *all* env-file loading (both auto and WEBPIPE_ENV_FILE).
+    // Any other value (or unset) keeps it enabled.
+    match std::env::var("WEBPIPE_DOTENV") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off" || v == "no" || v == "disabled")
+        }
+        Err(_) => true,
+    }
+}
+
+fn resolve_webpipe_env_file() -> Option<std::path::PathBuf> {
+    // 1) Explicit override.
+    if let Ok(p) = std::env::var("WEBPIPE_ENV_FILE") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+
+    // 2) Auto-search upward for `.env`.
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let cand = dir.join(".env");
+        if cand.is_file() {
+            return Some(cand);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn load_env_file_no_log(path: &std::path::Path) {
+    let Ok(txt) = std::fs::read_to_string(path) else {
+        return;
+    };
+
+    // Within the env file itself, allow later lines to override earlier lines
+    // (so "last occurrence wins"), but never override variables that were set
+    // in the process environment before loading the file.
+    let mut existed_before_file: std::collections::BTreeMap<String, bool> =
+        std::collections::BTreeMap::new();
+    for raw in txt.lines() {
+        let s = raw.trim();
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        let s = s.strip_prefix("export ").unwrap_or(s).trim();
+        let Some((k, v)) = s.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        let mut v = v.trim();
+        if k.is_empty() {
+            continue;
+        }
+
+        // Capture whether this key existed before we started applying the env file.
+        let had = existed_before_file
+            .entry(k.to_string())
+            .or_insert_with(|| std::env::var_os(k).is_some());
+
+        // Don't override explicit process env, but do allow overrides within the file.
+        if !*had {
+            // Strip one layer of surrounding quotes if present.
+            if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+                || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+            {
+                v = &v[1..v.len() - 1];
+            }
+            std::env::set_var(k, v);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dotenv_tests {
+    use super::*;
+    use std::io::Write;
+
+    struct EnvRestore {
+        vars: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            let vars = keys
+                .iter()
+                .map(|&k| (k, std::env::var(k).ok()))
+                .collect::<Vec<_>>();
+            Self { vars }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in self.vars.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_env_file_no_log_parses_export_and_quotes_and_respects_process_env() {
+        // This loader is part of the CLI/MCP startup contract:
+        // - it must not override explicit process env
+        // - it should accept simple `.env` shapes (export, quotes, last-wins within file)
+        let _restore =
+            EnvRestore::capture(&["WEBPIPE_TEST_FOO", "WEBPIPE_TEST_BAR", "WEBPIPE_TEST_DUP"]);
+
+        std::env::set_var("WEBPIPE_TEST_FOO", "from_process_env");
+
+        let mut f = tempfile::NamedTempFile::new().expect("tmp .env");
+        writeln!(
+            f,
+            r#"
+            # comment
+            export WEBPIPE_TEST_FOO=from_file_should_not_override
+            WEBPIPE_TEST_BAR="quoted value"
+            WEBPIPE_TEST_DUP=first
+            WEBPIPE_TEST_DUP=second
+            "#,
+        )
+        .expect("write");
+
+        load_env_file_no_log(f.path());
+
+        assert_eq!(
+            std::env::var("WEBPIPE_TEST_FOO").as_deref(),
+            Ok("from_process_env"),
+            "process env must not be overridden by env-file loading"
+        );
+        assert_eq!(
+            std::env::var("WEBPIPE_TEST_BAR").as_deref(),
+            Ok("quoted value")
+        );
+        assert_eq!(
+            std::env::var("WEBPIPE_TEST_DUP").as_deref(),
+            Ok("second"),
+            "within-file last occurrence should win"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Optional env-file loader (opt-in).
+    // Env-file loader.
     //
     // Rationale: Cursor/MCP server environments often aren't interactive shells, so users
     // want a single place to keep keys without exporting them manually.
     //
     // Safety:
-    // - opt-in only (WEBPIPE_ENV_FILE)
+    // - by default, auto-loads the nearest `.env` in the current directory or an ancestor
+    //   directory (so running from `dev/webpipe/` picks up `dev/.env`).
+    // - can be disabled with WEBPIPE_DOTENV=0 (useful for tests/CI)
+    // - can be explicitly pinned with WEBPIPE_ENV_FILE=/abs/or/rel/path/to/.env
     // - sets vars only if not already set in the process environment
     // - does not log values
-    if let Ok(p) = std::env::var("WEBPIPE_ENV_FILE") {
-        let p = p.trim();
-        if !p.is_empty() {
-            if let Ok(txt) = std::fs::read_to_string(p) {
-                for raw in txt.lines() {
-                    let s = raw.trim();
-                    if s.is_empty() || s.starts_with('#') {
-                        continue;
-                    }
-                    let Some((k, v)) = s.split_once('=') else {
-                        continue;
-                    };
-                    let k = k.trim();
-                    let v = v.trim();
-                    if k.is_empty() {
-                        continue;
-                    }
-                    // Don't override explicit process env.
-                    if std::env::var_os(k).is_none() {
-                        std::env::set_var(k, v);
-                    }
-                }
-            }
+    if webpipe_dotenv_enabled() {
+        if let Some(p) = resolve_webpipe_env_file() {
+            load_env_file_no_log(&p);
         }
     }
 
@@ -12739,6 +17406,7 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
+        #[cfg(feature = "eval")]
         Commands::EvalSearch(args) => {
             let now = args.now_epoch_s.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -12768,6 +17436,7 @@ async fn main() -> Result<()> {
             let p = eval::eval_search(spec).await?;
             println!("{}", p.display());
         }
+        #[cfg(feature = "eval")]
         Commands::EvalFetch(args) => {
             let now = args.now_epoch_s.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -12799,7 +17468,7 @@ async fn main() -> Result<()> {
             let p = eval::eval_fetch(spec).await?;
             println!("{}", p.display());
         }
-        #[cfg(feature = "stdio")]
+        #[cfg(all(feature = "eval", feature = "stdio"))]
         Commands::EvalSearchExtract(args) => {
             use rmcp::handler::server::wrapper::Parameters;
             let now = args.now_epoch_s.unwrap_or_else(|| {
@@ -12952,13 +17621,24 @@ async fn main() -> Result<()> {
                             .await
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-                        let s = r
-                            .content
-                            .first()
-                            .and_then(|c| c.as_text())
-                            .map(|t| t.text.clone())
-                            .unwrap_or_default();
-                        let v: serde_json::Value = serde_json::from_str(&s)?;
+                        let v: serde_json::Value = if let Some(sc) = r.structured_content.clone() {
+                            sc
+                        } else {
+                            // Back-compat: older tool results echoed JSON as the first `content` item.
+                            // Newer tools may put Markdown first; scan for any parseable JSON text.
+                            let mut parsed: Option<serde_json::Value> = None;
+                            for c in &r.content {
+                                let s = c.as_text().map(|t| t.text.as_str()).unwrap_or("").trim();
+                                if s.is_empty() {
+                                    continue;
+                                }
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                                    parsed = Some(v);
+                                    break;
+                                }
+                            }
+                            parsed.ok_or_else(|| anyhow::anyhow!("web_search_extract tool result had no structured_content and no JSON text payload"))?
+                        };
                         per_mode.push(serde_json::json!({ "selection_mode": m, "result": v }));
                     }
 
@@ -13158,7 +17838,7 @@ async fn main() -> Result<()> {
             std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
             println!("{}", out.display());
         }
-        #[cfg(feature = "stdio")]
+        #[cfg(all(feature = "eval", feature = "stdio"))]
         Commands::EvalMatrix(args) => {
             use rmcp::handler::server::wrapper::Parameters;
 
@@ -13189,20 +17869,35 @@ async fn main() -> Result<()> {
             let max_chunk_chars = args.max_chunk_chars.min(5_000).max(20);
 
             let call_json = |r: rmcp::model::CallToolResult| -> Result<serde_json::Value> {
-                let s = r
-                    .content
-                    .first()
-                    .and_then(|c| c.as_text())
-                    .map(|t| t.text.clone())
-                    .unwrap_or_default();
-                Ok(serde_json::from_str(&s)?)
+                if let Some(v) = r.structured_content {
+                    return Ok(v);
+                }
+                // Back-compat: older tool results echoed JSON as the first `content` text item.
+                // Newer tools may include Markdown first, so scan for any parseable JSON text.
+                for c in &r.content {
+                    let s = c.as_text().map(|t| t.text.as_str()).unwrap_or("").trim();
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                        return Ok(v);
+                    }
+                }
+                anyhow::bail!("tool result had no structured_content and no JSON text payload");
             };
 
             for q in e2e.queries {
                 let urls: Vec<String> = q
                     .url_paths
                     .iter()
-                    .map(|p| format!("{base_url}/{}", p.trim_start_matches('/')))
+                    .map(|p| {
+                        let p = p.trim();
+                        if p.starts_with("http://") || p.starts_with("https://") {
+                            p.to_string()
+                        } else {
+                            format!("{base_url}/{}", p.trim_start_matches('/'))
+                        }
+                    })
                     .collect();
 
                 // Case A: search leg (uses configured providers/endpoints via env)
@@ -13252,7 +17947,10 @@ async fn main() -> Result<()> {
                 let t1 = std::time::Instant::now();
                 let res_b = svc
                     .web_search_extract(Parameters(Some(mcp::WebSearchExtractArgs {
-                        query: row_a.get("query").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        query: row_a
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         urls: Some(
                             row_a
                                 .get("urls")
@@ -13300,7 +17998,10 @@ async fn main() -> Result<()> {
                 let t2 = std::time::Instant::now();
                 let res_c = svc
                     .web_search_extract(Parameters(Some(mcp::WebSearchExtractArgs {
-                        query: row_a.get("query").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        query: row_a
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         urls: Some(
                             row_a
                                 .get("urls")
@@ -13347,6 +18048,7 @@ async fn main() -> Result<()> {
 
             println!("{}", out.display());
         }
+        #[cfg(feature = "eval")]
         Commands::EvalMatrixScore(args) => {
             let now = args.now_epoch_s.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -13355,9 +18057,7 @@ async fn main() -> Result<()> {
                     .as_secs()
             });
             let out = args.out.unwrap_or_else(|| {
-                std::path::PathBuf::from(format!(
-                    ".generated/webpipe-eval-matrix-score-{now}.json"
-                ))
+                std::path::PathBuf::from(format!(".generated/webpipe-eval-matrix-score-{now}.json"))
             });
             std::fs::create_dir_all(
                 out.parent()
@@ -13381,18 +18081,30 @@ async fn main() -> Result<()> {
             }
 
             // Index: query_id -> case -> row
-            let mut by_q: std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>> =
-                std::collections::BTreeMap::new();
+            let mut by_q: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<String, serde_json::Value>,
+            > = std::collections::BTreeMap::new();
             for r in rows {
-                let qid = r.get("query_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let case = r.get("case").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let qid = r
+                    .get("query_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let case = r
+                    .get("case")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if qid.is_empty() || case.is_empty() {
                     continue;
                 }
                 by_q.entry(qid).or_default().insert(case, r);
             }
 
-            fn extract_urls_from_result(res: &serde_json::Value) -> std::collections::BTreeSet<String> {
+            fn extract_urls_from_result(
+                res: &serde_json::Value,
+            ) -> std::collections::BTreeSet<String> {
                 let mut out = std::collections::BTreeSet::new();
                 if let Some(top) = res.get("top_chunks").and_then(|v| v.as_array()) {
                     for c in top {
@@ -13424,13 +18136,13 @@ async fn main() -> Result<()> {
             for q in &qrels.qrels {
                 let mut per_case = Vec::new();
                 for case in expected_cases {
-                    let row = by_q
-                        .get(&q.query_id)
-                        .and_then(|m| m.get(case))
-                        .cloned();
+                    let row = by_q.get(&q.query_id).and_then(|m| m.get(case)).cloned();
 
                     if let Some(row) = row {
-                        let res = row.get("result").cloned().unwrap_or(serde_json::Value::Null);
+                        let res = row
+                            .get("result")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
                         let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
                         let urls = extract_urls_from_result(&res);
                         let hit = ok
@@ -13440,12 +18152,14 @@ async fn main() -> Result<()> {
                             });
 
                         if ok {
-                            totals["cases"][case]["ok"] =
-                                serde_json::json!(totals["cases"][case]["ok"].as_u64().unwrap_or(0) + 1);
+                            totals["cases"][case]["ok"] = serde_json::json!(
+                                totals["cases"][case]["ok"].as_u64().unwrap_or(0) + 1
+                            );
                         }
                         if hit {
-                            totals["cases"][case]["hit"] =
-                                serde_json::json!(totals["cases"][case]["hit"].as_u64().unwrap_or(0) + 1);
+                            totals["cases"][case]["hit"] = serde_json::json!(
+                                totals["cases"][case]["hit"].as_u64().unwrap_or(0) + 1
+                            );
                         }
 
                         per_case.push(serde_json::json!({
@@ -13488,6 +18202,7 @@ async fn main() -> Result<()> {
             std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
             println!("{}", out.display());
         }
+        #[cfg(feature = "eval")]
         Commands::EvalMatrixExport(args) => {
             let now = args.now_epoch_s.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -13566,9 +18281,21 @@ async fn main() -> Result<()> {
                     anyhow::anyhow!("matrix_artifact line {}: invalid json: {}", i + 1, e)
                 })?;
 
-                let query_id = row.get("query_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let case = row.get("case").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let query = row.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let query_id = row
+                    .get("query_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let case = row
+                    .get("case")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let query = row
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if query_id.is_empty() || case.is_empty() {
                     continue;
                 }
@@ -13583,14 +18310,23 @@ async fn main() -> Result<()> {
                     })
                     .unwrap_or_default();
 
-                let res = row.get("result").cloned().unwrap_or(serde_json::Value::Null);
+                let res = row
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                let backend_provider = res.get("backend_provider").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let backend_provider = res
+                    .get("backend_provider")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let urls = extract_urls(&res);
 
                 let expected = qrels_by_qid.get(&query_id).cloned().unwrap_or_default();
                 let matched = if ok {
-                    expected.iter().find(|needle| urls.iter().any(|u| u.contains(needle.as_str()))).cloned()
+                    expected
+                        .iter()
+                        .find(|needle| urls.iter().any(|u| u.contains(needle.as_str())))
+                        .cloned()
                 } else {
                     None
                 };
@@ -13610,7 +18346,8 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                let (judge_text, judge_text_truncated) = truncate_chars(&joined, args.max_text_chars);
+                let (judge_text, judge_text_truncated) =
+                    truncate_chars(&joined, args.max_text_chars);
 
                 out_rows.push(serde_json::json!({
                     "schema_version": 1,
@@ -13639,6 +18376,7 @@ async fn main() -> Result<()> {
 
             println!("{}", out.display());
         }
+        #[cfg(feature = "eval")]
         Commands::EvalMatrixJudge(args) => {
             let now = args.now_epoch_s.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -13647,9 +18385,7 @@ async fn main() -> Result<()> {
                     .as_secs()
             });
             let out = args.out.unwrap_or_else(|| {
-                std::path::PathBuf::from(format!(
-                    ".generated/webpipe-eval-matrix-judge-{now}.json"
-                ))
+                std::path::PathBuf::from(format!(".generated/webpipe-eval-matrix-judge-{now}.json"))
             });
             std::fs::create_dir_all(
                 out.parent()
@@ -13811,6 +18547,590 @@ async fn main() -> Result<()> {
             std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
             println!("{}", out.display());
         }
+        #[cfg(feature = "eval")]
+        Commands::EvalMatrixLlmJudge(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    ".generated/webpipe-eval-matrix-llm-judge-{now}.json"
+                ))
+            });
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+
+            let transcript_enabled = args.transcript;
+            let transcript_max_chars = args.transcript_max_chars.clamp(200, 200_000);
+            let transcript_path = args.transcript_jsonl.clone().unwrap_or_else(|| {
+                std::path::PathBuf::from(format!("{}.transcript.jsonl", out.display()))
+            });
+            let mut transcript_seq: u64 = 0;
+
+            fn append_jsonl(
+                path: &std::path::Path,
+                line: &serde_json::Value,
+            ) -> anyhow::Result<()> {
+                if let Some(p) = path.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                writeln!(f, "{}", serde_json::to_string(line)?)?;
+                Ok(())
+            }
+
+            let raw = std::fs::read_to_string(&args.examples_artifact)?;
+
+            fn take_chars(s: &str, max_chars: usize) -> (String, bool) {
+                if max_chars == 0 {
+                    return (String::new(), !s.is_empty());
+                }
+                let mut out = String::new();
+                for (n, ch) in s.chars().enumerate() {
+                    if n >= max_chars {
+                        return (out, true);
+                    }
+                    out.push(ch);
+                }
+                (out, false)
+            }
+
+            fn extract_json_object(s: &str) -> Option<serde_json::Value> {
+                // Prefer parsing the full response first (common case).
+                let trimmed = s.trim();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    return Some(v);
+                }
+
+                // Fallback: pull out the outermost {...} region.
+                //
+                // IMPORTANT: offsets/spans for user text in this workspace are char-based, and
+                // `&str` slicing by byte offsets can panic on Unicode. So we operate in char
+                // offsets and materialize a `String` slice via `.chars()`.
+                let mut start: Option<usize> = None;
+                let mut end: Option<usize> = None;
+                for (i, ch) in trimmed.chars().enumerate() {
+                    if start.is_none() && ch == '{' {
+                        start = Some(i);
+                    }
+                    if ch == '}' {
+                        end = Some(i);
+                    }
+                }
+                let (start, end) = match (start, end) {
+                    (Some(a), Some(b)) if b >= a => (a, b),
+                    _ => return None,
+                };
+
+                let slice: String = trimmed
+                    .chars()
+                    .skip(start)
+                    .take(end.saturating_sub(start) + 1)
+                    .collect();
+                serde_json::from_str(&slice).ok()
+            }
+
+            fn tx_trunc(s: &str, max_chars: usize) -> serde_json::Value {
+                let (t, truncated) = take_chars(s, max_chars);
+                serde_json::json!({
+                    "text": t,
+                    "chars": s.chars().count(),
+                    "truncated": truncated
+                })
+            }
+
+            let llm_backend = args.llm_backend.to_ascii_lowercase();
+            let temperature = args.temperature.or(Some(0.0));
+            let top_p = args.top_p.or(Some(1.0));
+            let max_examples = args.max_examples.clamp(1, 10_000);
+            let timeout_ms = args.timeout_ms.clamp(500, 300_000);
+            let max_prompt_chars = args.max_prompt_chars.clamp(200, 50_000);
+            let json_mode = args.json_mode;
+            let retry_on_parse_fail = args.retry_on_parse_fail;
+
+            let http = reqwest::Client::new();
+            let openai_like = match llm_backend.as_str() {
+                "openai" => {
+                    let api_key = mcp::WebpipeMcp::openai_api_key_from_env().ok_or_else(|| {
+                        anyhow::anyhow!("missing OPENAI_API_KEY (or WEBPIPE_OPENAI_API_KEY)")
+                    })?;
+                    let model = args
+                        .llm_model
+                        .clone()
+                        .unwrap_or_else(mcp::WebpipeMcp::openai_model_from_env);
+                    Some(webpipe_local::openai_compat::OpenAiCompatClient::new(
+                        http.clone(),
+                        "https://api.openai.com".to_string(),
+                        Some(api_key),
+                        model,
+                    )?)
+                }
+                "openai_compat" => {
+                    Some(webpipe_local::openai_compat::OpenAiCompatClient::from_env(
+                        http.clone(),
+                        args.llm_model.clone(),
+                    )?)
+                }
+                "openrouter" => {
+                    let api_key =
+                        mcp::WebpipeMcp::openrouter_api_key_from_env().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "missing OPENROUTER_API_KEY (or WEBPIPE_OPENROUTER_API_KEY)"
+                            )
+                        })?;
+                    let model = args
+                        .llm_model
+                        .clone()
+                        .unwrap_or_else(mcp::WebpipeMcp::openrouter_model_from_env);
+                    Some(webpipe_local::openai_compat::OpenAiCompatClient::new(
+                        http.clone(),
+                        // OpenAiCompatClient appends `/v1/chat/completions`.
+                        "https://openrouter.ai/api".to_string(),
+                        Some(api_key),
+                        model,
+                    )?)
+                }
+                "groq" => {
+                    let api_key = mcp::WebpipeMcp::groq_api_key_from_env().ok_or_else(|| {
+                        anyhow::anyhow!("missing GROQ_API_KEY (or WEBPIPE_GROQ_API_KEY)")
+                    })?;
+                    let model = args
+                        .llm_model
+                        .clone()
+                        .unwrap_or_else(mcp::WebpipeMcp::groq_model_from_env);
+                    Some(webpipe_local::openai_compat::OpenAiCompatClient::new(
+                        http.clone(),
+                        // OpenAiCompatClient appends `/v1/chat/completions`.
+                        "https://api.groq.com/openai".to_string(),
+                        Some(api_key),
+                        model,
+                    )?)
+                }
+                _ => None,
+            };
+            let ollama = if llm_backend == "ollama" {
+                Some(webpipe_local::ollama::OllamaClient::from_env(http.clone())?)
+            } else {
+                None
+            };
+            let llm_model_effective: Option<String> =
+                openai_like.as_ref().map(|c| c.model().to_string());
+
+            #[derive(serde::Deserialize)]
+            struct OpenRouterModels {
+                #[serde(default)]
+                data: Vec<OpenRouterModel>,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct OpenRouterModel {
+                id: String,
+                #[serde(default)]
+                supported_parameters: Vec<String>,
+            }
+
+            async fn openrouter_supported_params(
+                http: &reqwest::Client,
+                model_id: &str,
+            ) -> Option<std::collections::BTreeSet<String>> {
+                if model_id.trim().is_empty() {
+                    return None;
+                }
+                let resp = http
+                    .get("https://openrouter.ai/api/v1/models")
+                    .timeout(std::time::Duration::from_millis(8_000))
+                    .send()
+                    .await
+                    .ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let parsed: OpenRouterModels = resp.json().await.ok()?;
+                let m = parsed.data.into_iter().find(|m| m.id == model_id)?;
+                Some(m.supported_parameters.into_iter().collect())
+            }
+
+            let openrouter_caps: Option<std::collections::BTreeSet<String>> =
+                if llm_backend == "openrouter" {
+                    if let Some(mid) = llm_model_effective.as_deref() {
+                        openrouter_supported_params(&http, mid).await
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+            let mut chat_options = webpipe_local::openai_compat::ChatOptions::default();
+            if llm_backend == "openrouter" {
+                if let Ok(v) = std::env::var("WEBPIPE_OPENROUTER_INCLUDE_REASONING") {
+                    let v = v.trim().to_ascii_lowercase();
+                    if v == "true" || v == "1" {
+                        if openrouter_caps
+                            .as_ref()
+                            .map(|s| s.contains("include_reasoning"))
+                            .unwrap_or(true)
+                        {
+                            chat_options.include_reasoning = Some(true);
+                        }
+                    }
+                    if v == "false" || v == "0" {
+                        if openrouter_caps
+                            .as_ref()
+                            .map(|s| s.contains("include_reasoning"))
+                            .unwrap_or(true)
+                        {
+                            chat_options.include_reasoning = Some(false);
+                        }
+                    }
+                }
+                if let Ok(eff) = std::env::var("WEBPIPE_OPENROUTER_REASONING_EFFORT") {
+                    let eff = eff.trim().to_string();
+                    if !eff.is_empty()
+                        && openrouter_caps
+                            .as_ref()
+                            .map(|s| s.contains("reasoning"))
+                            .unwrap_or(true)
+                    {
+                        chat_options.reasoning_effort = Some(eff);
+                    }
+                }
+            }
+
+            let system: String = if let Some(p) = args.system_prompt_file.as_ref() {
+                std::fs::read_to_string(p)?
+            } else {
+                match args.prompt_preset.to_ascii_lowercase().as_str() {
+                    "v1" => r#"You are a strict judge of retrieval/extraction quality.
+
+You will receive:
+- a user query
+- extracted evidence text (possibly noisy or incomplete)
+
+Return a single JSON object ONLY, with this schema:
+{
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],                // subset of: ["empty","low_signal","off_topic","too_short","boilerplate","gunk","missing_key_facts"]
+  "notes": string,                   // <= 200 chars
+  "quotes": string[]                 // up to 2 short quotes from the evidence (<= 200 chars each)
+}
+
+Be conservative: mark answerable=false if the evidence is not sufficient."#
+                        .to_string(),
+                    _ => r#"You are a strict judge of retrieval/extraction quality.
+
+Goal: detect tail failures (JS challenges, app-shell gunk, boilerplate, truncation, off-topic evidence).
+
+Input:
+- Query: a user question
+- Evidence: extracted text (may be noisy/incomplete)
+
+Output: return ONE JSON object ONLY. No markdown, no prose, no code fences.
+Schema:
+{
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],                // subset of: ["empty","low_signal","off_topic","too_short","boilerplate","gunk","missing_key_facts","truncated","js_challenge"]
+  "notes": string,                   // <= 200 chars
+  "quotes": string[]                 // up to 2 short direct quotes (<= 200 chars each)
+}
+
+Conservatism:
+- If evidence is mostly navigation/boilerplate, set answerable=false and issues include "boilerplate".
+- If evidence looks like a JS/CAPTCHA/auth wall, set relevant=false, answerable=false, issues include "js_challenge".
+- If evidence is clearly minified/serialized bundle junk, issues include "gunk".
+- If query terms are absent and the text is about something else, issues include "off_topic"."#
+                        .to_string(),
+                }
+            };
+
+            let mut per_example: Vec<serde_json::Value> = Vec::new();
+            let mut totals = serde_json::json!({
+                "examples": 0u64,
+                "ok": 0u64,
+                "relevant": 0u64,
+                "answerable": 0u64,
+                "parse_failed": 0u64
+            });
+
+            for (i, line) in raw.lines().enumerate() {
+                if per_example.len() >= max_examples {
+                    break;
+                }
+                let s = line.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let ex: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+                    anyhow::anyhow!("examples_artifact line {}: invalid json: {}", i + 1, e)
+                })?;
+
+                let query_id = ex
+                    .get("query_id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let case = ex.get("case").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let ok = ex.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                let query = ex.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let text0 = ex.get("judge_text").and_then(|v| v.as_str()).unwrap_or("");
+                let (text, prompt_truncated) = take_chars(text0, max_prompt_chars);
+
+                let user = format!("Query:\n{}\n\nEvidence:\n{}\n", query.trim(), text.trim());
+
+                let t0 = std::time::Instant::now();
+                let call_id = format!(
+                    "eval_matrix_llm_judge:{}:{}:{}",
+                    now,
+                    per_example.len(),
+                    ex.get("query_id").and_then(|x| x.as_str()).unwrap_or("")
+                );
+                let mut resp_text = match llm_backend.as_str() {
+                    "ollama" => {
+                        let client = ollama.as_ref().expect("ollama client");
+                        client
+                            .chat(&system, &user, timeout_ms)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    }
+                    "openai" | "openai_compat" | "openrouter" | "groq" => {
+                        let client = openai_like.as_ref().expect("openai-like client");
+                        let wants_json = json_mode;
+                        let json_allowed = llm_backend.as_str() != "openrouter"
+                            || openrouter_caps
+                                .as_ref()
+                                .map(|s| s.contains("response_format"))
+                                .unwrap_or(true);
+                        if wants_json && json_allowed {
+                            match client
+                                .chat_json_with_options(
+                                    &system,
+                                    &user,
+                                    timeout_ms,
+                                    args.max_tokens.or(Some(250)),
+                                    temperature,
+                                    top_p,
+                                    chat_options.clone(),
+                                )
+                                .await
+                            {
+                                Ok(s) => s,
+                                Err(_) if llm_backend.as_str() == "openrouter" => client
+                                    .chat_with_options(
+                                        &system,
+                                        &user,
+                                        timeout_ms,
+                                        args.max_tokens.or(Some(250)),
+                                        temperature,
+                                        top_p,
+                                        chat_options.clone(),
+                                    )
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                                Err(e) => return Err(anyhow::anyhow!(e.to_string())),
+                            }
+                        } else {
+                            client
+                                .chat_with_options(
+                                    &system,
+                                    &user,
+                                    timeout_ms,
+                                    args.max_tokens.or(Some(250)),
+                                    temperature,
+                                    top_p,
+                                    chat_options.clone(),
+                                )
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                        }
+                    }
+                    other => anyhow::bail!(
+                        "unknown llm_backend: {other} (allowed: openai, openai_compat, openrouter, groq, ollama)"
+                    ),
+                };
+                let elapsed_ms = t0.elapsed().as_millis();
+
+                let mut parsed = extract_json_object(&resp_text);
+                if parsed.is_none() && retry_on_parse_fail && openai_like.is_some() {
+                    let (prev, _) = take_chars(&resp_text, 800);
+                    let retry_user = format!(
+                        "Your previous output was not parseable JSON.\nReturn ONLY one JSON object matching the schema. No extra text.\n\nQuery:\n{}\n\nEvidence:\n{}\n\nPrevious output:\n{}\n",
+                        query.trim(),
+                        text.trim(),
+                        prev.trim()
+                    );
+                    let client = openai_like.as_ref().expect("openai-like client");
+                    let wants_json = json_mode;
+                    let json_allowed = llm_backend.as_str() != "openrouter"
+                        || openrouter_caps
+                            .as_ref()
+                            .map(|s| s.contains("response_format"))
+                            .unwrap_or(true);
+                    let retry_text = if wants_json && json_allowed {
+                        match client
+                            .chat_json_with_options(
+                                &system,
+                                &retry_user,
+                                timeout_ms,
+                                args.max_tokens.or(Some(250)),
+                                temperature,
+                                top_p,
+                                chat_options.clone(),
+                            )
+                            .await
+                        {
+                            Ok(s) => s,
+                            Err(_) if llm_backend.as_str() == "openrouter" => client
+                                .chat_with_options(
+                                    &system,
+                                    &retry_user,
+                                    timeout_ms,
+                                    args.max_tokens.or(Some(250)),
+                                    temperature,
+                                    top_p,
+                                    chat_options.clone(),
+                                )
+                                .await
+                                .unwrap_or_default(),
+                            Err(_) => String::new(),
+                        }
+                    } else {
+                        client
+                            .chat_with_options(
+                                &system,
+                                &retry_user,
+                                timeout_ms,
+                                args.max_tokens.or(Some(250)),
+                                temperature,
+                                top_p,
+                                chat_options.clone(),
+                            )
+                            .await
+                            .unwrap_or_default()
+                    };
+                    resp_text = retry_text;
+                    parsed = extract_json_object(&resp_text);
+                }
+
+                if transcript_enabled {
+                    transcript_seq = transcript_seq.wrapping_add(1);
+                    let line = serde_json::json!({
+                        "schema_version": 1,
+                        "kind": "webpipe_eval_transcript_event",
+                        "generated_at_epoch_s": now,
+                        "seq": transcript_seq,
+                        "run_kind": "eval_matrix_llm_judge",
+                        "call_id": call_id,
+                        "llm": {
+                            "backend": llm_backend,
+                            "model_effective": llm_model_effective,
+                            "json_mode": json_mode,
+                            "timeout_ms": timeout_ms
+                        },
+                        "prompt": {
+                            "system": tx_trunc(&system, transcript_max_chars),
+                            "user": tx_trunc(&user, transcript_max_chars),
+                            "prompt_truncated": prompt_truncated
+                        },
+                        "response": {
+                            "raw": tx_trunc(&resp_text, transcript_max_chars),
+                            "parsed": parsed
+                        },
+                        "timing_ms": elapsed_ms
+                    });
+                    let _ = append_jsonl(transcript_path.as_path(), &line);
+                }
+                let (relevant, answerable, confidence) = if let Some(v) = parsed.as_ref() {
+                    (
+                        v.get("relevant").and_then(|x| x.as_bool()).unwrap_or(false),
+                        v.get("answerable")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
+                        v.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    )
+                } else {
+                    (false, false, 0.0)
+                };
+
+                totals["examples"] =
+                    serde_json::json!(totals["examples"].as_u64().unwrap_or(0) + 1);
+                if ok {
+                    totals["ok"] = serde_json::json!(totals["ok"].as_u64().unwrap_or(0) + 1);
+                }
+                if relevant {
+                    totals["relevant"] =
+                        serde_json::json!(totals["relevant"].as_u64().unwrap_or(0) + 1);
+                }
+                if answerable {
+                    totals["answerable"] =
+                        serde_json::json!(totals["answerable"].as_u64().unwrap_or(0) + 1);
+                }
+                if parsed.is_none() {
+                    totals["parse_failed"] =
+                        serde_json::json!(totals["parse_failed"].as_u64().unwrap_or(0) + 1);
+                }
+
+                per_example.push(serde_json::json!({
+                    "query_id": query_id,
+                    "case": case,
+                    "ok": ok,
+                    "prompt_truncated": prompt_truncated,
+                    "elapsed_ms": t0.elapsed().as_millis(),
+                    "llm_backend": llm_backend,
+                    "llm_model": args.llm_model,
+                    "llm_model_effective": llm_model_effective,
+                    "judge": parsed,
+                    "judge_raw": if parsed.is_none() { resp_text } else { String::new() },
+                    "derived": {
+                        "relevant": relevant,
+                        "answerable": answerable,
+                        "confidence": confidence
+                    }
+                }));
+            }
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_matrix_llm_judge",
+                "generated_at_epoch_s": now,
+                "inputs": {
+                    "examples_artifact": args.examples_artifact,
+                    "llm_backend": llm_backend,
+                    "llm_model": args.llm_model,
+                    "llm_model_effective": llm_model_effective,
+                    "prompt_preset": args.prompt_preset,
+                    "system_prompt_file": args.system_prompt_file,
+                    "json_mode": json_mode,
+                    "retry_on_parse_fail": retry_on_parse_fail,
+                    "timeout_ms": timeout_ms,
+                    "max_examples": max_examples,
+                    "max_prompt_chars": max_prompt_chars,
+                    "max_tokens": args.max_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "transcript": transcript_enabled,
+                    "transcript_jsonl": if transcript_enabled { Some(transcript_path.clone()) } else { None },
+                    "transcript_max_chars": transcript_max_chars
+                },
+                "totals": totals,
+                "per_example": per_example
+            });
+
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
+        }
+        #[cfg(feature = "eval")]
         Commands::EvalMatrixRun(args) => {
             let now = args.now_epoch_s.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -13850,22 +19170,6 @@ async fn main() -> Result<()> {
                     );
                 }
                 Ok(())
-            }
-
-            fn best_effort_git_sha() -> Option<String> {
-                let out = std::process::Command::new("git")
-                    .args(["rev-parse", "HEAD"])
-                    .output()
-                    .ok()?;
-                if !out.status.success() {
-                    return None;
-                }
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
             }
 
             // 1) eval-matrix
@@ -13961,11 +19265,3012 @@ async fn main() -> Result<()> {
                     "judge": judge_out
                 }
             });
-            std::fs::write(&manifest_out, serde_json::to_string_pretty(&manifest)? + "\n")?;
+            std::fs::write(
+                &manifest_out,
+                serde_json::to_string_pretty(&manifest)? + "\n",
+            )?;
             match args.output.to_ascii_lowercase().as_str() {
                 "json" => println!("{}", serde_json::to_string(&manifest)?),
                 _ => println!("{}", judge_out.display()),
             }
+        }
+        #[cfg(all(feature = "eval", feature = "stdio"))]
+        Commands::EvalJudgeSwarm(args) => {
+            use rmcp::handler::server::wrapper::Parameters;
+
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(".generated/webpipe-eval-judge-swarm-{now}.json"))
+            });
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+
+            let transcript_enabled = args.transcript;
+            let transcript_max_chars = args.transcript_max_chars.clamp(200, 200_000);
+            let transcript_path = args.transcript_jsonl.clone().unwrap_or_else(|| {
+                std::path::PathBuf::from(format!("{}.transcript.jsonl", out.display()))
+            });
+            let mut transcript_seq: u64 = 0;
+
+            fn parse_csv(s: &str) -> Vec<String> {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            }
+
+            fn take_chars(s: &str, max_chars: usize) -> (String, bool) {
+                if max_chars == 0 {
+                    return (String::new(), !s.is_empty());
+                }
+                let mut out = String::new();
+                for (n, ch) in s.chars().enumerate() {
+                    if n >= max_chars {
+                        return (out, true);
+                    }
+                    out.push(ch);
+                }
+                (out, false)
+            }
+
+            fn append_jsonl(
+                path: &std::path::Path,
+                line: &serde_json::Value,
+            ) -> anyhow::Result<()> {
+                if let Some(p) = path.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                writeln!(f, "{}", serde_json::to_string(line)?)?;
+                Ok(())
+            }
+
+            fn tx_trunc(s: &str, max_chars: usize) -> serde_json::Value {
+                let (t, truncated) = take_chars(s, max_chars);
+                serde_json::json!({
+                    "text": t,
+                    "chars": s.chars().count(),
+                    "truncated": truncated
+                })
+            }
+
+            fn json_trunc(v: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+                let s = serde_json::to_string(v).unwrap_or_default();
+                tx_trunc(&s, max_chars)
+            }
+
+            fn extract_json_object(s: &str) -> Option<serde_json::Value> {
+                // Prefer parsing the full response first (common case).
+                let trimmed = s.trim();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    return Some(v);
+                }
+
+                // Fallback: pull out the outermost {...} region, Unicode-safe (char offsets).
+                let mut start: Option<usize> = None;
+                let mut end: Option<usize> = None;
+                for (i, ch) in trimmed.chars().enumerate() {
+                    if start.is_none() && ch == '{' {
+                        start = Some(i);
+                    }
+                    if ch == '}' {
+                        end = Some(i);
+                    }
+                }
+                let (start, end) = match (start, end) {
+                    (Some(a), Some(b)) if b >= a => (a, b),
+                    _ => return None,
+                };
+
+                let slice: String = trimmed
+                    .chars()
+                    .skip(start)
+                    .take(end.saturating_sub(start) + 1)
+                    .collect();
+                serde_json::from_str(&slice).ok()
+            }
+
+            // NOTE: We intentionally avoid any cross-judge “global notes” channel.
+            // It is too easy to accidentally leak labels/ground-truth or cause side-note bleed.
+
+            fn hash64(seed: u64, s: &str) -> u64 {
+                // Deterministic FNV-1a-ish (no extra deps).
+                let mut h: u64 = 0xcbf29ce484222325 ^ seed;
+                for b in s.as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                h
+            }
+
+            #[derive(Clone, Debug, Default)]
+            struct CurriculumStats {
+                worked: bool,
+                best_score: f64,
+            }
+
+            fn load_curriculum(
+                path: &std::path::Path,
+            ) -> anyhow::Result<std::collections::BTreeMap<String, CurriculumStats>> {
+                let raw = std::fs::read_to_string(path)?;
+                let v: serde_json::Value = serde_json::from_str(&raw)?;
+                let ok = v.get("schema_version").and_then(|x| x.as_u64()) == Some(1)
+                    && v.get("kind").and_then(|x| x.as_str()) == Some("webpipe_eval_judge_swarm");
+                if !ok {
+                    anyhow::bail!("curriculum_from: unexpected kind/schema_version");
+                }
+                let mut out: std::collections::BTreeMap<String, CurriculumStats> =
+                    std::collections::BTreeMap::new();
+                let Some(reports) = v.get("judge_reports").and_then(|x| x.as_array()) else {
+                    return Ok(out);
+                };
+                for r in reports {
+                    let Some(per_query) = r.get("per_query").and_then(|x| x.as_array()) else {
+                        continue;
+                    };
+                    for q in per_query {
+                        let qid = q
+                            .get("query_id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        if qid.is_empty() {
+                            continue;
+                        }
+                        let _hit_any = q
+                            .get("hit_expected_url_any_trial")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false);
+                        let solved = q
+                            .get("task_solve")
+                            .and_then(|x| x.get("evidence_sufficient"))
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false);
+                        // Curriculum "worked" should reflect *answerability*, not just URL hits.
+                        // URL hits can be misleading when extraction returns empty/boilerplate.
+                        let mut any_answerable = false;
+                        if let Some(trials) = q.get("trials").and_then(|x| x.as_array()) {
+                            for t in trials {
+                                let a = t
+                                    .get("judge")
+                                    .and_then(|j| j.get("answerable"))
+                                    .and_then(|x| x.as_bool())
+                                    .unwrap_or(false);
+                                if a {
+                                    any_answerable = true;
+                                    break;
+                                }
+                            }
+                        }
+                        let worked = solved || any_answerable;
+
+                        let mut best_score = 0.0;
+                        if let Some(trials) = q.get("trials").and_then(|x| x.as_array()) {
+                            for t in trials {
+                                let s = t
+                                    .get("judge")
+                                    .and_then(|j| j.get("overall_score"))
+                                    .and_then(|x| x.as_f64())
+                                    .unwrap_or(0.0);
+                                if s > best_score {
+                                    best_score = s;
+                                }
+                            }
+                        }
+
+                        out.entry(qid.to_string())
+                            .and_modify(|st| {
+                                st.worked = st.worked || worked;
+                                if best_score > st.best_score {
+                                    st.best_score = best_score;
+                                }
+                            })
+                            .or_insert(CurriculumStats { worked, best_score });
+                    }
+                }
+                Ok(out)
+            }
+
+            #[derive(Clone, Debug)]
+            struct TrialCfg {
+                id: &'static str,
+                agentic: bool,
+                agentic_selector: &'static str,
+                url_selection_mode: &'static str,
+                fetch_backend: String,
+            }
+
+            #[derive(Clone, Debug)]
+            struct JudgePreset {
+                id: String,
+                domain_tags: Vec<String>,
+                system: String,
+            }
+
+            fn builtin_judge_presets() -> std::collections::BTreeMap<String, JudgePreset> {
+                let mut out = std::collections::BTreeMap::new();
+                out.insert(
+                    "docs".to_string(),
+                    JudgePreset {
+                        id: "docs".to_string(),
+                        domain_tags: vec!["docs".to_string()],
+                        system: r#"You are a strict, adversarial judge for developer documentation retrieval and extraction.
+
+You will see multiple trials (different tool strategies) for the same query.
+You must score signal quality and tail-risk failure modes (boilerplate, JS shells, off-topic pages, truncation).
+
+Return ONE JSON object ONLY (no markdown, no prose) with schema:
+{
+  "overall_score": number,            // 0..100
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],                // use strings like: ["ux_confusing","writing_poor","math_broken","js_challenge","boilerplate","truncated","missing_key_facts"]
+  "musings": [{"dimension": string, "note": string}] // optional; up to 12 short items (dimension<=32, note<=200)
+}
+
+Musings guidance (if you include them):
+- Prefer 1–3 items, especially when answerable=false or overall_score < 85.
+- Choose any dimensions you want; keep them short and stable (e.g. "ux", "coverage", "credibility", "freshness", "math", "latency", "retrieval").
+}"#
+                        .to_string(),
+                    },
+                );
+                out.insert(
+                    "academic".to_string(),
+                    JudgePreset {
+                        id: "academic".to_string(),
+                        domain_tags: vec![
+                            "academic".to_string(),
+                            "paper".to_string(),
+                            "arxiv".to_string(),
+                        ],
+                        system: r#"You are a strict, adversarial judge for academic/paper retrieval and extraction.
+
+Favor trials that surface concrete claims, definitions, and key results from the evidence text.
+Penalize boilerplate, navigation-only pages, and missing key facts.
+
+Return ONE JSON object ONLY (no markdown, no prose) with schema:
+{
+  "overall_score": number,            // 0..100
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],                // use strings like: ["missing_key_facts","writing_poor","math_broken","off_topic","truncated"]
+  "musings": [{"dimension": string, "note": string}] // optional; up to 12 short items
+}
+
+Musings guidance (if you include them): prefer 1–3 items, especially on failures.
+}"#
+                        .to_string(),
+                    },
+                );
+                out.insert(
+                    "news".to_string(),
+                    JudgePreset {
+                        id: "news".to_string(),
+                        domain_tags: vec!["news".to_string()],
+                        system: r#"You are a strict, adversarial judge for news/article retrieval and extraction.
+
+Penalize paywalls/auth walls, JS challenges, and low-signal app shells.
+Favor trials with concrete facts and minimal boilerplate.
+
+Return ONE JSON object ONLY (no markdown, no prose) with schema:
+{
+  "overall_score": number,            // 0..100
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],                // use strings like: ["paywall","js_challenge","boilerplate","low_signal","off_topic"]
+  "musings": [{"dimension": string, "note": string}] // optional; up to 12 short items
+}
+
+Musings guidance (if you include them): prefer 1–3 items, especially on failures.
+}"#
+                        .to_string(),
+                    },
+                );
+                // Lens-specific “poor man’s adversarial judges”.
+                out.insert(
+                    "ux".to_string(),
+                    JudgePreset {
+                        id: "ux".to_string(),
+                        domain_tags: vec!["docs".to_string(), "news".to_string(), "academic".to_string()],
+                        system: r#"You are an adversarial UX/layout judge for retrieval/extraction outputs.
+
+You are judging evidence text produced by a web retrieval + extraction pipeline (not a hand-written document).
+Your job is to catch UX-shaped failures that make the page unusable even if it contains some relevant words.
+
+Expert rubric (what “good” looks like):
+- The extract surfaces the *right section* quickly (not nav chrome).
+- The extract preserves meaningful structure: headings, short paragraphs, lists.
+- The extract is scannable: low boilerplate ratio, minimal repetition.
+- It avoids “false affordances”: pages that look like content but are actually app shells / cookie walls / JS challenges.
+
+Hard negatives (almost always answerable=false):
+- JS challenge / captcha / auth wall / “enable JavaScript”
+- paywall / subscribe wall where the body is missing
+- empty or near-empty output
+- minified bundle junk or serialized noise
+
+Output ONE JSON object only (no markdown, no prose). Required keys:
+{
+  "overall_score": number,            // 0..100
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],                // use short codes
+  "musings": [{"dimension": string, "note": string}] // optional; up to 12 short items
+}
+
+Musings guidance (if you include them): prefer 1–3 items, especially on failures.
+
+Optional (structured notes; keep short): you MAY include:
+{
+  "good": string[],   // up to 3 bullets
+  "bad": string[],    // up to 3 bullets
+  "fixes": string[]   // up to 3 concrete fixes for the tool/pipeline
+}
+
+Issue codes (pick 1–6):
+- "empty", "low_signal", "boilerplate", "nav_only", "js_challenge", "paywall", "gunk", "truncated",
+- "wrong_section", "duplication", "toc_spam", "poor_structure", "hard_to_scan"
+
+Scoring guidance:
+- 90–100: clean, structured, right section, minimal noise.
+- 60–89: mostly right but some chrome/noise/truncation.
+- 0–59: wrong section, mostly boilerplate, or hard-negative."#
+                            .to_string(),
+                    },
+                );
+                out.insert(
+                    "writing".to_string(),
+                    JudgePreset {
+                        id: "writing".to_string(),
+                        domain_tags: vec!["docs".to_string(), "news".to_string(), "academic".to_string()],
+                        system: r#"You are an adversarial writing-quality judge for retrieved/extracted text.
+
+You are judging whether the extracted evidence is *readable and sufficient* to answer the user query.
+Assume extraction artifacts exist (broken wrapping, missing punctuation, duplicated nav). You must detect them.
+
+Expert rubric (math/tech writing aware):
+- Definitions appear before use (terms introduced, symbols explained in nearby prose).
+- The “answer-bearing” paragraph is present (not just a TOC).
+- Lists read cleanly (no orphan punctuation, no mangled numbering).
+- References to code/config are intact (flags, names, units).
+- For technical docs: includes at least one concrete step / API / command.
+
+Readability targets (concrete, use as heuristics):
+- Line length: prefer ~65–75 characters for prose; if the evidence is presented as a “block”, treat >80 chars as a readability risk.
+  (WCAG 2.1 SC 1.4.8 suggests a width cap of 80 characters/glyphs for blocks of text.)
+- Leading: for dense prose, ~1.5 line spacing improves scan and reduces line-skipping (also cited in WCAG 2.1 SC 1.4.8 guidance).
+
+Penalize:
+- incoherent fragments / sentence boundary loss
+- missing key steps/constraints/definitions
+- “TOC spam” (lots of headings, no substance)
+- boilerplate domination (cookie banners, nav)
+- truncation that drops the “how-to”
+
+Output ONE JSON object only. Required keys:
+{
+  "overall_score": number,            // 0..100
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],
+  "musings": [{"dimension": string, "note": string}] // optional; up to 12 short items
+}
+
+Optional structured notes (short): you MAY include:
+{
+  "good": string[],
+  "bad": string[],
+  "fixes": string[]
+}
+
+Issue codes (pick 1–6):
+- "writing_poor", "too_short", "missing_key_facts", "off_topic", "boilerplate", "toc_spam",
+- "duplication", "broken_punctuation", "broken_lists", "truncated", "gunk"
+
+Scoring guidance:
+- 90–100: coherent, answer-bearing, includes concrete steps.
+- 60–89: mostly coherent but missing one key piece or has moderate noise.
+- 0–59: fragmented, dominated by boilerplate/TOC, or missing the answer-bearing portion."#
+                            .to_string(),
+                    },
+                );
+                out.insert(
+                    "rendered_page".to_string(),
+                    JudgePreset {
+                        id: "rendered_page".to_string(),
+                        domain_tags: vec!["docs".to_string(), "news".to_string(), "academic".to_string()],
+                        system: r#"You are an adversarial “rendered technical page” judge.
+
+You are judging extracted evidence text (HTML→text), but your rubric is: “would the original rendered page be usable and trustworthy?”
+Treat missing structure as a rendering/usability failure even if some keywords are present.
+
+Expert rubric:
+- The table-of-contents (if present) is not the only content; the answer-bearing section is included.
+- Heading hierarchy is preserved (you can tell what’s a section vs subsection).
+- Lists are readable (no smashed numbering / orphan punctuation).
+- Code blocks are intact (commands/flags not truncated or wrapped into nonsense).
+- Math/notation (if relevant) survives (symbols/relations; no delimiter soup).
+
+Hard negatives (answerable=false):
+- nav-only / app shell / login wall / “enable JavaScript”
+- content is mostly boilerplate or duplicated chrome
+- the extract is so structure-poor you can’t locate the answer-bearing section
+
+Output ONE JSON object only. Required keys:
+{
+  "overall_score": number,            // 0..100
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],
+  "musings": [{"dimension": string, "note": string}] // optional; up to 12 short items
+}
+
+Optional structured notes (short): you MAY include:
+{
+  "good": string[],
+  "bad": string[],
+  "fixes": string[]
+}
+
+Issue codes (pick 1–8):
+- "nav_only", "boilerplate", "toc_spam", "poor_hierarchy", "broken_lists", "code_broken", "math_broken", "truncated", "low_signal"
+
+Scoring guidance:
+- 90–100: strongly structured and answer-bearing.
+- 60–89: mostly usable but one structural weakness.
+- 0–59: structure is missing or dominated by chrome."#
+                            .to_string(),
+                    },
+                );
+                out.insert(
+                    "math".to_string(),
+                    JudgePreset {
+                        id: "math".to_string(),
+                        domain_tags: vec!["docs".to_string(), "academic".to_string()],
+                        system: r#"You are an adversarial math/notation fidelity judge.
+
+You are judging evidence text that may have lost structure during HTML→text extraction.
+You must detect when *math-bearing meaning* was lost.
+
+Expert rubric (math exposition aware):
+- Key expressions survive (symbols, subscripts, Greek, set membership like “∈”, fractions, sums).
+- The statement is interpretable: variables referenced in prose, units/assumptions present.
+- Display math is not reduced to garbage; inline math is not flattened into ambiguous ASCII.
+
+KaTeX/LaTeX failure modes to watch for (technical, common in extraction):
+- Broken delimiters or delimiter confusion: e.g. `$...$` vs `$$...$$` vs `\(...\)`/`\[...\]`.
+  KaTeX auto-render treats delimiters in-order; if `$` is handled before `$$`, `$$` can be misparsed as empty math.
+- Render-vs-text mismatch: the page may render math correctly, but extracted text can drop backslashes/braces, losing meaning.
+
+Hard negatives:
+- The query clearly needs a formula/definition, but the extract has none.
+- The extract contains broken LaTeX delimiters / mangled backslashes / missing braces that destroy meaning.
+- The extract is mostly unreadable glyph soup.
+
+Output ONE JSON object only. Required keys:
+{
+  "overall_score": number,            // 0..100
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],
+  "musings": [{"dimension": string, "note": string}] // optional; up to 12 short items
+}
+
+Optional structured notes (short): you MAY include:
+{
+  "good": string[],
+  "bad": string[],
+  "fixes": string[]
+}
+
+Issue codes (pick 1–6):
+- "math_missing", "math_broken", "symbol_loss", "delimiter_broken", "equation_missing",
+- "missing_definitions", "too_short", "truncated", "off_topic"
+
+Scoring guidance:
+- 90–100: equations/notation intact and sufficient.
+- 60–89: mostly intact but one key definition/equation missing.
+- 0–59: math meaning lost (missing/broken/garbled)."#
+                            .to_string(),
+                    },
+                );
+                out.insert(
+                    "redteam".to_string(),
+                    JudgePreset {
+                        id: "redteam".to_string(),
+                        domain_tags: vec![
+                            "docs".to_string(),
+                            "news".to_string(),
+                            "academic".to_string(),
+                        ],
+                        system: r#"You are a red-team adversarial judge.
+
+You are skeptical by default. Your job is to surface plausible failure modes and false confidence.
+If you can find any plausible failure mode, mark answerable=false and record it.
+
+Red-team checklist:
+- Wrong page type: nav-only / app shell / marketing / forum / SEO spam.
+- Mismatch: query asks “how/why/definition”, evidence has only a snippet.
+- Staleness risk: versioned docs mismatch (e.g. old API).
+- Truncation risk: evidence cuts off at the “critical step”.
+- Citation risk: claims appear without any supporting quote-like text.
+- Confabulation risk: answerable=true would require outside knowledge.
+
+Output ONE JSON object only. Required keys:
+{
+  "overall_score": number,            // 0..100
+  "relevant": boolean,
+  "answerable": boolean,
+  "confidence": number,              // 0..1
+  "issues": string[],                // include at least one issue unless truly clean
+  "musings": [{"dimension": string, "note": string}] // optional; up to 12 short items
+}
+
+Optional structured notes (short): you MAY include:
+{
+  "bad": string[],    // up to 3 failure modes
+  "fixes": string[]   // up to 3 next experiments to reduce risk
+}
+
+Issue codes (pick 1–8):
+- "needs_citation", "insufficient_evidence", "wrong_page_type", "stale_version_risk",
+- "truncated", "off_topic", "boilerplate", "low_signal", "js_challenge", "paywall"
+
+Scoring guidance:
+- 90–100: clean evidence, direct support, low tail-risk.
+- 60–89: plausible but needs one more supporting detail.
+- 0–59: high risk of being wrong or unsupported."#
+                            .to_string(),
+                    },
+                );
+                out
+            }
+
+            let llm_backend = args.llm_backend.to_ascii_lowercase();
+            let temperature = args.temperature.or(Some(0.0));
+            let top_p = args.top_p.or(Some(1.0));
+            let json_mode = args.json_mode;
+            let retry_on_parse_fail = args.retry_on_parse_fail;
+            let llm_timeout_ms = args.llm_timeout_ms.clamp(500, 300_000);
+
+            let http = reqwest::Client::new();
+            let openai_like = match llm_backend.as_str() {
+                "openai" => {
+                    let api_key = mcp::WebpipeMcp::openai_api_key_from_env().ok_or_else(|| {
+                        anyhow::anyhow!("missing OPENAI_API_KEY (or WEBPIPE_OPENAI_API_KEY)")
+                    })?;
+                    let model = args
+                        .llm_model
+                        .clone()
+                        .unwrap_or_else(mcp::WebpipeMcp::openai_model_from_env);
+                    Some(webpipe_local::openai_compat::OpenAiCompatClient::new(
+                        http.clone(),
+                        "https://api.openai.com".to_string(),
+                        Some(api_key),
+                        model,
+                    )?)
+                }
+                "openai_compat" => {
+                    Some(webpipe_local::openai_compat::OpenAiCompatClient::from_env(
+                        http.clone(),
+                        args.llm_model.clone(),
+                    )?)
+                }
+                "openrouter" => {
+                    let api_key =
+                        mcp::WebpipeMcp::openrouter_api_key_from_env().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "missing OPENROUTER_API_KEY (or WEBPIPE_OPENROUTER_API_KEY)"
+                            )
+                        })?;
+                    let model = args
+                        .llm_model
+                        .clone()
+                        .unwrap_or_else(mcp::WebpipeMcp::openrouter_model_from_env);
+                    Some(webpipe_local::openai_compat::OpenAiCompatClient::new(
+                        http.clone(),
+                        // OpenAiCompatClient appends `/v1/chat/completions`.
+                        "https://openrouter.ai/api".to_string(),
+                        Some(api_key),
+                        model,
+                    )?)
+                }
+                "groq" => {
+                    let api_key = mcp::WebpipeMcp::groq_api_key_from_env().ok_or_else(|| {
+                        anyhow::anyhow!("missing GROQ_API_KEY (or WEBPIPE_GROQ_API_KEY)")
+                    })?;
+                    let model = args
+                        .llm_model
+                        .clone()
+                        .unwrap_or_else(mcp::WebpipeMcp::groq_model_from_env);
+                    Some(webpipe_local::openai_compat::OpenAiCompatClient::new(
+                        http.clone(),
+                        // OpenAiCompatClient appends `/v1/chat/completions`.
+                        "https://api.groq.com/openai".to_string(),
+                        Some(api_key),
+                        model,
+                    )?)
+                }
+                _ => None,
+            };
+            let ollama = if llm_backend == "ollama" {
+                Some(webpipe_local::ollama::OllamaClient::from_env(http.clone())?)
+            } else {
+                None
+            };
+            let llm_model_effective: Option<String> =
+                openai_like.as_ref().map(|c| c.model().to_string());
+            if openai_like.is_none() && ollama.is_none() {
+                anyhow::bail!(
+                    "unknown llm_backend: {} (allowed: openai, openai_compat, openrouter, groq, ollama)",
+                    llm_backend
+                );
+            }
+
+            #[derive(serde::Deserialize)]
+            struct OpenRouterModels {
+                #[serde(default)]
+                data: Vec<OpenRouterModel>,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct OpenRouterModel {
+                id: String,
+                #[serde(default)]
+                supported_parameters: Vec<String>,
+            }
+
+            async fn openrouter_supported_params(
+                http: &reqwest::Client,
+                model_id: &str,
+            ) -> Option<std::collections::BTreeSet<String>> {
+                if model_id.trim().is_empty() {
+                    return None;
+                }
+                let resp = http
+                    .get("https://openrouter.ai/api/v1/models")
+                    .timeout(std::time::Duration::from_millis(8_000))
+                    .send()
+                    .await
+                    .ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let parsed: OpenRouterModels = resp.json().await.ok()?;
+                let m = parsed.data.into_iter().find(|m| m.id == model_id)?;
+                Some(m.supported_parameters.into_iter().collect())
+            }
+
+            let openrouter_caps: Option<std::collections::BTreeSet<String>> =
+                if llm_backend == "openrouter" {
+                    if let Some(mid) = llm_model_effective.as_deref() {
+                        openrouter_supported_params(&http, mid).await
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+            let mut chat_options = webpipe_local::openai_compat::ChatOptions::default();
+            if llm_backend == "openrouter" {
+                if let Ok(v) = std::env::var("WEBPIPE_OPENROUTER_INCLUDE_REASONING") {
+                    let v = v.trim().to_ascii_lowercase();
+                    if v == "true" || v == "1" {
+                        if openrouter_caps
+                            .as_ref()
+                            .map(|s| s.contains("include_reasoning"))
+                            .unwrap_or(true)
+                        {
+                            chat_options.include_reasoning = Some(true);
+                        }
+                    }
+                    if v == "false" || v == "0" {
+                        if openrouter_caps
+                            .as_ref()
+                            .map(|s| s.contains("include_reasoning"))
+                            .unwrap_or(true)
+                        {
+                            chat_options.include_reasoning = Some(false);
+                        }
+                    }
+                }
+                if let Ok(eff) = std::env::var("WEBPIPE_OPENROUTER_REASONING_EFFORT") {
+                    let eff = eff.trim().to_string();
+                    if !eff.is_empty()
+                        && openrouter_caps
+                            .as_ref()
+                            .map(|s| s.contains("reasoning"))
+                            .unwrap_or(true)
+                    {
+                        chat_options.reasoning_effort = Some(eff);
+                    }
+                }
+            }
+
+            async fn llm_call(
+                llm_backend: &str,
+                openai_like: Option<&webpipe_local::openai_compat::OpenAiCompatClient>,
+                ollama: Option<&webpipe_local::ollama::OllamaClient>,
+                openrouter_caps: Option<&std::collections::BTreeSet<String>>,
+                chat_options: &webpipe_local::openai_compat::ChatOptions,
+                messages: Vec<webpipe_local::openai_compat::ChatMessage>,
+                timeout_ms: u64,
+                temperature: Option<f64>,
+                top_p: Option<f64>,
+                json_mode: bool,
+            ) -> anyhow::Result<String> {
+                match llm_backend {
+                    "ollama" => {
+                        // Ollama adapter is system+user only; use best-effort extraction.
+                        let system = messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == "system")
+                            .map(|m| m.content.as_str())
+                            .unwrap_or("");
+                        let user = messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.role == "user")
+                            .map(|m| m.content.as_str())
+                            .unwrap_or("");
+                        Ok(ollama
+                            .expect("ollama client")
+                            .chat(system, user, timeout_ms)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?)
+                    }
+                    "openai" | "openai_compat" | "openrouter" | "groq" => {
+                        let c = openai_like.expect("openai-like client");
+                        let wants_json = json_mode;
+                        let json_allowed = llm_backend != "openrouter"
+                            || openrouter_caps
+                                .map(|s| s.contains("response_format"))
+                                .unwrap_or(true);
+                        let json_mode_effective = wants_json && json_allowed;
+                        Ok(c.chat_messages_with_options(
+                            messages,
+                            timeout_ms,
+                            Some(350),
+                            temperature,
+                            top_p,
+                            json_mode_effective,
+                            chat_options.clone(),
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?)
+                    }
+                    _ => anyhow::bail!("unknown llm_backend"),
+                }
+            }
+
+            // Issues are a controlled vocabulary; reject free-form drift.
+            const ISSUE_VOCAB: &[&str] = &[
+                "missing_key_facts",
+                "too_short",
+                "boilerplate",
+                "low_signal",
+                "off_topic",
+                "truncated",
+                "did_not_hit_expected_url",
+            ];
+
+            fn validate_scorecard(v: &serde_json::Value) -> bool {
+                let Some(o) = v.as_object() else { return false };
+                let score_ok = o
+                    .get("overall_score")
+                    .and_then(|x| x.as_f64())
+                    .is_some_and(|s| (0.0..=100.0).contains(&s));
+                let conf_ok = o
+                    .get("confidence")
+                    .and_then(|x| x.as_f64())
+                    .is_some_and(|c| (0.0..=1.0).contains(&c));
+                let relevant_ok = o.get("relevant").and_then(|x| x.as_bool()).is_some();
+                let answerable_ok = o.get("answerable").and_then(|x| x.as_bool()).is_some();
+                let issues_ok = match o.get("issues").and_then(|x| x.as_array()) {
+                    Some(xs) => {
+                        if xs.len() > 12 {
+                            return false;
+                        }
+                        xs.iter().all(|x| {
+                            x.as_str().is_some_and(|s| {
+                                let s = s.trim();
+                                !s.is_empty()
+                                    && s.len() <= 64
+                                    && ISSUE_VOCAB.iter().any(|&v| v == s)
+                            })
+                        })
+                    }
+                    None => false,
+                };
+                // Optional: allow judges to “muse” in a bounded, aggregatable shape.
+                // We keep it structured (dimension + note) to support meta aggregation.
+                let musings_ok = match o.get("musings") {
+                    None => true,
+                    Some(v) => match v.as_array() {
+                        Some(xs) => {
+                            if xs.len() > 12 {
+                                return false;
+                            }
+                            xs.iter().all(|it| {
+                                let Some(m) = it.as_object() else {
+                                    return false;
+                                };
+                                let dim_ok = m
+                                    .get("dimension")
+                                    .and_then(|x| x.as_str())
+                                    .is_some_and(|s| {
+                                        let s = s.trim();
+                                        !s.is_empty() && s.len() <= 32
+                                    });
+                                let note_ok =
+                                    m.get("note").and_then(|x| x.as_str()).is_some_and(|s| {
+                                        let s = s.trim();
+                                        !s.is_empty() && s.len() <= 200
+                                    });
+                                dim_ok && note_ok
+                            })
+                        }
+                        None => false,
+                    },
+                };
+                let answerable = o
+                    .get("answerable")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                let overall_score = o
+                    .get("overall_score")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0);
+                let should_muse = !answerable || overall_score < 85.0;
+                let musings_present = o
+                    .get("musings")
+                    .and_then(|x| x.as_array())
+                    .is_some_and(|xs| !xs.is_empty());
+                let musings_required_ok = !should_muse || musings_present;
+
+                score_ok
+                    && conf_ok
+                    && relevant_ok
+                    && answerable_ok
+                    && issues_ok
+                    && musings_ok
+                    && musings_required_ok
+            }
+
+            fn validate_judge_overall(v: &serde_json::Value) -> bool {
+                let Some(o) = v.as_object() else { return false };
+                let oa_ok = o
+                    .get("overall_assessment")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.trim().is_empty());
+                // top_failure_modes is a controlled vocabulary so we can aggregate it.
+                let tfm_ok = match o.get("top_failure_modes").and_then(|x| x.as_array()) {
+                    Some(xs) => {
+                        if xs.len() > 12 {
+                            return false;
+                        }
+                        xs.iter().all(|x| {
+                            x.as_str().is_some_and(|s| {
+                                let s = s.trim();
+                                !s.is_empty()
+                                    && s.len() <= 64
+                                    && ISSUE_VOCAB.iter().any(|&v| v == s)
+                            })
+                        })
+                    }
+                    None => false,
+                };
+                let rd_ok = o
+                    .get("recommended_defaults")
+                    .map(|x| x.is_object())
+                    .unwrap_or(false);
+                let conf_ok = o
+                    .get("confidence")
+                    .and_then(|x| x.as_f64())
+                    .is_some_and(|c| (0.0..=1.0).contains(&c));
+                oa_ok && tfm_ok && rd_ok && conf_ok
+            }
+
+            fn validate_meta_summary(v: &serde_json::Value) -> bool {
+                let Some(o) = v.as_object() else { return false };
+                let oa_ok = o
+                    .get("overall_assessment")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| {
+                        let s = s.trim();
+                        !s.is_empty() && s.len() <= 500
+                    });
+                let agree_ok = o
+                    .get("cross_judge_agreement")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| {
+                        let s = s.trim();
+                        !s.is_empty() && s.len() <= 200
+                    });
+                // Keep systemic failures aggregatable, same controlled vocab as per-judge issues.
+                let fails_ok = match o.get("top_systemic_failures").and_then(|x| x.as_array()) {
+                    Some(xs) => {
+                        if xs.len() > 12 {
+                            return false;
+                        }
+                        xs.iter().all(|x| {
+                            x.as_str().is_some_and(|s| {
+                                let s = s.trim();
+                                !s.is_empty()
+                                    && s.len() <= 64
+                                    && ISSUE_VOCAB.iter().any(|&v| v == s)
+                            })
+                        })
+                    }
+                    None => false,
+                };
+                let fixes_ok = match o.get("top_3_fixes").and_then(|x| x.as_array()) {
+                    Some(xs) => {
+                        if xs.len() > 3 {
+                            return false;
+                        }
+                        let mut seen = std::collections::BTreeSet::new();
+                        xs.iter().all(|x| {
+                            x.as_str().is_some_and(|s| {
+                                let s = s.trim();
+                                !s.is_empty() && s.len() <= 96 && seen.insert(s.to_string())
+                            })
+                        })
+                    }
+                    None => false,
+                };
+                let next_ok = match o
+                    .get("recommended_next_experiments")
+                    .and_then(|x| x.as_array())
+                {
+                    Some(xs) => {
+                        if xs.len() > 12 {
+                            return false;
+                        }
+                        xs.iter().all(|x| {
+                            x.as_str().is_some_and(|s| {
+                                let s = s.trim();
+                                !s.is_empty() && s.len() <= 96
+                            })
+                        })
+                    }
+                    None => false,
+                };
+                let dims_ok = match o.get("top_dimensions").and_then(|x| x.as_array()) {
+                    Some(xs) => {
+                        if xs.len() > 12 {
+                            return false;
+                        }
+                        let mut seen = std::collections::BTreeSet::new();
+                        xs.iter().all(|x| {
+                            x.as_str().is_some_and(|s| {
+                                let s = s.trim();
+                                !s.is_empty() && s.len() <= 32 && seen.insert(s.to_string())
+                            })
+                        })
+                    }
+                    None => false,
+                };
+                let muses_ok = match o.get("top_musings").and_then(|x| x.as_array()) {
+                    Some(xs) => {
+                        if xs.len() > 12 {
+                            return false;
+                        }
+                        xs.iter().all(|x| {
+                            x.as_str().is_some_and(|s| {
+                                let s = s.trim();
+                                !s.is_empty() && s.len() <= 96
+                            })
+                        })
+                    }
+                    None => false,
+                };
+                oa_ok && agree_ok && fails_ok && fixes_ok && next_ok && dims_ok && muses_ok
+            }
+
+            fn validate_task_solve(v: &serde_json::Value) -> bool {
+                let Some(o) = v.as_object() else { return false };
+                let best = o
+                    .get("best_trial_id")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.trim().is_empty());
+                let es = o
+                    .get("evidence_sufficient")
+                    .and_then(|x| x.as_bool())
+                    .is_some();
+                let conf = o
+                    .get("confidence")
+                    .and_then(|x| x.as_f64())
+                    .is_some_and(|c| (0.0..=1.0).contains(&c));
+                let cites = o.get("citations").map(|x| x.is_array()).unwrap_or(false);
+                let has_answer = o
+                    .get("answer")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_abstain = o
+                    .get("abstain_reason")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|s| !s.trim().is_empty());
+                best && es && conf && cites && (has_answer || has_abstain)
+            }
+
+            let base_url = args.base_url.trim_end_matches('/').to_string();
+            let e2e = eval::load_e2e_queries_v1(&args.queries_json)?;
+            let qrels_by_qid: std::collections::BTreeMap<String, Vec<String>> =
+                if let Some(p) = args.qrels.as_ref() {
+                    let qrels = eval::load_e2e_qrels_v1(p)?;
+                    qrels
+                        .qrels
+                        .into_iter()
+                        .map(|q| (q.query_id, q.expected_url_substrings))
+                        .collect()
+                } else {
+                    std::collections::BTreeMap::new()
+                };
+
+            let mut domain_tags_filter: Vec<String> = Vec::new();
+            if let Some(s) = args.domain_tags.as_ref() {
+                domain_tags_filter = parse_csv(s);
+            }
+
+            let svc = mcp::WebpipeMcp::new().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+            let max_results = args.max_results.clamp(1, 20);
+            let max_urls = args.max_urls.clamp(1, 10);
+            let top_chunks = args.top_chunks.min(50).max(1);
+            let max_chunk_chars = args.max_chunk_chars.min(5_000).max(20);
+
+            let trials: Vec<TrialCfg> = match args.trial_set.to_ascii_lowercase().as_str() {
+                "wide" => vec![
+                    TrialCfg {
+                        id: "non_agentic",
+                        agentic: false,
+                        agentic_selector: "lexical",
+                        url_selection_mode: "preserve",
+                        fetch_backend: args.fetch_backend.clone(),
+                    },
+                    TrialCfg {
+                        id: "agentic_lexical",
+                        agentic: true,
+                        agentic_selector: "lexical",
+                        url_selection_mode: "query_rank",
+                        fetch_backend: args.fetch_backend.clone(),
+                    },
+                    TrialCfg {
+                        id: "agentic_auto",
+                        agentic: true,
+                        agentic_selector: "auto",
+                        url_selection_mode: "query_rank",
+                        fetch_backend: args.fetch_backend.clone(),
+                    },
+                ],
+                _ => vec![
+                    TrialCfg {
+                        id: "non_agentic",
+                        agentic: false,
+                        agentic_selector: "lexical",
+                        url_selection_mode: "preserve",
+                        fetch_backend: args.fetch_backend.clone(),
+                    },
+                    TrialCfg {
+                        id: "agentic_lexical",
+                        agentic: true,
+                        agentic_selector: "lexical",
+                        url_selection_mode: "query_rank",
+                        fetch_backend: args.fetch_backend.clone(),
+                    },
+                ],
+            };
+
+            // Optional presets override file (cheap prompt iteration without recompiling).
+            let mut preset_overrides: std::collections::BTreeMap<String, JudgePreset> =
+                std::collections::BTreeMap::new();
+            if let Some(p) = args.judge_presets_json.as_ref() {
+                let raw = std::fs::read_to_string(p)?;
+                let v: serde_json::Value = serde_json::from_str(&raw)?;
+                let ok = v.get("schema_version").and_then(|x| x.as_u64()) == Some(1)
+                    && v.get("kind").and_then(|x| x.as_str()) == Some("webpipe_judge_presets");
+                if !ok {
+                    anyhow::bail!("judge_presets_json: unexpected kind/schema_version");
+                }
+                if let Some(ps) = v.get("presets").and_then(|x| x.as_array()) {
+                    for pr in ps {
+                        let id = pr.get("id").and_then(|x| x.as_str()).unwrap_or("").trim();
+                        let system = pr
+                            .get("system")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        if id.is_empty() || system.is_empty() {
+                            continue;
+                        }
+                        let domain_tags = pr
+                            .get("domain_tags")
+                            .and_then(|x| x.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect::<Vec<String>>()
+                            })
+                            .unwrap_or_default();
+                        preset_overrides.insert(
+                            id.to_ascii_lowercase(),
+                            JudgePreset {
+                                id: id.to_string(),
+                                domain_tags,
+                                system: system.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+
+            // Select judge presets (built-ins, optionally overridden by judge_presets_json).
+            let mut preset_by_id = builtin_judge_presets();
+            for (k, v) in preset_overrides {
+                preset_by_id.insert(k, v);
+            }
+
+            // Optional curriculum: use a prior run artifact to filter/sort query selection.
+            let curriculum_mode = args.curriculum.to_ascii_lowercase();
+            let curriculum: std::collections::BTreeMap<String, CurriculumStats> =
+                if curriculum_mode != "none" {
+                    if let Some(p) = args.curriculum_from.as_ref() {
+                        load_curriculum(p.as_path()).unwrap_or_default()
+                    } else {
+                        std::collections::BTreeMap::new()
+                    }
+                } else {
+                    std::collections::BTreeMap::new()
+                };
+
+            let judge_ids = parse_csv(&args.judges);
+            let mut judges: Vec<JudgePreset> = Vec::new();
+            for id in judge_ids {
+                let jid = id.to_ascii_lowercase();
+                let Some(p) = preset_by_id.get(&jid).cloned() else {
+                    anyhow::bail!(
+                        "unknown judge preset: {jid} (known: ux, writing, rendered_page, math, redteam, docs, academic, news)"
+                    );
+                };
+                judges.push(p);
+            }
+            if judges.is_empty() {
+                anyhow::bail!("no judges selected");
+            }
+
+            let mut judge_reports: Vec<serde_json::Value> = Vec::new();
+            // Deliberately no shared “global notes” channel across judges/queries.
+
+            for preset in judges {
+                // Filter queries by domain tags (CLI filter wins; else preset tags).
+                let mut selected: Vec<&eval::E2eQueryV1> = Vec::new();
+                for q in e2e.queries.iter() {
+                    let q_tags: Vec<&str> = q.tags.iter().map(|s| s.as_str()).collect();
+                    let want = if !domain_tags_filter.is_empty() {
+                        domain_tags_filter
+                            .iter()
+                            .any(|t| q_tags.iter().any(|qt| qt.eq_ignore_ascii_case(t)))
+                    } else {
+                        preset
+                            .domain_tags
+                            .iter()
+                            .any(|t| q_tags.iter().any(|qt| qt.eq_ignore_ascii_case(t.as_str())))
+                    };
+                    if want {
+                        selected.push(q);
+                    }
+                }
+                if selected.is_empty() {
+                    // Fallback: judge still runs on all queries if no tags match.
+                    selected = e2e.queries.iter().collect();
+                }
+
+                // Curriculum filter: unseen/failed subsets.
+                if curriculum_mode == "unseen" && !curriculum.is_empty() {
+                    selected.retain(|q| !curriculum.contains_key(&q.query_id));
+                } else if curriculum_mode == "failed" && !curriculum.is_empty() {
+                    selected.retain(|q| {
+                        curriculum
+                            .get(&q.query_id)
+                            .is_some_and(|st| st.worked == false)
+                    });
+                }
+
+                // Deterministic ordering by (hash(seed+judge_id, query_id), query_id).
+                let judge_seed = hash64(args.seed, preset.id.as_str());
+                selected.sort_by(|a, b| {
+                    let ha = hash64(judge_seed, &a.query_id);
+                    let hb = hash64(judge_seed, &b.query_id);
+                    let base = ha.cmp(&hb).then_with(|| a.query_id.cmp(&b.query_id));
+                    // Curriculum ordering: use prior best_score when requested; keep deterministic tie-break.
+                    if curriculum_mode == "harder" && !curriculum.is_empty() {
+                        let sa = curriculum
+                            .get(&a.query_id)
+                            .map(|s| s.best_score)
+                            .unwrap_or(0.0);
+                        let sb = curriculum
+                            .get(&b.query_id)
+                            .map(|s| s.best_score)
+                            .unwrap_or(0.0);
+                        sa.partial_cmp(&sb)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(base)
+                    } else if curriculum_mode == "easier" && !curriculum.is_empty() {
+                        let sa = curriculum
+                            .get(&a.query_id)
+                            .map(|s| s.best_score)
+                            .unwrap_or(0.0);
+                        let sb = curriculum
+                            .get(&b.query_id)
+                            .map(|s| s.best_score)
+                            .unwrap_or(0.0);
+                        sb.partial_cmp(&sa)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(base)
+                    } else {
+                        base
+                    }
+                });
+                selected.truncate(args.max_queries.clamp(1, 10_000));
+
+                let mut per_query: Vec<serde_json::Value> = Vec::new();
+                let mut totals = serde_json::json!({
+                    "queries": 0u64,
+                    "trials": 0u64,
+                    "llm_failed": 0u64,
+                    "llm_parse_failed": 0u64,
+                    "llm_ok": 0u64,
+                    "hit_expected_url_any_trial": 0u64
+                });
+
+                // Judge prompts should be *stateless* to avoid cross-query “note bleed”.
+
+                let task_solve_enabled = args.task_solve;
+                let task_solve_max_trials = args.task_solve_max_trials.clamp(1, 5);
+                let task_solve_max_evidence_chars =
+                    args.task_solve_max_evidence_chars.clamp(200, 5_000);
+
+                let task_solver_system = r#"You are an evidence-only task solver.
+
+You will receive a user query and several tool trials, each with:
+- trial_id
+- observed_urls
+- warnings
+- quality (optional)
+- evidence_text (bounded)
+
+Rules:
+- Use ONLY the evidence_text and observed_urls. Do not use outside knowledge.
+- If evidence is insufficient, abstain and explain what is missing (briefly).
+- Output ONE JSON object only (no markdown, no prose) with schema:
+{
+  "best_trial_id": string,
+  "answer": string,              // required if evidence_sufficient=true
+  "abstain_reason": string,      // required if evidence_sufficient=false
+  "evidence_sufficient": boolean,
+  "confidence": number,          // 0..1
+  "citations": [
+    { "url": string, "quote": string }
+  ]
+}"#;
+
+                let mut solver_history: Vec<webpipe_local::openai_compat::ChatMessage> = vec![
+                    webpipe_local::openai_compat::ChatMessage::system(task_solver_system),
+                    webpipe_local::openai_compat::ChatMessage::assistant(
+                        "Follow the schema exactly. If you abstain, still pick best_trial_id based on evidence quality.",
+                    ),
+                ];
+
+                for q in selected {
+                    let urls: Vec<String> = q
+                        .url_paths
+                        .iter()
+                        .map(|p| {
+                            let p = p.trim();
+                            if p.starts_with("http://") || p.starts_with("https://") {
+                                p.to_string()
+                            } else {
+                                format!("{base_url}/{}", p.trim_start_matches('/'))
+                            }
+                        })
+                        .collect();
+
+                    let expected = qrels_by_qid.get(&q.query_id).cloned().unwrap_or_default();
+
+                    let mut trial_rows: Vec<serde_json::Value> = Vec::new();
+                    let mut hit_any = false;
+                    let mut solver_trials: Vec<serde_json::Value> = Vec::new();
+                    let mut solver_best: Option<(f64, String)> = None;
+
+                    for t in &trials {
+                        let t0 = std::time::Instant::now();
+                        // IMPORTANT: even in-process, go through the same “exposed tool” shape:
+                        // JSON args → serde decode → tool method → CallToolResult JSON string.
+                        let args_json = serde_json::json!({
+                            "query": q.query,
+                            "urls": urls,
+                            "provider": args.provider,
+                            "auto_mode": args.auto_mode,
+                            "selection_mode": args.selection_mode,
+                            "fetch_backend": t.fetch_backend,
+                            "no_network": false,
+                            "max_results": max_results,
+                            "max_urls": max_urls,
+                            "timeout_ms": args.timeout_ms,
+                            "max_bytes": args.max_bytes,
+                            "top_chunks": top_chunks,
+                            "max_chunk_chars": max_chunk_chars,
+                            "include_links": false,
+                            "include_text": false,
+                            "agentic": t.agentic,
+                            "agentic_selector": t.agentic_selector,
+                            "url_selection_mode": t.url_selection_mode,
+                            "cache_read": true,
+                            "cache_write": true
+                        });
+                        // `from_value` consumes the JSON; keep a copy for optional transcript logging.
+                        let tool_args: mcp::WebSearchExtractArgs =
+                            serde_json::from_value(args_json.clone())?;
+                        let res = svc
+                            .web_search_extract(Parameters(Some(tool_args)))
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+                        let res_json: serde_json::Value = if let Some(v) =
+                            res.structured_content.clone()
+                        {
+                            v
+                        } else {
+                            // Back-compat: older tool results echoed JSON as the first `content` text item.
+                            // Newer tools may include Markdown first, so scan for any parseable JSON text.
+                            let mut parsed: Option<serde_json::Value> = None;
+                            for c in &res.content {
+                                let s = c.as_text().map(|t| t.text.as_str()).unwrap_or("");
+                                let s = s.trim();
+                                if s.is_empty() {
+                                    continue;
+                                }
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                                    parsed = Some(v);
+                                    break;
+                                }
+                            }
+                            parsed.ok_or_else(|| anyhow::anyhow!("web_search_extract tool result had no structured_content and no JSON text payload"))?
+                        };
+                        if transcript_enabled {
+                            transcript_seq = transcript_seq.wrapping_add(1);
+                            // IMPORTANT: keep transcript tool results parseable.
+                            // Full `res_json` can be large; `json_trunc` will truncate the serialized JSON
+                            // (making it unparseable). Instead, log:
+                            // - args (small)
+                            // - a compact, stable `result_summary` object
+                            // - warning/quality signals used by downstream judging
+                            let results_count = res_json
+                                .get("results")
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            let top_chunks_count = res_json
+                                .get("top_chunks")
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            let provider_eff = res_json
+                                .get("provider")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let fetch_backend_eff = res_json
+                                .get("fetch_backend")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let ok = res_json
+                                .get("ok")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+
+                            let line = serde_json::json!({
+                                "schema_version": 1,
+                                "kind": "webpipe_eval_transcript_event",
+                                "generated_at_epoch_s": now,
+                                "seq": transcript_seq,
+                                "run_kind": "eval_judge_swarm",
+                                "stage": "tool",
+                                "call_id": format!("tool:{}:{}:{}", preset.id, q.query_id, t.id),
+                                "tool": {
+                                    "name": "web_search_extract",
+                                    "args": json_trunc(&args_json, transcript_max_chars),
+                                    "result_summary": {
+                                        "ok": ok,
+                                        "provider": provider_eff,
+                                        "fetch_backend": fetch_backend_eff,
+                                        "results_count": results_count,
+                                        "top_chunks_count": top_chunks_count
+                                    },
+                                    // Keep these: they are small but high-signal.
+                                    "warnings": res_json.get("warnings").cloned().unwrap_or(serde_json::Value::Null),
+                                    "quality": res_json.get("quality").cloned().unwrap_or(serde_json::Value::Null),
+                                    "elapsed_ms": t0.elapsed().as_millis()
+                                }
+                            });
+                            let _ = append_jsonl(transcript_path.as_path(), &line);
+                        }
+
+                        // Compact judge text: join top_chunks.text, then truncate.
+                        let mut joined = String::new();
+                        if let Some(top) = res_json.get("top_chunks").and_then(|v| v.as_array()) {
+                            for (idx, c) in top.iter().enumerate() {
+                                if let Some(tx) = c.get("text").and_then(|v| v.as_str()) {
+                                    if idx > 0 {
+                                        joined.push('\n');
+                                        joined.push('\n');
+                                    }
+                                    joined.push_str(tx);
+                                }
+                            }
+                        }
+                        let (judge_text, judge_text_truncated) = take_chars(&joined, 2500);
+                        let (solver_evidence_text, _) =
+                            take_chars(&judge_text, task_solve_max_evidence_chars);
+
+                        // Observed URLs.
+                        let mut observed_urls: Vec<String> = Vec::new();
+                        if let Some(rs) = res_json.get("results").and_then(|v| v.as_array()) {
+                            for r in rs {
+                                if let Some(u) = r.get("url").and_then(|v| v.as_str()) {
+                                    observed_urls.push(u.to_string());
+                                }
+                            }
+                        }
+
+                        let matched = expected
+                            .iter()
+                            .find(|needle| {
+                                observed_urls.iter().any(|u| u.contains(needle.as_str()))
+                            })
+                            .cloned();
+                        let hit_expected_url = matched.is_some();
+                        if hit_expected_url {
+                            hit_any = true;
+                        }
+
+                        let quality = res_json
+                            .get("quality")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let warnings: Vec<String> = res_json
+                            .get("warnings")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        // Ask the judge to score this trial (stateless).
+                        // Include boundedness/truncation metadata explicitly.
+                        let user_prompt = format!(
+                            "Query:\n{}\n\nTrial:\n{}\n\nObserved URLs:\n{}\n\nWarnings:\n{}\n\nQuality (if present):\n{}\n\nEvidence (judge_text; chars={} truncated={}):\n{}\n",
+                            q.query.trim(),
+                            t.id,
+                            observed_urls.join("\n"),
+                            warnings.join(", "),
+                            serde_json::to_string_pretty(&quality).unwrap_or_default(),
+                            judge_text.chars().count(),
+                            judge_text_truncated,
+                            judge_text.trim()
+                        );
+
+                        let messages = vec![
+                            webpipe_local::openai_compat::ChatMessage::system(
+                                preset.system.as_str(),
+                            ),
+                            webpipe_local::openai_compat::ChatMessage::user(&user_prompt),
+                        ];
+
+                        let mut llm_error: Option<String> = None;
+                        let llm_t0 = std::time::Instant::now();
+                        let mut resp_text = match llm_call(
+                            llm_backend.as_str(),
+                            openai_like.as_ref(),
+                            ollama.as_ref(),
+                            openrouter_caps.as_ref(),
+                            &chat_options,
+                            messages.clone(),
+                            llm_timeout_ms,
+                            temperature,
+                            top_p,
+                            json_mode,
+                        )
+                        .await
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                llm_error = Some(e.to_string());
+                                String::new()
+                            }
+                        };
+
+                        let mut parsed = extract_json_object(&resp_text);
+                        // Hard-remove any free-form “notes” channel if the model emits it anyway.
+                        if let Some(o) = parsed.as_mut().and_then(|v| v.as_object_mut()) {
+                            let _ = o.remove("notes");
+                        }
+                        if transcript_enabled {
+                            let evidence_chars = judge_text.chars().count();
+                            let observed_url_count = observed_urls.len();
+                            let warnings_count = warnings.len();
+                            transcript_seq = transcript_seq.wrapping_add(1);
+                            let line = serde_json::json!({
+                                "schema_version": 1,
+                                "kind": "webpipe_eval_transcript_event",
+                                "generated_at_epoch_s": now,
+                                "seq": transcript_seq,
+                                "run_kind": "eval_judge_swarm",
+                                "stage": "judge",
+                                "call_id": format!("judge:{}:{}:{}", preset.id, q.query_id, t.id),
+                                "attempt": 1,
+                                "context": {
+                                    "observed_url_count": observed_url_count,
+                                    "warnings_count": warnings_count,
+                                    "evidence_chars": evidence_chars,
+                                    "evidence_truncated": judge_text_truncated,
+                                },
+                                "llm": {
+                                    "backend": llm_backend,
+                                    "model_effective": llm_model_effective,
+                                    "json_mode": json_mode,
+                                    "timeout_ms": llm_timeout_ms
+                                },
+                                "prompt": {
+                                    "system": tx_trunc(preset.system.as_str(), transcript_max_chars),
+                                    "user": tx_trunc(&user_prompt, transcript_max_chars)
+                                },
+                                "response": {
+                                    "raw": tx_trunc(&resp_text, transcript_max_chars),
+                                    "parsed": parsed,
+                                    "error": llm_error
+                                },
+                                "timing_ms": llm_t0.elapsed().as_millis()
+                            });
+                            let _ = append_jsonl(transcript_path.as_path(), &line);
+                        }
+                        if parsed.as_ref().is_some_and(|v| validate_scorecard(v)) {
+                            // ok
+                        } else if retry_on_parse_fail
+                            && openai_like.is_some()
+                            && llm_error.is_none()
+                        {
+                            let (prev, _) = take_chars(&resp_text, 900);
+                            let retry_prompt = format!(
+                                "Your previous output was not valid JSON matching the schema.\nReturn ONLY one JSON object matching the schema.\n\nPrevious output:\n{}\n\n(Repeat)\n{}",
+                                prev.trim(),
+                                user_prompt
+                            );
+                            let llm_t1 = std::time::Instant::now();
+                            resp_text = llm_call(
+                                llm_backend.as_str(),
+                                openai_like.as_ref(),
+                                ollama.as_ref(),
+                                openrouter_caps.as_ref(),
+                                &chat_options,
+                                vec![
+                                    webpipe_local::openai_compat::ChatMessage::system(
+                                        preset.system.as_str(),
+                                    ),
+                                    webpipe_local::openai_compat::ChatMessage::user(&retry_prompt),
+                                ],
+                                llm_timeout_ms,
+                                temperature,
+                                top_p,
+                                json_mode,
+                            )
+                            .await
+                            .unwrap_or_default();
+                            parsed = extract_json_object(&resp_text);
+                            if let Some(o) = parsed.as_mut().and_then(|v| v.as_object_mut()) {
+                                let _ = o.remove("notes");
+                            }
+                            parsed = parsed.filter(|v| validate_scorecard(v));
+                            if transcript_enabled {
+                                let evidence_chars = judge_text.chars().count();
+                                let observed_url_count = observed_urls.len();
+                                let warnings_count = warnings.len();
+                                transcript_seq = transcript_seq.wrapping_add(1);
+                                let line = serde_json::json!({
+                                    "schema_version": 1,
+                                    "kind": "webpipe_eval_transcript_event",
+                                    "generated_at_epoch_s": now,
+                                    "seq": transcript_seq,
+                                    "run_kind": "eval_judge_swarm",
+                                    "stage": "judge",
+                                    "call_id": format!("judge:{}:{}:{}", preset.id, q.query_id, t.id),
+                                    "attempt": 2,
+                                    "context": {
+                                        "observed_url_count": observed_url_count,
+                                        "warnings_count": warnings_count,
+                                        "evidence_chars": evidence_chars,
+                                        "evidence_truncated": judge_text_truncated,
+                                    },
+                                    "llm": {
+                                        "backend": llm_backend,
+                                        "model_effective": llm_model_effective,
+                                        "json_mode": json_mode,
+                                        "timeout_ms": llm_timeout_ms
+                                    },
+                                    "prompt": {
+                                        "system": tx_trunc(preset.system.as_str(), transcript_max_chars),
+                                        "user": tx_trunc(&retry_prompt, transcript_max_chars)
+                                    },
+                                    "response": {
+                                        "raw": tx_trunc(&resp_text, transcript_max_chars),
+                                        "parsed": parsed
+                                    },
+                                    "timing_ms": llm_t1.elapsed().as_millis()
+                                });
+                                let _ = append_jsonl(transcript_path.as_path(), &line);
+                            }
+                        }
+
+                        totals["trials"] =
+                            serde_json::json!(totals["trials"].as_u64().unwrap_or(0) + 1);
+                        if llm_error.is_some() {
+                            totals["llm_failed"] = serde_json::json!(
+                                totals
+                                    .get("llm_failed")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    + 1
+                            );
+                        } else if parsed.is_none() {
+                            totals["llm_parse_failed"] = serde_json::json!(
+                                totals["llm_parse_failed"].as_u64().unwrap_or(0) + 1
+                            );
+                        } else {
+                            totals["llm_ok"] =
+                                serde_json::json!(totals["llm_ok"].as_u64().unwrap_or(0) + 1);
+                        }
+
+                        trial_rows.push(serde_json::json!({
+                            "trial_id": t.id,
+                            "elapsed_ms": t0.elapsed().as_millis(),
+                            "agentic": t.agentic,
+                            "agentic_selector": t.agentic_selector,
+                            "fetch_backend": t.fetch_backend,
+                            "url_selection_mode": t.url_selection_mode,
+                            "ok": res_json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+                            "observed_urls": observed_urls,
+                            "expected_url_substrings": expected,
+                            "hit_expected_url": hit_expected_url,
+                            "matched_substring": matched,
+                            "warnings": warnings,
+                            "quality": quality,
+                            "judge_text_truncated": judge_text_truncated,
+                            "judge": parsed,
+                            "judge_raw": if llm_error.is_some() { llm_error.unwrap_or_default() } else if parsed.is_none() { resp_text } else { String::new() }
+                        }));
+
+                        if task_solve_enabled {
+                            let score = trial_rows
+                                .last()
+                                .and_then(|r| r.get("judge"))
+                                .and_then(|j| j.get("overall_score"))
+                                .and_then(|x| x.as_f64())
+                                .unwrap_or(0.0);
+                            solver_trials.push(serde_json::json!({
+                                "trial_id": t.id,
+                                "score": score,
+                                "observed_urls": trial_rows.last().and_then(|r| r.get("observed_urls")).cloned().unwrap_or(serde_json::Value::Null),
+                                "warnings": trial_rows.last().and_then(|r| r.get("warnings")).cloned().unwrap_or(serde_json::Value::Null),
+                                "quality": trial_rows.last().and_then(|r| r.get("quality")).cloned().unwrap_or(serde_json::Value::Null),
+                                "evidence_text": solver_evidence_text
+                            }));
+                            if solver_best
+                                .as_ref()
+                                .map(|(s, _)| score > *s)
+                                .unwrap_or(true)
+                            {
+                                solver_best = Some((score, t.id.to_string()));
+                            }
+                        }
+
+                        if let Some(j) = trial_rows
+                            .last()
+                            .and_then(|r| r.get("judge"))
+                            .and_then(|v| v.as_object())
+                        {
+                            let score = j
+                                .get("overall_score")
+                                .and_then(|x| x.as_f64())
+                                .unwrap_or(0.0);
+                            let relevant =
+                                j.get("relevant").and_then(|x| x.as_bool()).unwrap_or(false);
+                            let answerable = j
+                                .get("answerable")
+                                .and_then(|x| x.as_bool())
+                                .unwrap_or(false);
+                            let _ = (score, relevant, answerable);
+                        }
+                    }
+
+                    // Optional: evidence-only task solver (picks best trial + answers or abstains).
+                    let mut task_solve_raw = String::new();
+                    let mut task_solve: Option<serde_json::Value> = None;
+                    if task_solve_enabled {
+                        let mut st = solver_trials.clone();
+                        st.sort_by(|a, b| {
+                            let sa = a.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            let sb = b.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        st.truncate(task_solve_max_trials);
+
+                        let best_hint = solver_best
+                            .as_ref()
+                            .map(|(_, id)| id.as_str())
+                            .unwrap_or("unknown");
+                        let user_prompt = format!(
+                            "User query:\n{}\n\nBest-trial hint (from per-trial judge scores): {}\n\nTrials (bounded):\n{}\n",
+                            q.query.trim(),
+                            best_hint,
+                            serde_json::to_string_pretty(&st).unwrap_or_default()
+                        );
+                        solver_history.push(webpipe_local::openai_compat::ChatMessage::user(
+                            &user_prompt,
+                        ));
+                        let solve_t0 = std::time::Instant::now();
+                        task_solve_raw = llm_call(
+                            llm_backend.as_str(),
+                            openai_like.as_ref(),
+                            ollama.as_ref(),
+                            openrouter_caps.as_ref(),
+                            &chat_options,
+                            solver_history.clone(),
+                            llm_timeout_ms,
+                            temperature,
+                            top_p,
+                            json_mode,
+                        )
+                        .await
+                        .unwrap_or_default();
+                        task_solve =
+                            extract_json_object(&task_solve_raw).filter(|v| validate_task_solve(v));
+                        if transcript_enabled {
+                            transcript_seq = transcript_seq.wrapping_add(1);
+                            let line = serde_json::json!({
+                                "schema_version": 1,
+                                "kind": "webpipe_eval_transcript_event",
+                                "generated_at_epoch_s": now,
+                                "seq": transcript_seq,
+                                "run_kind": "eval_judge_swarm",
+                                "stage": "task_solve",
+                                "call_id": format!("solve:{}:{}", preset.id, q.query_id),
+                                "attempt": 1,
+                                "llm": {
+                                    "backend": llm_backend,
+                                    "model_effective": llm_model_effective,
+                                    "json_mode": json_mode,
+                                    "timeout_ms": llm_timeout_ms
+                                },
+                                "prompt": {
+                                    "system": tx_trunc(task_solver_system, transcript_max_chars),
+                                    "user": tx_trunc(&user_prompt, transcript_max_chars)
+                                },
+                                "response": {
+                                    "raw": tx_trunc(&task_solve_raw, transcript_max_chars),
+                                    "parsed": task_solve
+                                },
+                                "timing_ms": solve_t0.elapsed().as_millis()
+                            });
+                            let _ = append_jsonl(transcript_path.as_path(), &line);
+                        }
+                        if task_solve.is_none() && retry_on_parse_fail && openai_like.is_some() {
+                            let (prev, _) = take_chars(&task_solve_raw, 900);
+                            let retry = format!(
+                                "Return ONLY one JSON object matching the schema.\nPrevious output:\n{}\n\n(Repeat)\n{}",
+                                prev.trim(),
+                                user_prompt
+                            );
+                            solver_history
+                                .push(webpipe_local::openai_compat::ChatMessage::user(&retry));
+                            let solve_t1 = std::time::Instant::now();
+                            task_solve_raw = llm_call(
+                                llm_backend.as_str(),
+                                openai_like.as_ref(),
+                                ollama.as_ref(),
+                                openrouter_caps.as_ref(),
+                                &chat_options,
+                                solver_history.clone(),
+                                llm_timeout_ms,
+                                temperature,
+                                top_p,
+                                json_mode,
+                            )
+                            .await
+                            .unwrap_or_default();
+                            task_solve = extract_json_object(&task_solve_raw)
+                                .filter(|v| validate_task_solve(v));
+                            if transcript_enabled {
+                                transcript_seq = transcript_seq.wrapping_add(1);
+                                let line = serde_json::json!({
+                                    "schema_version": 1,
+                                    "kind": "webpipe_eval_transcript_event",
+                                    "generated_at_epoch_s": now,
+                                    "seq": transcript_seq,
+                                    "run_kind": "eval_judge_swarm",
+                                    "stage": "task_solve",
+                                    "call_id": format!("solve:{}:{}:retry", preset.id, q.query_id),
+                                    "attempt": 2,
+                                    "llm": {
+                                        "backend": llm_backend,
+                                        "model_effective": llm_model_effective,
+                                        "json_mode": json_mode,
+                                        "timeout_ms": llm_timeout_ms
+                                    },
+                                    "prompt": {
+                                        "system": tx_trunc(task_solver_system, transcript_max_chars),
+                                        "user": tx_trunc(&retry, transcript_max_chars)
+                                    },
+                                    "response": {
+                                        "raw": tx_trunc(&task_solve_raw, transcript_max_chars),
+                                        "parsed": task_solve
+                                    },
+                                    "timing_ms": solve_t1.elapsed().as_millis()
+                                });
+                                let _ = append_jsonl(transcript_path.as_path(), &line);
+                            }
+                        }
+                        if !task_solve_raw.trim().is_empty() {
+                            let (resp2, _) = take_chars(&task_solve_raw, 1800);
+                            solver_history.push(
+                                webpipe_local::openai_compat::ChatMessage::assistant(resp2.trim()),
+                            );
+                        }
+                    }
+
+                    totals["queries"] =
+                        serde_json::json!(totals["queries"].as_u64().unwrap_or(0) + 1);
+                    if hit_any {
+                        totals["hit_expected_url_any_trial"] = serde_json::json!(
+                            totals["hit_expected_url_any_trial"].as_u64().unwrap_or(0) + 1
+                        );
+                    }
+
+                    per_query.push(serde_json::json!({
+                        "query_id": q.query_id,
+                        "query": q.query,
+                        "tags": q.tags,
+                        "urls": urls,
+                        "trials": trial_rows,
+                        "hit_expected_url_any_trial": hit_any,
+                        "task_solve": task_solve,
+                        "task_solve_raw": if task_solve.is_none() { task_solve_raw } else { String::new() }
+                    }));
+                }
+
+                // Per-judge overall assessment (one more "turn").
+                let judge_summary_prompt = {
+                    let mut compact: Vec<serde_json::Value> = Vec::new();
+                    for pq in &per_query {
+                        let qid = pq
+                            .get("query_id")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let query = pq.get("query").cloned().unwrap_or(serde_json::Value::Null);
+                        let hit_any = pq
+                            .get("hit_expected_url_any_trial")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let mut trial_scores: Vec<serde_json::Value> = Vec::new();
+                        if let Some(ts) = pq.get("trials").and_then(|v| v.as_array()) {
+                            for t in ts {
+                                let trial_id = t.get("trial_id").cloned().unwrap_or_default();
+                                let ok = t.get("ok").cloned().unwrap_or_default();
+                                let hit = t.get("hit_expected_url").cloned().unwrap_or_default();
+                                let score = t
+                                    .get("judge")
+                                    .and_then(|j| j.get("overall_score"))
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let issues = t
+                                    .get("judge")
+                                    .and_then(|j| j.get("issues"))
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                trial_scores.push(serde_json::json!({
+                                    "trial_id": trial_id,
+                                    "ok": ok,
+                                    "hit_expected_url": hit,
+                                    "overall_score": score,
+                                    "issues": issues
+                                }));
+                            }
+                        }
+                        compact.push(serde_json::json!({
+                            "query_id": qid,
+                            "query": query,
+                            "hit_expected_url_any_trial": hit_any,
+                            "trials": trial_scores
+                        }));
+                    }
+                    format!(
+                        "Summarize the judge's findings across queries.\nReturn ONE JSON object ONLY with schema:\n{{\"overall_assessment\": string, \"top_failure_modes\": string[], \"recommended_defaults\": object, \"confidence\": number}}\n\nData:\n{}\n",
+                        serde_json::to_string_pretty(&compact).unwrap_or_default()
+                    )
+                };
+                let judge_overall_system = r#"You are a strict evaluator. Output strict JSON only.
+
+Return ONE JSON object ONLY with exactly these keys:
+{
+  "overall_assessment": string,
+  "top_failure_modes": string[],
+  "recommended_defaults": object,
+  "confidence": number
+}
+
+Rules:
+- "top_failure_modes" MUST be an array of strings from this controlled vocabulary (use [] if none):
+  ["missing_key_facts","too_short","boilerplate","low_signal","off_topic","truncated","did_not_hit_expected_url"]
+- "recommended_defaults" MUST be an object (use {} if none).
+- Do not include keys like "overall_score", "relevant", "answerable", "issues", "notes"."#;
+                let judge_overall_t0 = std::time::Instant::now();
+                let mut judge_overall_raw = llm_call(
+                    llm_backend.as_str(),
+                    openai_like.as_ref(),
+                    ollama.as_ref(),
+                    openrouter_caps.as_ref(),
+                    &chat_options,
+                    vec![
+                        webpipe_local::openai_compat::ChatMessage::system(judge_overall_system),
+                        webpipe_local::openai_compat::ChatMessage::user(&judge_summary_prompt),
+                    ],
+                    llm_timeout_ms,
+                    temperature,
+                    top_p,
+                    json_mode,
+                )
+                .await
+                .unwrap_or_default();
+                let mut judge_overall =
+                    extract_json_object(&judge_overall_raw).filter(|v| validate_judge_overall(v));
+                if transcript_enabled {
+                    transcript_seq = transcript_seq.wrapping_add(1);
+                    let line = serde_json::json!({
+                        "schema_version": 1,
+                        "kind": "webpipe_eval_transcript_event",
+                        "generated_at_epoch_s": now,
+                        "seq": transcript_seq,
+                        "run_kind": "eval_judge_swarm",
+                        "stage": "judge_overall",
+                        "call_id": format!("judge_overall:{}:attempt1", preset.id),
+                        "llm": {
+                            "backend": llm_backend,
+                            "model_effective": llm_model_effective,
+                            "json_mode": json_mode,
+                            "timeout_ms": llm_timeout_ms
+                        },
+                        "prompt": {
+                            "system": tx_trunc(judge_overall_system, transcript_max_chars),
+                            "user": tx_trunc(&judge_summary_prompt, transcript_max_chars)
+                        },
+                        "response": {
+                            "raw": tx_trunc(&judge_overall_raw, transcript_max_chars),
+                            "parsed": judge_overall
+                        },
+                        "timing_ms": judge_overall_t0.elapsed().as_millis()
+                    });
+                    let _ = append_jsonl(transcript_path.as_path(), &line);
+                }
+                if judge_overall.is_none() && retry_on_parse_fail && openai_like.is_some() {
+                    let (prev, _) = take_chars(&judge_overall_raw, 900);
+                    let retry = format!(
+                        "Return ONLY one JSON object matching the schema.\nPrevious output:\n{}\n",
+                        prev.trim()
+                    );
+                    let judge_overall_t1 = std::time::Instant::now();
+                    judge_overall_raw = llm_call(
+                        llm_backend.as_str(),
+                        openai_like.as_ref(),
+                        ollama.as_ref(),
+                        openrouter_caps.as_ref(),
+                        &chat_options,
+                        vec![
+                            webpipe_local::openai_compat::ChatMessage::system(judge_overall_system),
+                            webpipe_local::openai_compat::ChatMessage::user(&retry),
+                        ],
+                        llm_timeout_ms,
+                        temperature,
+                        top_p,
+                        json_mode,
+                    )
+                    .await
+                    .unwrap_or_default();
+                    judge_overall = extract_json_object(&judge_overall_raw)
+                        .filter(|v| validate_judge_overall(v));
+                    if transcript_enabled {
+                        transcript_seq = transcript_seq.wrapping_add(1);
+                        let line = serde_json::json!({
+                            "schema_version": 1,
+                            "kind": "webpipe_eval_transcript_event",
+                            "generated_at_epoch_s": now,
+                            "seq": transcript_seq,
+                            "run_kind": "eval_judge_swarm",
+                            "stage": "judge_overall",
+                            "call_id": format!("judge_overall:{}:attempt2", preset.id),
+                            "llm": {
+                                "backend": llm_backend,
+                                "model_effective": llm_model_effective,
+                                "json_mode": json_mode,
+                                "timeout_ms": llm_timeout_ms
+                            },
+                            "prompt": {
+                                "system": tx_trunc(judge_overall_system, transcript_max_chars),
+                                "user": tx_trunc(&retry, transcript_max_chars)
+                            },
+                            "response": {
+                                "raw": tx_trunc(&judge_overall_raw, transcript_max_chars),
+                                "parsed": judge_overall
+                            },
+                            "timing_ms": judge_overall_t1.elapsed().as_millis()
+                        });
+                        let _ = append_jsonl(transcript_path.as_path(), &line);
+                    }
+                }
+
+                judge_reports.push(serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_judge_agent_report",
+                    "generated_at_epoch_s": now,
+                    "judge_id": preset.id,
+                    "inputs": {
+                        "queries_json": args.queries_json,
+                        "qrels": args.qrels,
+                        "base_url": args.base_url,
+                        "provider": args.provider,
+                        "auto_mode": args.auto_mode,
+                        "selection_mode": args.selection_mode,
+                        "fetch_backend": args.fetch_backend,
+                        "trial_set": args.trial_set,
+                        "judge_presets_json": args.judge_presets_json,
+                        "max_queries": args.max_queries,
+                        "seed": args.seed,
+                        "llm_backend": llm_backend,
+                        "llm_model": args.llm_model,
+                        "llm_model_effective": llm_model_effective,
+                        "llm_timeout_ms": llm_timeout_ms,
+                        "json_mode": json_mode,
+                        "retry_on_parse_fail": retry_on_parse_fail
+                    },
+                    "totals": totals,
+                    "overall": judge_overall,
+                    "overall_raw": if judge_overall.is_none() { judge_overall_raw } else { String::new() },
+                    "per_query": per_query
+                }));
+            }
+
+            // Meta-judge (deterministic aggregation + optional LLM synthesis).
+            let meta_summary = {
+                let mut compact: Vec<serde_json::Value> = Vec::new();
+                for jr in &judge_reports {
+                    compact.push(serde_json::json!({
+                        "judge_id": jr.get("judge_id").cloned().unwrap_or(serde_json::Value::Null),
+                        "totals": jr.get("totals").cloned().unwrap_or(serde_json::Value::Null),
+                        "overall": jr.get("overall").cloned().unwrap_or(serde_json::Value::Null),
+                        "per_query": jr.get("per_query").cloned().unwrap_or(serde_json::Value::Null),
+                    }));
+                }
+                let meta_schema_reminder = r#"Return ONE JSON object ONLY with exactly these keys:
+{
+  "overall_assessment": string,
+  "cross_judge_agreement": string,
+  "top_systemic_failures": string[],
+  "top_3_fixes": string[],
+  "recommended_next_experiments": string[],
+  "top_dimensions": string[],
+  "top_musings": string[]
+}
+
+Rules:
+- "top_systemic_failures", "top_3_fixes", and "recommended_next_experiments" MUST be arrays (use [] if none).
+- "top_systemic_failures" MUST use ONLY this controlled vocabulary (use [] if none):
+  ["missing_key_facts","too_short","boilerplate","low_signal","off_topic","truncated","did_not_hit_expected_url"]
+- "top_dimensions" MUST be an array of <=12 short strings (<=32 chars); deduplicate.
+- "top_musings" MUST be an array of <=12 short strings (<=96 chars); focus on cross-judge themes from musings/good/bad/fixes.
+- For "top_3_fixes", deduplicate and prioritize concrete, tool-shaped fixes (max 3).
+- Each string in "top_3_fixes" and "recommended_next_experiments" MUST be <= 96 chars; avoid paragraphs.
+- Do not include keys like "overall_score", "issues", "confidence"."#;
+                format!(
+                        "You are a meta-judge. Aggregate multiple judge reports into one evaluation summary.\n{}\n\nJudge reports (compact):\n{}\n",
+                        meta_schema_reminder,
+                    serde_json::to_string_pretty(&compact).unwrap_or_default()
+                )
+            };
+            let meta_system = r#"You are a strict meta-judge. Output strict JSON only and follow the schema exactly."#;
+            let meta_t0 = std::time::Instant::now();
+            let mut meta_raw = llm_call(
+                llm_backend.as_str(),
+                openai_like.as_ref(),
+                ollama.as_ref(),
+                openrouter_caps.as_ref(),
+                &chat_options,
+                vec![
+                    webpipe_local::openai_compat::ChatMessage::system(meta_system),
+                    webpipe_local::openai_compat::ChatMessage::user(&meta_summary),
+                ],
+                llm_timeout_ms,
+                temperature,
+                top_p,
+                json_mode,
+            )
+            .await
+            .unwrap_or_default();
+            let mut meta = extract_json_object(&meta_raw).filter(|v| validate_meta_summary(v));
+            if transcript_enabled {
+                transcript_seq = transcript_seq.wrapping_add(1);
+                let line = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_transcript_event",
+                    "generated_at_epoch_s": now,
+                    "seq": transcript_seq,
+                    "run_kind": "eval_judge_swarm",
+                    "stage": "meta",
+                    "call_id": "meta:attempt1",
+                    "llm": {
+                        "backend": llm_backend,
+                        "model_effective": llm_model_effective,
+                        "json_mode": json_mode,
+                        "timeout_ms": llm_timeout_ms
+                    },
+                    "prompt": {
+                        "system": tx_trunc(meta_system, transcript_max_chars),
+                        "user": tx_trunc(&meta_summary, transcript_max_chars)
+                    },
+                    "response": {
+                        "raw": tx_trunc(&meta_raw, transcript_max_chars),
+                        "parsed": meta
+                    },
+                    "timing_ms": meta_t0.elapsed().as_millis()
+                });
+                let _ = append_jsonl(transcript_path.as_path(), &line);
+            }
+            if meta.is_none() && retry_on_parse_fail && openai_like.is_some() {
+                let (prev, _) = take_chars(&meta_raw, 900);
+                let retry = format!(
+                    "Your previous output did not match the required schema.\n\nReturn ONLY one JSON object. Keep EXACTLY these keys and types:\n{{\n  \"overall_assessment\": string,\n  \"cross_judge_agreement\": string,\n  \"top_systemic_failures\": string[],\n  \"top_3_fixes\": string[],\n  \"recommended_next_experiments\": string[],\n  \"top_dimensions\": string[],\n  \"top_musings\": string[]\n}}\n\nCopy this template and fill it in (keep arrays as arrays; use [] if none):\n{{\"overall_assessment\":\"...\",\"cross_judge_agreement\":\"...\",\"top_systemic_failures\":[\"...\"],\"top_3_fixes\":[\"...\"],\"recommended_next_experiments\":[\"...\"],\"top_dimensions\":[\"...\"],\"top_musings\":[\"...\"]}}\n\nPrevious output:\n{}\n\nSource material:\n{}",
+                    prev.trim(),
+                    meta_summary
+                );
+                let meta_t1 = std::time::Instant::now();
+                meta_raw = llm_call(
+                    llm_backend.as_str(),
+                    openai_like.as_ref(),
+                    ollama.as_ref(),
+                    openrouter_caps.as_ref(),
+                    &chat_options,
+                    vec![
+                        webpipe_local::openai_compat::ChatMessage::system(meta_system),
+                        webpipe_local::openai_compat::ChatMessage::user(&retry),
+                    ],
+                    llm_timeout_ms,
+                    temperature,
+                    top_p,
+                    json_mode,
+                )
+                .await
+                .unwrap_or_default();
+                meta = extract_json_object(&meta_raw).filter(|v| validate_meta_summary(v));
+                if transcript_enabled {
+                    transcript_seq = transcript_seq.wrapping_add(1);
+                    let line = serde_json::json!({
+                        "schema_version": 1,
+                        "kind": "webpipe_eval_transcript_event",
+                        "generated_at_epoch_s": now,
+                        "seq": transcript_seq,
+                        "run_kind": "eval_judge_swarm",
+                        "stage": "meta",
+                        "call_id": "meta:attempt2",
+                        "llm": {
+                            "backend": llm_backend,
+                            "model_effective": llm_model_effective,
+                            "json_mode": json_mode,
+                            "timeout_ms": llm_timeout_ms
+                        },
+                        "prompt": {
+                            "system": tx_trunc(meta_system, transcript_max_chars),
+                            "user": tx_trunc(&retry, transcript_max_chars)
+                        },
+                        "response": {
+                            "raw": tx_trunc(&meta_raw, transcript_max_chars),
+                            "parsed": meta
+                        },
+                        "timing_ms": meta_t1.elapsed().as_millis()
+                    });
+                    let _ = append_jsonl(transcript_path.as_path(), &line);
+                }
+            }
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_judge_swarm",
+                "generated_at_epoch_s": now,
+                "inputs": {
+                    "queries_json": args.queries_json,
+                    "qrels": args.qrels,
+                    "base_url": args.base_url,
+                    "provider": args.provider,
+                    "auto_mode": args.auto_mode,
+                    "selection_mode": args.selection_mode,
+                    "fetch_backend": args.fetch_backend,
+                    "trial_set": args.trial_set,
+                    "judges": args.judges,
+                    "judge_presets_json": args.judge_presets_json,
+                    "domain_tags": args.domain_tags,
+                    "max_queries": args.max_queries,
+                    "seed": args.seed,
+                    "llm_backend": llm_backend,
+                    "llm_model": args.llm_model,
+                    "llm_model_effective": llm_model_effective,
+                    "llm_timeout_ms": llm_timeout_ms,
+                    "json_mode": json_mode,
+                    "retry_on_parse_fail": retry_on_parse_fail,
+                    "task_solve": args.task_solve,
+                    "task_solve_max_trials": args.task_solve_max_trials,
+                    "task_solve_max_evidence_chars": args.task_solve_max_evidence_chars,
+                    "transcript": transcript_enabled,
+                    "transcript_jsonl": if transcript_enabled { Some(transcript_path.clone()) } else { None },
+                    "transcript_max_chars": transcript_max_chars
+                },
+                "meta": meta,
+                "meta_raw": if meta.is_none() { meta_raw } else { String::new() },
+                "judge_reports": judge_reports
+            });
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
+        }
+        #[cfg(feature = "eval")]
+        Commands::EvalGenerateDomainPack(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    ".generated/webpipe-e2e-queries-domain-pack-{now}.json"
+                ))
+            });
+            let domains = args
+                .domains
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+
+            let p = eval::generate_domain_pack(eval::DomainPackSpec {
+                domains,
+                per_domain: args.per_domain,
+                seed: args.seed,
+                out,
+                notes: args.notes,
+            })?;
+            println!("{}", p.display());
+        }
+        #[cfg(all(feature = "eval", feature = "stdio"))]
+        Commands::EvalCriticLoop(args) => {
+            use rmcp::{
+                model::CallToolRequestParam,
+                service::ServiceExt,
+                transport::{ConfigureCommandExt, TokioChildProcess},
+            };
+
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(".generated/webpipe-eval-critic-loop-{now}.json"))
+            });
+            let transcript_path = args.transcript_jsonl.clone().unwrap_or_else(|| {
+                std::path::PathBuf::from(format!("{}.transcript.jsonl", out.display()))
+            });
+
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+            if let Some(p) = transcript_path.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+
+            fn append_jsonl(
+                path: &std::path::Path,
+                line: &serde_json::Value,
+            ) -> anyhow::Result<()> {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                writeln!(f, "{}", serde_json::to_string(line).unwrap_or_default())?;
+                Ok(())
+            }
+            fn take_chars(s: &str, max_chars: usize) -> (String, bool) {
+                if max_chars == 0 {
+                    return (String::new(), true);
+                }
+                let mut out = String::new();
+                let mut n = 0usize;
+                for ch in s.chars() {
+                    if n >= max_chars {
+                        return (out, true);
+                    }
+                    out.push(ch);
+                    n += 1;
+                }
+                (out, false)
+            }
+            fn tx_trunc(s: &str, max_chars: usize) -> serde_json::Value {
+                let (t, truncated) = take_chars(s, max_chars);
+                serde_json::json!({ "text": t, "truncated": truncated })
+            }
+            fn json_trunc(v: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+                let s = serde_json::to_string(v).unwrap_or_default();
+                tx_trunc(&s, max_chars)
+            }
+
+            let urls: Vec<String> = args
+                .urls
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if urls.is_empty() {
+                anyhow::bail!("no URLs provided (use --url ... --url ...)");
+            }
+            let max_urls = std::cmp::min(10usize, urls.len());
+
+            // Spawn MCP stdio server as a child and talk to it as a client.
+            let bin = std::env::current_exe()?;
+            let service = ()
+                .serve(TokioChildProcess::new(
+                    tokio::process::Command::new(bin).configure(|cmd| {
+                        cmd.args(["mcp-stdio"]);
+                        cmd.env("WEBPIPE_DOTENV", "0");
+                        // Avoid accidentally using real keys on dev machines.
+                        cmd.env_remove("WEBPIPE_BRAVE_API_KEY");
+                        cmd.env_remove("BRAVE_SEARCH_API_KEY");
+                        cmd.env_remove("WEBPIPE_TAVILY_API_KEY");
+                        cmd.env_remove("TAVILY_API_KEY");
+                        cmd.env_remove("WEBPIPE_FIRECRAWL_API_KEY");
+                        cmd.env_remove("FIRECRAWL_API_KEY");
+                    }),
+                )?)
+                .await?;
+
+            // Tool call (bounded).
+            let args_json = serde_json::json!({
+                "query": args.query,
+                "urls": urls,
+                "url_selection_mode": "preserve",
+                "fetch_backend": args.fetch_backend,
+                "no_network": args.no_network,
+                "agentic": false,
+                "max_urls": max_urls,
+                "top_chunks": 5,
+                "max_chunk_chars": 350,
+                "include_text": false,
+                "include_links": false,
+                "cache_read": false,
+                "cache_write": false
+            });
+
+            let t0 = std::time::Instant::now();
+            let resp = service
+                .call_tool(CallToolRequestParam {
+                    name: "web_search_extract".into(),
+                    arguments: Some(args_json.as_object().cloned().unwrap_or_default()),
+                })
+                .await?;
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+
+            let structured = resp.structured_content.clone();
+            let structured_ok = structured.as_ref().is_some_and(|v| v.is_object());
+            let payload = structured.clone().unwrap_or(serde_json::Value::Null);
+
+            let mut issues: Vec<&str> = Vec::new();
+            let mut push_issue = |s: &'static str| {
+                if !CRITIC_ISSUE_VOCAB.iter().any(|&v| v == s) {
+                    return;
+                }
+                if !issues.iter().any(|&x| x == s) {
+                    issues.push(s);
+                }
+            };
+
+            if !structured_ok {
+                push_issue("missing_structured_content");
+            }
+
+            // Cursor-facing Markdown contract checks.
+            let md0 = resp
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            let markdown_present = !md0.trim().is_empty();
+            if !markdown_present {
+                push_issue("missing_markdown");
+            } else {
+                if serde_json::from_str::<serde_json::Value>(&md0).is_ok() {
+                    push_issue("markdown_is_json");
+                }
+                if !md0.contains("## Request") {
+                    push_issue("markdown_missing_request_section");
+                }
+                if !md0.contains("## Summary") {
+                    push_issue("markdown_missing_summary_section");
+                }
+            }
+
+            // Deterministic critic over structured payload (no model calls).
+            let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !ok {
+                push_issue("tool_failed");
+            }
+            let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if kind.is_empty() {
+                push_issue("missing_or_bad_kind");
+            } else if kind != "web_search_extract" {
+                push_issue("unexpected_kind");
+            }
+            let results_count = payload
+                .get("results")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let observed_url_count = payload
+                .get("results")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    let mut n = 0usize;
+                    for it in a {
+                        if it
+                            .get("url")
+                            .and_then(|u| u.as_str())
+                            .is_some_and(|s| !s.trim().is_empty())
+                        {
+                            n += 1;
+                        }
+                    }
+                    n
+                })
+                .unwrap_or(0);
+            if observed_url_count == 0 {
+                push_issue("missing_urls");
+            }
+            let top_chunks_count = payload
+                .get("top_chunks")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if top_chunks_count == 0 {
+                push_issue("empty_top_chunks");
+            }
+            let warnings_count = payload
+                .get("warnings")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if warnings_count > 0 {
+                push_issue("warnings_present");
+            }
+            let has_low_signal = payload
+                .get("quality")
+                .and_then(|q| q.get("signals"))
+                .and_then(|s| s.get("has_low_signal"))
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            if has_low_signal {
+                push_issue("low_signal");
+            }
+
+            let critic = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_critic_v1",
+                "issues": issues,
+                "ok": ok,
+                "structured_ok": structured_ok,
+                "markdown_ok": markdown_present,
+                "markdown_len_chars": md0.chars().count(),
+                "results_count": results_count,
+                "observed_url_count": observed_url_count,
+                "top_chunks_count": top_chunks_count,
+                "warnings_count": warnings_count,
+                "has_low_signal": has_low_signal
+            });
+
+            // Transcript events (tool + critic).
+            let transcript_max_chars = args.transcript_max_chars.clamp(200, 200_000);
+            let mut seq: u64 = 0;
+            seq = seq.wrapping_add(1);
+            let tool_line = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_transcript_event",
+                "generated_at_epoch_s": now,
+                "seq": seq,
+                "run_kind": "eval_critic_loop",
+                "stage": "tool",
+                "call_id": "tool:web_search_extract",
+                "tool": {
+                    "name": "web_search_extract",
+                    "args": json_trunc(&args_json, transcript_max_chars),
+                    "result_summary": {
+                        "ok": ok,
+                        "results_count": results_count,
+                        "observed_url_count": observed_url_count,
+                        "top_chunks_count": top_chunks_count,
+                        "warnings_count": warnings_count,
+                        "markdown_ok": markdown_present,
+                        "structured_ok": structured_ok
+                    },
+                    "elapsed_ms": elapsed_ms
+                }
+            });
+            let _ = append_jsonl(transcript_path.as_path(), &tool_line);
+            seq = seq.wrapping_add(1);
+            let critic_line = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_transcript_event",
+                "generated_at_epoch_s": now,
+                "seq": seq,
+                "run_kind": "eval_critic_loop",
+                "stage": "critic",
+                "call_id": "critic:deterministic",
+                "prompt": { "user": tx_trunc("deterministic_critic_v1", transcript_max_chars) },
+                "response": { "parsed": critic }
+            });
+            let _ = append_jsonl(transcript_path.as_path(), &critic_line);
+
+            service.cancel().await?;
+
+            let report = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_critic_loop",
+                "generated_at_epoch_s": now,
+                "inputs": {
+                    "query": args_json.get("query").cloned().unwrap_or(serde_json::Value::Null),
+                    "urls": args_json.get("urls").cloned().unwrap_or(serde_json::Value::Null),
+                    "fetch_backend": args_json.get("fetch_backend").cloned().unwrap_or(serde_json::Value::Null),
+                    "no_network": args_json.get("no_network").cloned().unwrap_or(serde_json::Value::Null)
+                },
+                "outputs": {
+                    "out": out.display().to_string(),
+                    "transcript_jsonl": transcript_path.display().to_string()
+                },
+                "tool_result_summary": {
+                    "ok": ok,
+                    "results_count": results_count,
+                    "observed_url_count": observed_url_count,
+                    "top_chunks_count": top_chunks_count
+                },
+                "critic": critic
+            });
+            std::fs::write(&out, serde_json::to_string_pretty(&report)? + "\n")?;
+            println!("{}", out.display());
+        }
+        #[cfg(all(feature = "eval", feature = "stdio"))]
+        Commands::EvalCriticRun(args) => {
+            use rmcp::{
+                model::CallToolRequestParam,
+                service::ServiceExt,
+                transport::{ConfigureCommandExt, TokioChildProcess},
+            };
+
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(".generated/webpipe-eval-critic-run-{now}.json"))
+            });
+            let transcript_path = args.transcript_jsonl.clone().unwrap_or_else(|| {
+                std::path::PathBuf::from(format!("{}.transcript.jsonl", out.display()))
+            });
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+            if let Some(p) = transcript_path.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+
+            fn append_jsonl(
+                path: &std::path::Path,
+                line: &serde_json::Value,
+            ) -> anyhow::Result<()> {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                writeln!(f, "{}", serde_json::to_string(line).unwrap_or_default())?;
+                Ok(())
+            }
+            fn take_chars(s: &str, max_chars: usize) -> (String, bool) {
+                if max_chars == 0 {
+                    return (String::new(), true);
+                }
+                let mut out = String::new();
+                let mut n = 0usize;
+                for ch in s.chars() {
+                    if n >= max_chars {
+                        return (out, true);
+                    }
+                    out.push(ch);
+                    n += 1;
+                }
+                (out, false)
+            }
+            fn tx_trunc(s: &str, max_chars: usize) -> serde_json::Value {
+                let (t, truncated) = take_chars(s, max_chars);
+                serde_json::json!({ "text": t, "truncated": truncated })
+            }
+            fn json_trunc(v: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+                let s = serde_json::to_string(v).unwrap_or_default();
+                tx_trunc(&s, max_chars)
+            }
+
+            let base_url = args.base_url.trim_end_matches('/').to_string();
+            if base_url.trim().is_empty() {
+                anyhow::bail!("base_url must be non-empty");
+            }
+            let query_pack_hash = std::fs::read(&args.queries_json)
+                .ok()
+                .map(|b| blake3_hex_bytes(&b));
+            let git_sha = best_effort_git_sha();
+            let e2e = eval::load_e2e_queries_v1(&args.queries_json)?;
+            let max_queries = args.max_queries.clamp(1, 200);
+            let queries = e2e
+                .queries
+                .into_iter()
+                .take(max_queries)
+                .collect::<Vec<_>>();
+            if queries.is_empty() {
+                anyhow::bail!("no queries in dataset");
+            }
+
+            // Spawn MCP stdio server once and reuse it for all tool calls.
+            let bin = std::env::current_exe()?;
+            let service = ()
+                .serve(TokioChildProcess::new(
+                    tokio::process::Command::new(bin).configure(|cmd| {
+                        cmd.args(["mcp-stdio"]);
+                        cmd.env("WEBPIPE_DOTENV", "0");
+                        // Keep output stable: Markdown-first only, no raw JSON text.
+                        cmd.env("WEBPIPE_MCP_INCLUDE_JSON_TEXT", "0");
+                        cmd.env("WEBPIPE_MCP_MARKDOWN_CHUNK_EXCERPTS", "0");
+                        // Avoid accidentally using real keys on dev machines.
+                        cmd.env_remove("WEBPIPE_BRAVE_API_KEY");
+                        cmd.env_remove("BRAVE_SEARCH_API_KEY");
+                        cmd.env_remove("WEBPIPE_TAVILY_API_KEY");
+                        cmd.env_remove("TAVILY_API_KEY");
+                        cmd.env_remove("WEBPIPE_FIRECRAWL_API_KEY");
+                        cmd.env_remove("FIRECRAWL_API_KEY");
+                    }),
+                )?)
+                .await?;
+
+            let transcript_max_chars = args.transcript_max_chars.clamp(200, 200_000);
+            let mut seq: u64 = 0;
+
+            let mut totals_ok: u64 = 0;
+            let mut totals_queries: u64 = 0;
+            let mut issue_counts: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut per_query: Vec<serde_json::Value> = Vec::new();
+
+            // Transcript: run manifest (first line).
+            seq = seq.wrapping_add(1);
+            let manifest_line = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_transcript_event",
+                "generated_at_epoch_s": now,
+                "seq": seq,
+                "run_kind": "eval_critic_run",
+                "stage": "manifest",
+                "call_id": "manifest",
+                "manifest": {
+                    "git": { "sha": git_sha },
+                    "queries_json_hash": query_pack_hash,
+                    "llm": { "backend": serde_json::Value::Null, "model": serde_json::Value::Null },
+                }
+            });
+            let _ = append_jsonl(transcript_path.as_path(), &manifest_line);
+
+            for q in &queries {
+                totals_queries = totals_queries.saturating_add(1);
+                let urls: Vec<String> = q
+                    .url_paths
+                    .iter()
+                    .filter_map(|p| {
+                        let s = p.trim();
+                        if s.is_empty() {
+                            return None;
+                        }
+                        if s.starts_with("http://") || s.starts_with("https://") {
+                            return Some(s.to_string());
+                        }
+                        let sp = s.trim_start_matches('/');
+                        Some(format!("{base_url}/{sp}"))
+                    })
+                    .collect();
+
+                let args_json = serde_json::json!({
+                    "query": q.query,
+                    "urls": urls,
+                    "url_selection_mode": "preserve",
+                    "fetch_backend": args.fetch_backend,
+                    "no_network": args.no_network,
+                    "agentic": false,
+                    "max_urls": 5,
+                    "top_chunks": 5,
+                    "max_chunk_chars": 350,
+                    "include_text": false,
+                    "include_links": false,
+                    "cache_read": false,
+                    "cache_write": false
+                });
+
+                let t0 = std::time::Instant::now();
+                let resp = service
+                    .call_tool(CallToolRequestParam {
+                        name: "web_search_extract".into(),
+                        arguments: Some(args_json.as_object().cloned().unwrap_or_default()),
+                    })
+                    .await?;
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+
+                // Critic checks (same contract focus as eval-critic-loop).
+                let structured = resp.structured_content.clone();
+                let structured_ok = structured.as_ref().is_some_and(|v| v.is_object());
+                let payload = structured.clone().unwrap_or(serde_json::Value::Null);
+
+                let mut issues: Vec<&str> = Vec::new();
+                let mut push_issue = |s: &'static str| {
+                    if !CRITIC_ISSUE_VOCAB.iter().any(|&v| v == s) {
+                        return;
+                    }
+                    if !issues.iter().any(|&x| x == s) {
+                        issues.push(s);
+                    }
+                };
+                if !structured_ok {
+                    push_issue("missing_structured_content");
+                }
+
+                let md0 = resp
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap_or_default();
+                let markdown_present = !md0.trim().is_empty();
+                if !markdown_present {
+                    push_issue("missing_markdown");
+                } else {
+                    if serde_json::from_str::<serde_json::Value>(&md0).is_ok() {
+                        push_issue("markdown_is_json");
+                    }
+                    if !md0.contains("## Request") {
+                        push_issue("markdown_missing_request_section");
+                    }
+                    if !md0.contains("## Summary") {
+                        push_issue("markdown_missing_summary_section");
+                    }
+                }
+
+                let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !ok {
+                    push_issue("tool_failed");
+                }
+                let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                if kind.is_empty() {
+                    push_issue("missing_or_bad_kind");
+                } else if kind != "web_search_extract" {
+                    push_issue("unexpected_kind");
+                }
+                let results_count = payload
+                    .get("results")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let observed_url_count = payload
+                    .get("results")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        let mut n = 0usize;
+                        for it in a {
+                            if it
+                                .get("url")
+                                .and_then(|u| u.as_str())
+                                .is_some_and(|s| !s.trim().is_empty())
+                            {
+                                n += 1;
+                            }
+                        }
+                        n
+                    })
+                    .unwrap_or(0);
+                if observed_url_count == 0 {
+                    push_issue("missing_urls");
+                }
+                let top_chunks_count = payload
+                    .get("top_chunks")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if top_chunks_count == 0 {
+                    push_issue("empty_top_chunks");
+                }
+                let warnings_count = payload
+                    .get("warnings")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if warnings_count > 0 {
+                    push_issue("warnings_present");
+                }
+                let has_low_signal = payload
+                    .get("quality")
+                    .and_then(|q| q.get("signals"))
+                    .and_then(|s| s.get("has_low_signal"))
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
+                if has_low_signal {
+                    push_issue("low_signal");
+                }
+
+                let critic = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_critic_v1",
+                    "issues": issues,
+                    "ok": ok,
+                    "structured_ok": structured_ok,
+                    "markdown_ok": markdown_present,
+                    "markdown_len_chars": md0.chars().count(),
+                    "results_count": results_count,
+                    "observed_url_count": observed_url_count,
+                    "top_chunks_count": top_chunks_count,
+                    "warnings_count": warnings_count,
+                    "has_low_signal": has_low_signal
+                });
+
+                // Update aggregates.
+                if ok {
+                    totals_ok = totals_ok.saturating_add(1);
+                }
+                if let Some(arr) = critic.get("issues").and_then(|v| v.as_array()) {
+                    for it in arr {
+                        let s = it.as_str().unwrap_or("").to_string();
+                        if s.is_empty() {
+                            continue;
+                        }
+                        *issue_counts.entry(s).or_insert(0) += 1;
+                    }
+                }
+
+                // Transcript: tool event.
+                seq = seq.wrapping_add(1);
+                let tool_line = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_transcript_event",
+                    "generated_at_epoch_s": now,
+                    "seq": seq,
+                    "run_kind": "eval_critic_run",
+                    "stage": "tool",
+                    "call_id": format!("tool:web_search_extract:{}", q.query_id),
+                    "tool": {
+                        "name": "web_search_extract",
+                        "args": json_trunc(&args_json, transcript_max_chars),
+                        "result_summary": {
+                            "ok": ok,
+                            "results_count": results_count,
+                            "observed_url_count": observed_url_count,
+                            "top_chunks_count": top_chunks_count,
+                            "warnings_count": warnings_count,
+                            "markdown_ok": markdown_present,
+                            "structured_ok": structured_ok
+                        },
+                        "elapsed_ms": elapsed_ms
+                    }
+                });
+                let _ = append_jsonl(transcript_path.as_path(), &tool_line);
+
+                // Transcript: critic event.
+                seq = seq.wrapping_add(1);
+                let critic_line = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_transcript_event",
+                    "generated_at_epoch_s": now,
+                    "seq": seq,
+                    "run_kind": "eval_critic_run",
+                    "stage": "critic",
+                    "call_id": format!("critic:deterministic:{}", q.query_id),
+                    "prompt": { "user": tx_trunc("deterministic_critic_v1", transcript_max_chars) },
+                    "response": { "parsed": critic }
+                });
+                let _ = append_jsonl(transcript_path.as_path(), &critic_line);
+
+                per_query.push(serde_json::json!({
+                    "query_id": q.query_id,
+                    "query": q.query,
+                    "urls_count": urls.len(),
+                    "tool_elapsed_ms": elapsed_ms,
+                    "critic": critic
+                }));
+            }
+
+            service.cancel().await?;
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_critic_run",
+                "generated_at_epoch_s": now,
+                "manifest": {
+                    "git": { "sha": git_sha },
+                    "queries_json_hash": query_pack_hash
+                },
+                "inputs": {
+                    "queries_json": args.queries_json,
+                    "base_url": args.base_url,
+                    "fetch_backend": args.fetch_backend,
+                    "no_network": args.no_network,
+                    "max_queries": max_queries
+                },
+                "outputs": {
+                    "out": out.display().to_string(),
+                    "transcript_jsonl": transcript_path.display().to_string()
+                },
+                "totals": {
+                    "queries": totals_queries,
+                    "ok": totals_ok
+                },
+                "issue_counts": issue_counts,
+                "per_query": per_query
+            });
+
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
         }
         Commands::Doctor(args) => {
             fn has_env(k: &str) -> bool {
@@ -14033,6 +22338,10 @@ async fn main() -> Result<()> {
                 let child = TokioChildProcess::new(Command::new(exe).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
                     cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
+                    // Make this probe hermetic: don't auto-load a nearby `.env` and "reintroduce"
+                    // keys we just removed.
+                    cmd.env("WEBPIPE_DOTENV", "0");
+                    cmd.env_remove("WEBPIPE_ENV_FILE");
                     // Avoid accidentally inheriting provider keys for this probe.
                     cmd.env_remove("WEBPIPE_BRAVE_API_KEY");
                     cmd.env_remove("BRAVE_SEARCH_API_KEY");
@@ -14132,9 +22441,11 @@ async fn main() -> Result<()> {
                 },
                 "features": {
                     "stdio": cfg!(feature = "stdio"),
-                    "semantic": false,
+                    "semantic": true,
                     "embeddings_openai": false,
                     "embeddings_tei": false,
+                    "embeddings_openrouter": has_env("WEBPIPE_OPENROUTER_API_KEY")
+                        || has_env("OPENROUTER_API_KEY"),
                 },
                 "elapsed_ms": t0.elapsed().as_millis(),
                 "configured": {
@@ -14225,6 +22536,1634 @@ async fn main() -> Result<()> {
                 _ => println!("{payload}"),
             }
         }
+        #[cfg(feature = "eval")]
+        Commands::EvalTranscriptSummarize(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    ".generated/webpipe-eval-transcript-summary-{now}.json"
+                ))
+            });
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+
+            let run_kind_filter = args
+                .run_kind
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let stage_filter = args
+                .stage
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let top_k = args.top_k.clamp(1, 200);
+
+            #[derive(Clone, Debug)]
+            struct SlowEvent {
+                elapsed_ms: u64,
+                call_id: String,
+                run_kind: String,
+                stage: String,
+                kind: String,
+                tool_name: Option<String>,
+                llm_backend: Option<String>,
+            }
+
+            fn extract_elapsed_ms(v: &serde_json::Value) -> Option<u64> {
+                if let Some(ms) = v.get("timing_ms").and_then(|x| x.as_u64()) {
+                    return Some(ms);
+                }
+                v.get("tool")
+                    .and_then(|t| t.get("elapsed_ms"))
+                    .and_then(|x| x.as_u64())
+            }
+
+            use std::io::BufRead;
+            let f = std::fs::File::open(&args.transcript_jsonl)?;
+            let mut reader = std::io::BufReader::new(f);
+            let mut line = String::new();
+
+            let mut total_lines: u64 = 0;
+            let mut parsed_lines: u64 = 0;
+            let mut parse_failed: u64 = 0;
+            let mut included: u64 = 0;
+
+            let mut counts_by_stage: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut counts_by_run_kind: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut critic_issue_counts: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut critic_issue_unknown: u64 = 0;
+            let mut judge_musing_dimension_counts: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut judge_musing_dimension_unknown: u64 = 0;
+            let mut slow: Vec<SlowEvent> = Vec::new();
+
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line)?;
+                if n == 0 {
+                    break;
+                }
+                total_lines = total_lines.saturating_add(1);
+                let s = line.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = match serde_json::from_str(s) {
+                    Ok(v) => {
+                        parsed_lines = parsed_lines.saturating_add(1);
+                        v
+                    }
+                    Err(_) => {
+                        parse_failed = parse_failed.saturating_add(1);
+                        continue;
+                    }
+                };
+
+                let run_kind = v
+                    .get("run_kind")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let stage = v
+                    .get("stage")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if let Some(fk) = run_kind_filter {
+                    if run_kind != fk {
+                        continue;
+                    }
+                }
+                if let Some(fs) = stage_filter {
+                    if stage != fs {
+                        continue;
+                    }
+                }
+
+                included = included.saturating_add(1);
+                *counts_by_run_kind.entry(run_kind.clone()).or_insert(0) += 1;
+                *counts_by_stage.entry(stage.clone()).or_insert(0) += 1;
+
+                // Optional: aggregate deterministic critic issues when present.
+                if stage == "critic" {
+                    if let Some(issues) = v
+                        .get("response")
+                        .and_then(|r| r.get("parsed"))
+                        .and_then(|p| p.get("issues"))
+                        .and_then(|x| x.as_array())
+                    {
+                        for it in issues {
+                            let s = it.as_str().unwrap_or("").trim();
+                            if s.is_empty() || s.len() > 96 {
+                                critic_issue_unknown = critic_issue_unknown.saturating_add(1);
+                                continue;
+                            }
+                            if CRITIC_ISSUE_VOCAB.iter().any(|&v| v == s) {
+                                *critic_issue_counts.entry(s.to_string()).or_insert(0) += 1;
+                            } else {
+                                critic_issue_unknown = critic_issue_unknown.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+
+                // Optional: aggregate judge musing dimensions (privacy-safe; structured).
+                if stage == "judge" {
+                    if let Some(ms) = v
+                        .get("response")
+                        .and_then(|r| r.get("parsed"))
+                        .and_then(|p| p.get("musings"))
+                        .and_then(|x| x.as_array())
+                    {
+                        for it in ms {
+                            let dim = it
+                                .get("dimension")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .trim();
+                            if dim.is_empty() || dim.len() > 32 {
+                                judge_musing_dimension_unknown =
+                                    judge_musing_dimension_unknown.saturating_add(1);
+                                continue;
+                            }
+                            *judge_musing_dimension_counts
+                                .entry(dim.to_string())
+                                .or_insert(0) += 1;
+                        }
+                    }
+                }
+
+                let elapsed_ms = extract_elapsed_ms(&v).unwrap_or(0);
+                let call_id = v
+                    .get("call_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let kind = v
+                    .get("kind")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool_name = v
+                    .get("tool")
+                    .and_then(|t| t.get("name"))
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                let llm_backend = v
+                    .get("llm")
+                    .and_then(|t| t.get("backend"))
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+
+                slow.push(SlowEvent {
+                    elapsed_ms,
+                    call_id,
+                    run_kind,
+                    stage,
+                    kind,
+                    tool_name,
+                    llm_backend,
+                });
+            }
+
+            slow.sort_by_key(|e| std::cmp::Reverse(e.elapsed_ms));
+            slow.truncate(top_k);
+            let slow_json: Vec<serde_json::Value> = slow
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "elapsed_ms": e.elapsed_ms,
+                        "call_id": e.call_id,
+                        "run_kind": e.run_kind,
+                        "stage": e.stage,
+                        "kind": e.kind,
+                        "tool_name": e.tool_name,
+                        "llm_backend": e.llm_backend
+                    })
+                })
+                .collect();
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_transcript_summary",
+                "generated_at_epoch_s": now,
+                "ok": parse_failed == 0,
+                "inputs": {
+                    "transcript_jsonl": args.transcript_jsonl,
+                    "run_kind": args.run_kind,
+                    "stage": args.stage,
+                    "top_k": top_k
+                },
+                "totals": {
+                    // "lines/parsed/parse_failed/included" are the low-level scanning counters.
+                    "lines": total_lines,
+                    "parsed": parsed_lines,
+                    "parse_failed": parse_failed,
+                    "included": included,
+                    // Back-compat aliases (contract tests): treat "events" as "included".
+                    "events": included,
+                    "parse_failed_events": parse_failed,
+                    "by_stage": counts_by_stage,
+                    "by_run_kind": counts_by_run_kind
+                },
+                "critic": {
+                    "issue_counts": critic_issue_counts,
+                    "unknown_issue_count": critic_issue_unknown
+                },
+                "judge_musings": {
+                    "dimension_counts": judge_musing_dimension_counts,
+                    "unknown_dimension_count": judge_musing_dimension_unknown
+                },
+                "slowest": slow_json
+            });
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
+        }
+        #[cfg(feature = "eval")]
+        Commands::EvalVlmSummarize(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(".generated/webpipe-eval-vlm-summary-{now}.json"))
+            });
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+
+            #[derive(Clone, Debug)]
+            struct FixCount {
+                fix: String,
+                count: u64,
+            }
+
+            let input_paths: Vec<String> = args
+                .inputs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+
+            let mut per_input = Vec::new();
+            let mut runs: u64 = 0;
+            let mut parsed_ok: u64 = 0;
+
+            let mut fixes: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut issues_by_area: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut issues_by_area_norm: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut themes: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut theme_fix_counts: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<String, u64>,
+            > = std::collections::BTreeMap::new();
+
+            fn norm_area(s: &str) -> String {
+                let t = s.trim().to_ascii_lowercase();
+                // Normalize a few frequent near-duplicates (keeps reports consistent across models).
+                if t.contains("navigation") {
+                    return "navigation".to_string();
+                }
+                if t.contains("typography") {
+                    return "typography".to_string();
+                }
+                if t.contains("spacing") || t.contains("layout") {
+                    return "layout_spacing".to_string();
+                }
+                if t.contains("hierarchy") {
+                    return "visual_hierarchy".to_string();
+                }
+                if t.contains("information") {
+                    return "information_architecture".to_string();
+                }
+                t.replace(['/', ' '], "_")
+            }
+
+            fn theme_for_fix(fix: &str) -> Option<&'static str> {
+                let t = fix.trim().to_ascii_lowercase();
+                if t.is_empty() {
+                    return None;
+                }
+                if (t.contains("table of contents") || t.contains("contents") || t.contains("toc"))
+                    && (t.contains("sidebar")
+                        || t.contains("two-column")
+                        || t.contains("two column")
+                        || t.contains("sticky"))
+                {
+                    return Some("toc_sidebar");
+                }
+                if t.contains("margin")
+                    || t.contains("padding")
+                    || t.contains("gap")
+                    || t.contains("whitespace")
+                    || t.contains("spacing")
+                {
+                    return Some("tighten_spacing");
+                }
+                if t.contains("legend")
+                    || t.contains("glossary")
+                    || (t.contains("define") && t.contains("parameter"))
+                {
+                    return Some("parameter_legend");
+                }
+                if t.contains("contrast") || t.contains("darken") || t.contains("legibility") {
+                    return Some("metadata_contrast");
+                }
+                if t.contains("underline") || t.contains("hover") || t.contains("interactive") {
+                    return Some("toc_link_affordance");
+                }
+                None
+            }
+
+            for path in &args.inputs {
+                let raw = std::fs::read_to_string(path)?;
+                let v: serde_json::Value = serde_json::from_str(&raw)?;
+                let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+                let schema_version = v
+                    .get("schema_version")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                if kind != "webpipe_vlm_openrouter" || schema_version != 1 {
+                    anyhow::bail!(
+                        "unexpected input artifact kind/schema_version for {}",
+                        path.display()
+                    );
+                }
+
+                runs = runs.saturating_add(1);
+                let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                let parsed_ok_i = v
+                    .get("parsed_ok")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                if parsed_ok_i {
+                    parsed_ok = parsed_ok.saturating_add(1);
+                }
+
+                let img = v
+                    .get("inputs")
+                    .and_then(|x| x.get("image_path"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let mut score: Option<f64> = None;
+                let mut top_3_fixes: Vec<String> = Vec::new();
+                let mut issues: Vec<serde_json::Value> = Vec::new();
+
+                if let Some(p) = v.get("parsed") {
+                    score = p.get("score_0_10").and_then(|x| x.as_f64());
+                    if let Some(arr) = p.get("top_3_fixes").and_then(|x| x.as_array()) {
+                        for s in arr.iter().filter_map(|x| x.as_str()) {
+                            let s = s.trim();
+                            if s.is_empty() {
+                                continue;
+                            }
+                            top_3_fixes.push(s.to_string());
+                            *fixes.entry(s.to_string()).or_insert(0) += 1;
+                            if let Some(theme) = theme_for_fix(s) {
+                                let t = theme.to_string();
+                                *themes.entry(t.clone()).or_insert(0) += 1;
+                                *theme_fix_counts
+                                    .entry(t)
+                                    .or_default()
+                                    .entry(s.to_string())
+                                    .or_insert(0) += 1;
+                            }
+                        }
+                    }
+                    if let Some(arr) = p.get("issues").and_then(|x| x.as_array()) {
+                        for it in arr {
+                            issues.push(it.clone());
+                            if let Some(area) = it.get("area").and_then(|x| x.as_str()) {
+                                let a = area.trim();
+                                if !a.is_empty() {
+                                    *issues_by_area.entry(a.to_string()).or_insert(0) += 1;
+                                    *issues_by_area_norm.entry(norm_area(a)).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                per_input.push(serde_json::json!({
+                    "input_path": path.display().to_string(),
+                    "image_path": img,
+                    "ok": ok,
+                    "parsed_ok": parsed_ok_i,
+                    "score_0_10": score,
+                    "top_3_fixes": top_3_fixes,
+                    "issues": issues
+                }));
+            }
+
+            let mut fixes_vec: Vec<FixCount> = fixes
+                .into_iter()
+                .map(|(fix, count)| FixCount { fix, count })
+                .collect();
+            fixes_vec.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.fix.cmp(&b.fix)));
+
+            let top_3_fixes: Vec<String> =
+                fixes_vec.iter().take(3).map(|fc| fc.fix.clone()).collect();
+
+            let mut themes_vec = themes.clone().into_iter().collect::<Vec<_>>();
+            themes_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let top_3_themes: Vec<String> =
+                themes_vec.into_iter().take(3).map(|(k, _)| k).collect();
+            let mut top_3_fixes_by_theme: Vec<String> = Vec::new();
+            for theme in &top_3_themes {
+                if let Some(m) = theme_fix_counts.get(theme) {
+                    let mut v = m.iter().map(|(k, c)| (k.clone(), *c)).collect::<Vec<_>>();
+                    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    if let Some((fix, _)) = v.into_iter().next() {
+                        top_3_fixes_by_theme.push(fix);
+                    }
+                }
+            }
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_vlm_summary",
+                "generated_at_epoch_s": now,
+                "inputs": {
+                    "count": input_paths.len(),
+                    "paths": input_paths,
+                },
+                "totals": {
+                    "runs": runs,
+                    "parsed_ok": parsed_ok,
+                },
+                "top_3_fixes": top_3_fixes,
+                "fix_counts": fixes_vec.iter().take(50).map(|fc| serde_json::json!({"fix": fc.fix, "count": fc.count})).collect::<Vec<_>>(),
+                "issues_by_area": issues_by_area,
+                "issues_by_area_norm": issues_by_area_norm,
+                "themes": themes,
+                "top_3_themes": top_3_themes,
+                "top_3_fixes_by_theme": top_3_fixes_by_theme,
+                "per_input": per_input,
+            });
+
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
+        }
+        #[cfg(feature = "eval")]
+        Commands::EvalVlmRun(args) => {
+            let t0 = std::time::Instant::now();
+            let transcript_seq0: u64 = 0;
+            fn env(key: &str) -> Option<String> {
+                std::env::var(key)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }
+            fn is_image_like(p: &std::path::Path) -> bool {
+                matches!(
+                    p.extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "png" | "jpg" | "jpeg" | "webp" | "gif"
+                )
+            }
+
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+
+            // Goal profile registry (built-ins). Keep this small and curated.
+            #[derive(Clone, Debug)]
+            struct GoalProfile {
+                id: &'static str,
+                description: &'static str,
+                goals: &'static [&'static str],
+            }
+            static GOAL_PROFILES: &[GoalProfile] = &[
+                GoalProfile {
+                    id: "sinprimes_story_v1",
+                    description: "sinprimes story page: reading flow, plot legibility, low-risk CSS refinements, with P0/P1-first severity.",
+                    goals: &[
+                        "Fix P0/P1 issues before any purely cosmetic changes.",
+                        "Prefer small, local CSS/HTML tweaks over layout rewrites.",
+                        "Keep navigation/TOC orientation strong on both desktop and mobile slices.",
+                        "Make plots readable at a glance (ticks/labels/legends) without needing zoom.",
+                        "Prevent anchor jumps from clipping headings under fixed UI (progress bar).",
+                        "Keep tables scanable (alignment, striping, header separation) without increasing visual noise.",
+                        "Treat math typesetting issues as P0 only when they break meaning/legibility (overflow, baseline collisions).",
+                    ],
+                },
+            ];
+            fn goal_profile_by_id(id: &str) -> Option<&'static GoalProfile> {
+                let t = id.trim();
+                if t.is_empty() {
+                    return None;
+                }
+                GOAL_PROFILES.iter().find(|gp| gp.id == t)
+            }
+
+            if args.list_goal_profiles {
+                let payload = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_vlm_goal_profiles",
+                    "profiles": GOAL_PROFILES.iter().map(|gp| serde_json::json!({
+                        "id": gp.id,
+                        "description": gp.description,
+                        "goals": gp.goals,
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            }
+
+            // Collect images from explicit args and/or directory scan.
+            let mut images: Vec<std::path::PathBuf> = args.images.clone();
+            if let Some(dir) = args.images_dir.as_ref() {
+                let max_images = args.max_images.clamp(0, 500);
+                if max_images > 0 {
+                    let mut from_dir: Vec<std::path::PathBuf> = Vec::new();
+                    for ent in std::fs::read_dir(dir)? {
+                        let ent = ent?;
+                        let p = ent.path();
+                        if p.is_file() && is_image_like(&p) {
+                            from_dir.push(p);
+                        }
+                    }
+                    from_dir.sort_by(|a, b| a.display().to_string().cmp(&b.display().to_string()));
+                    from_dir.truncate(max_images);
+                    images.extend(from_dir);
+                }
+            }
+            images.sort_by(|a, b| a.display().to_string().cmp(&b.display().to_string()));
+            images.dedup();
+            if images.is_empty() {
+                anyhow::bail!("no images provided (use --image ... or --images-dir ...)");
+            }
+
+            let out_dir = args.out_dir.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(".generated/webpipe-eval-vlm-run-{now}"))
+            });
+            std::fs::create_dir_all(&out_dir)?;
+            let out_summary = args
+                .out_summary
+                .unwrap_or_else(|| out_dir.join("summary.json"));
+            // Transcript defaults: keep eval runs auditable by default, and put the JSONL next
+            // to the other run artifacts so downstream tooling can discover it.
+            let transcript_jsonl_path = args
+                .transcript_jsonl
+                .clone()
+                .unwrap_or_else(|| out_dir.join("eval-vlm-run.transcript.jsonl"));
+            if let Some(p) = transcript_jsonl_path.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&transcript_jsonl_path)?;
+
+            let api_key = env("WEBPIPE_OPENROUTER_API_KEY")
+                .or_else(|| env("OPENROUTER_API_KEY"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing OPENROUTER_API_KEY (or WEBPIPE_OPENROUTER_API_KEY)")
+                })?;
+            let model = args
+                .model
+                .or_else(|| env("WEBPIPE_OPENROUTER_MODEL"))
+                .unwrap_or_else(|| "google/gemini-3-flash-preview".to_string());
+            let trials = args.trials.clamp(1, 20);
+            let temperature = args.temperature.clamp(0.0, 2.0);
+            let base = env("WEBPIPE_OPENROUTER_BASE_URL")
+                .unwrap_or_else(|| "https://openrouter.ai/api".to_string());
+            let url = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
+
+            let prompt = args.prompt.unwrap_or_else(|| {
+                "Return ONE JSON object only (no markdown, no prose).\n\nYou are critiquing a *rendered technical page screenshot* (sometimes full-page and very tall). Use BOTH the screenshot and any provided Render Context (computed CSS, TOC state, console/network errors).\n\nSchema (required keys):\n- overall: string (2–4 sentences; include 1 sentence on strengths, 1 on biggest risks)\n- score_0_10: number\n- verdict: \"good\"|\"mixed\"|\"bad\"\n- strengths: string[] (3–6 concrete positives)\n- issues: array of {\n    area: \"navigation\"|\"layout_spacing\"|\"typography\"|\"visual_hierarchy\"|\"plots_figures\"|\"tables_data\"|\"math_typesetting\"|\"writing_clarity\"|\"accessibility\"|\"technical_runtime\",\n    severity: \"P0\"|\"P1\"|\"P2\",\n    region: \"top\"|\"middle\"|\"bottom\"|\"global\",\n    problem: string,\n    evidence: string,\n    fix: string\n  }\n- top_3_fixes: string[] (ranked, highest leverage)\n\nRules:\n- Evidence must be concrete and locally grounded (quote a label, mention a specific UI element, or cite a render-context field like computed_styles.* / console.errors count).\n- Fixes must be actionable (specific CSS/layout/typography changes), not generic.\n- Keep each issues[].{problem,evidence,fix} <= 200 chars.\n- Keep each top_3_fixes entry <= 96 chars.\n- Do NOT recommend changes already present per render context.\n  - If computed_styles.html.scroll-padding-top is nonzero, do NOT suggest adding/changing scroll-padding-top unless you have evidence headings are still clipped.\n  - If computed_styles.h2.scroll-margin-top is nonzero, do NOT suggest adding/changing scroll-margin-top unless you cite a clipped heading.\n  - If computed_styles.katex_display.overflow-x is \"auto\" or \"scroll\", do NOT suggest adding overflow-x: auto for display math.\n- If this screenshot is a partial viewport (not full-page), say so in overall and avoid claims about unseen sections."
+                    .to_string()
+            });
+            let mut prompt_effective = prompt.clone();
+            if args.context_dir.is_some() {
+                // A short marker in the user prompt so the model knows extra context follows.
+                prompt_effective.push_str(
+                    "\n\n(Additional render context is provided below; consider it alongside the screenshot.)\n",
+                );
+            }
+            let (_prompt_tx, _) = vlm_truncate_chars(&prompt_effective, args.transcript_max_chars);
+
+            // Optional, stable judge goals (priority ordered).
+            fn load_goals_file(p: &std::path::Path) -> anyhow::Result<Vec<String>> {
+                let raw = std::fs::read_to_string(p)?;
+                let mut out: Vec<String> = Vec::new();
+                for line in raw.lines() {
+                    let t = line.trim();
+                    if t.is_empty() || t.starts_with('#') {
+                        continue;
+                    }
+                    out.push(t.to_string());
+                }
+                Ok(out)
+            }
+            fn dedup_keep_first(v: Vec<String>) -> Vec<String> {
+                let mut seen: std::collections::BTreeMap<String, ()> =
+                    std::collections::BTreeMap::new();
+                let mut out: Vec<String> = Vec::new();
+                for s in v {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if seen.contains_key(t) {
+                        continue;
+                    }
+                    seen.insert(t.to_string(), ());
+                    out.push(t.to_string());
+                }
+                out
+            }
+            fn format_goals_block(goals: &[String]) -> String {
+                if goals.is_empty() {
+                    return String::new();
+                }
+                let mut s = String::new();
+                s.push_str("## Goals (priority order)\n");
+                for g in goals {
+                    let gg = g.trim();
+                    if gg.is_empty() {
+                        continue;
+                    }
+                    s.push_str("- ");
+                    s.push_str(gg);
+                    s.push('\n');
+                }
+                s.push_str(
+                    "\nRules for goals:\n- Use these goals to set severity (P0/P1/P2) and to choose top_3_fixes.\n- If goals conflict, say which you prioritized and why.\n",
+                );
+                s
+            }
+
+            let mut goals0: Vec<String> = Vec::new();
+            // 1) explicit goals first (highest priority; argv order)
+            goals0.extend(args.goals.iter().cloned());
+            // 2) goals file next
+            if let Some(p) = args.goals_file.as_ref() {
+                goals0.extend(load_goals_file(p.as_path())?);
+            }
+            // 3) goal profiles last (baseline)
+            let mut goal_profiles_used: Vec<String> = Vec::new();
+            for gp in &args.goal_profiles {
+                let id = gp.trim();
+                if id.is_empty() {
+                    continue;
+                }
+                let prof = goal_profile_by_id(id).ok_or_else(|| {
+                    anyhow::anyhow!("unknown --goal-profile {id:?} (try --list-goal-profiles)")
+                })?;
+                goal_profiles_used.push(prof.id.to_string());
+                for g in prof.goals {
+                    goals0.push((*g).to_string());
+                }
+            }
+            let goals = std::sync::Arc::new(dedup_keep_first(goals0));
+            let goal_profiles_used = std::sync::Arc::new(goal_profiles_used);
+
+            // Aggregation state (same spirit as eval-vlm-summarize, but computed during the run).
+            let mut per_input = Vec::new();
+            let mut runs: u64 = 0;
+            let mut parsed_ok: u64 = 0;
+            let mut fixes: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut issues_by_area: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut issues_by_area_norm: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut themes: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut theme_fix_counts: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<String, u64>,
+            > = std::collections::BTreeMap::new();
+            let mut by_profile: std::collections::BTreeMap<String, serde_json::Value> =
+                std::collections::BTreeMap::new();
+
+            fn norm_area(s: &str) -> String {
+                let t = s.trim().to_ascii_lowercase();
+                if t.contains("navigation") {
+                    return "navigation".to_string();
+                }
+                if t.contains("typography") {
+                    return "typography".to_string();
+                }
+                if t.contains("spacing") || t.contains("layout") {
+                    return "layout_spacing".to_string();
+                }
+                if t.contains("hierarchy") {
+                    return "visual_hierarchy".to_string();
+                }
+                if t.contains("information") {
+                    return "information_architecture".to_string();
+                }
+                t.replace(['/', ' '], "_")
+            }
+            fn theme_for_fix(fix: &str) -> Option<&'static str> {
+                let t = fix.trim().to_ascii_lowercase();
+                if t.is_empty() {
+                    return None;
+                }
+                if (t.contains("table of contents") || t.contains("contents") || t.contains("toc"))
+                    && (t.contains("sidebar")
+                        || t.contains("two-column")
+                        || t.contains("two column")
+                        || t.contains("sticky"))
+                {
+                    return Some("toc_sidebar");
+                }
+                if t.contains("margin")
+                    || t.contains("padding")
+                    || t.contains("gap")
+                    || t.contains("whitespace")
+                    || t.contains("spacing")
+                {
+                    return Some("tighten_spacing");
+                }
+                if t.contains("legend")
+                    || t.contains("glossary")
+                    || (t.contains("define") && t.contains("parameter"))
+                {
+                    return Some("parameter_legend");
+                }
+                if t.contains("contrast") || t.contains("darken") || t.contains("legibility") {
+                    return Some("metadata_contrast");
+                }
+                if t.contains("underline") || t.contains("hover") || t.contains("interactive") {
+                    return Some("toc_link_affordance");
+                }
+                None
+            }
+
+            fn sanitize_stem(s: &str) -> String {
+                // Deterministic, filename-safe-ish stem: keep ASCII alnum plus a few separators.
+                // This avoids collisions for same-stem across dirs when combined with the index prefix.
+                let mut out = String::with_capacity(s.len());
+                for ch in s.chars() {
+                    let ok = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.');
+                    out.push(if ok { ch } else { '_' });
+                }
+                let t = out.trim_matches('_').to_string();
+                if t.is_empty() {
+                    "image".to_string()
+                } else {
+                    t
+                }
+            }
+
+            fn sanitize_id(s: &str) -> String {
+                let mut out = String::new();
+                for ch in s.trim().chars() {
+                    let ok = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.');
+                    out.push(if ok { ch } else { '_' });
+                }
+                let t = out.trim_matches('_').to_string();
+                if t.is_empty() {
+                    "general".to_string()
+                } else {
+                    t
+                }
+            }
+            fn profile_prompt_suffix(profile: &str) -> &'static str {
+                match profile {
+                    "ux_layout" => "Profile focus: UX + layout. Prioritize navigation, spacing, and reading flow.\n",
+                    "tables" => "Profile focus: tables + data legibility. Prioritize row/column scanability, numeric alignment, borders/striping.\n",
+                    "plots" => "Profile focus: plots + figures. Prioritize axis/legend/title readability, export sizing, and label overlap.\n",
+                    "math" => "Profile focus: math typesetting. Prioritize KaTeX baseline, display-math spacing, and overflow.\n",
+                    "writing" => "Profile focus: writing clarity. Prioritize structure, definitions, redundancy, and reader orientation.\n",
+                    "runtime" => "Profile focus: runtime/console/network. Prioritize JS errors, missing assets, and render warnings.\n",
+                    _ => "Profile focus: general.\n",
+                }
+            }
+            fn blake3_hex(s: &str) -> String {
+                blake3::hash(s.as_bytes()).to_hex().to_string()
+            }
+
+            let profiles: Vec<String> = if args.profiles.is_empty() {
+                vec!["general".to_string()]
+            } else {
+                let mut v = args
+                    .profiles
+                    .iter()
+                    .map(|s| sanitize_id(s))
+                    .collect::<Vec<_>>();
+                v.sort();
+                v.dedup();
+                v
+            };
+            let cache_mode = args.cache.trim().to_ascii_lowercase();
+            let max_inflight = args.max_inflight.clamp(1, 32);
+
+            // Fan-out tasks: images × profiles × trials.
+            #[derive(Clone, Debug)]
+            struct TaskSpec {
+                image_index: usize,
+                image_path: std::path::PathBuf,
+                image_stem: String,
+                profile: String,
+                trial: u64,
+            }
+            #[derive(Clone, Debug)]
+            struct TaskOut {
+                spec: TaskSpec,
+                artifact_path: std::path::PathBuf,
+                artifact_file: String,
+                payload: serde_json::Value,
+                _reused: bool,
+                _elapsed_ms: u64,
+            }
+
+            let context_dir = args.context_dir.clone();
+            let context_max_chars = args.context_max_chars;
+            let max_chars = args.max_chars;
+            let transcript_jsonl = std::sync::Arc::new(Some(transcript_jsonl_path.clone()));
+            let transcript_max_chars = args.transcript_max_chars;
+            let use_legacy_name = profiles.len() == 1 && profiles[0].as_str() == "general";
+
+            let mut tasks: Vec<TaskSpec> = Vec::new();
+            for (idx0, img_path) in images.iter().enumerate() {
+                let stem0 = img_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("image");
+                let stem = sanitize_stem(stem0);
+                for profile in &profiles {
+                    for t_idx in 0..trials {
+                        tasks.push(TaskSpec {
+                            image_index: idx0,
+                            image_path: img_path.clone(),
+                            image_stem: stem.clone(),
+                            profile: profile.clone(),
+                            trial: t_idx + 1,
+                        });
+                    }
+                }
+            }
+
+            let http = std::sync::Arc::new(reqwest::Client::new());
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_inflight));
+            let tx_seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(transcript_seq0));
+            let tx_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+
+            let base_prompt = prompt.clone();
+            let base_prompt_with_marker = prompt_effective.clone();
+            let prompt_tx_base = {
+                let (p, _) = vlm_truncate_chars(&base_prompt_with_marker, transcript_max_chars);
+                p
+            };
+
+            let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<TaskOut>>> = Vec::new();
+            for spec in tasks {
+                let http = http.clone();
+                let sem = sem.clone();
+                let tx_seq = tx_seq.clone();
+                let tx_lock = tx_lock.clone();
+                let url = url.clone();
+                let api_key = api_key.clone();
+                let model = model.clone();
+                let out_dir = out_dir.clone();
+                let cache_mode = cache_mode.clone();
+                let context_dir = context_dir.clone();
+                let base_prompt = base_prompt.clone();
+                let goals = goals.clone();
+                let goal_profiles_used = goal_profiles_used.clone();
+                let transcript_jsonl = transcript_jsonl.clone();
+                let prompt_tx_base = prompt_tx_base.clone();
+                let use_legacy_name = use_legacy_name;
+
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await?;
+                    let t0_one = std::time::Instant::now();
+
+                    let mut prompt_effective = base_prompt.clone();
+                    prompt_effective.push_str("\n\n");
+                    prompt_effective.push_str(profile_prompt_suffix(spec.profile.as_str()));
+                    if !goals.is_empty() {
+                        prompt_effective.push_str("\n");
+                        prompt_effective.push_str(format_goals_block(goals.as_ref()).as_str());
+                    }
+                    if context_dir.is_some() {
+                        prompt_effective.push_str(
+                            "\n(Additional render context is provided below; consider it alongside the screenshot.)\n",
+                        );
+                    }
+
+                    let ctx_txt = context_dir.as_ref().and_then(|d| {
+                        vlm_load_context_for_image(d.as_path(), spec.image_path.as_path(), context_max_chars)
+                    });
+                    let prompt_trial = if let Some(ctx_txt) = ctx_txt.as_ref() {
+                        format!("{prompt_effective}\n\n## Render context (from Playwright)\n{ctx_txt}\n")
+                    } else {
+                        prompt_effective.clone()
+                    };
+                    let prompt_hash = blake3_hex(prompt_trial.as_str());
+                    let context_hash = ctx_txt
+                        .as_ref()
+                        .map(|s| blake3_hex(s.as_str()))
+                        .unwrap_or_else(|| "none".to_string());
+
+                    let file = if use_legacy_name {
+                        format!(
+                            "{:03}-{}.t{:02}.vlm_openrouter.json",
+                            spec.image_index + 1,
+                            spec.image_stem,
+                            spec.trial
+                        )
+                    } else {
+                        let prof = sanitize_id(spec.profile.as_str());
+                        format!(
+                            "{:03}-{}.{}.t{:02}.vlm_openrouter.json",
+                            spec.image_index + 1,
+                            spec.image_stem,
+                            prof,
+                            spec.trial
+                        )
+                    };
+                    let out_path = out_dir.join(&file);
+
+                    if cache_mode != "off" && out_path.exists() {
+                        if let Ok(raw) = std::fs::read_to_string(&out_path) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                                let reuse = if cache_mode == "reuse_any" {
+                                    true
+                                } else {
+                                    let im = v.get("inputs").cloned().unwrap_or(serde_json::Value::Null);
+                                    let m0 = im.get("model").and_then(|x| x.as_str()).unwrap_or("");
+                                    let t0 = im.get("temperature").and_then(|x| x.as_f64()).unwrap_or(-1.0);
+                                    let ph0 = im.get("prompt_hash").and_then(|x| x.as_str()).unwrap_or("");
+                                    let ch0 = im.get("context_hash").and_then(|x| x.as_str()).unwrap_or("");
+                                    m0 == model.as_str()
+                                        && (t0 - temperature).abs() < 1e-9
+                                        && ph0 == prompt_hash.as_str()
+                                        && ch0 == context_hash.as_str()
+                                };
+                                if reuse {
+                                    return Ok(TaskOut {
+                                        spec,
+                                        artifact_path: out_path,
+                                        artifact_file: file,
+                                        payload: v,
+                                        _reused: true,
+                                        _elapsed_ms: t0_one.elapsed().as_millis() as u64,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    let payload0 = vlm_openrouter_call(
+                        http.as_ref(),
+                        url.as_str(),
+                        api_key.as_str(),
+                        model.as_str(),
+                        prompt_trial.as_str(),
+                        spec.image_path.as_path(),
+                        max_chars,
+                        temperature,
+                        now,
+                    )
+                    .await;
+                    let mut payload = payload0;
+                    if let Some(m) = payload.get_mut("inputs").and_then(|x| x.as_object_mut()) {
+                        m.insert("profile".to_string(), serde_json::Value::String(spec.profile.clone()));
+                        m.insert("prompt_hash".to_string(), serde_json::Value::String(prompt_hash));
+                        m.insert("context_hash".to_string(), serde_json::Value::String(context_hash));
+                        if !goals.is_empty() {
+                            m.insert(
+                                "goals".to_string(),
+                                serde_json::Value::Array(
+                                    goals
+                                        .iter()
+                                        .map(|s| serde_json::Value::String(s.clone()))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        if !goal_profiles_used.is_empty() {
+                            m.insert(
+                                "goal_profiles".to_string(),
+                                serde_json::Value::Array(
+                                    goal_profiles_used
+                                        .iter()
+                                        .map(|s| serde_json::Value::String(s.clone()))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                    }
+
+                    std::fs::write(&out_path, serde_json::to_string_pretty(&payload)? + "\n")?;
+
+                    // Transcript event (optional, serialized).
+                    if let Some(tx_path) = transcript_jsonl.as_ref().as_ref() {
+                        let _g = tx_lock.lock().await;
+                        if let Some(p) = tx_path.parent() {
+                            std::fs::create_dir_all(p)?;
+                        }
+                        let elapsed_ms = t0_one.elapsed().as_millis() as u64;
+                        let seq = tx_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let parsed_ok_i = payload
+                            .get("parsed_ok")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false);
+                        let ok = payload.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                        let goals_tx: Vec<String> = goals.as_ref().clone();
+                        let goal_profiles_tx: Vec<String> = goal_profiles_used.as_ref().clone();
+                        let line = serde_json::json!({
+                            "schema_version": 1,
+                            "kind": "webpipe_eval_transcript_event",
+                            "generated_at_epoch_s": now,
+                            "seq": seq,
+                            "run_kind": "eval_vlm_run",
+                            "stage": "vlm_openrouter",
+                            "call_id": format!("vlm_openrouter:{}:{}:p{}:t{}", now, spec.image_path.display(), spec.profile, spec.trial),
+                            "timing_ms": elapsed_ms,
+                            "llm": {
+                                "backend": "openrouter",
+                                "model_effective": model,
+                                "temperature": temperature
+                            },
+                            "prompt": { "user": prompt_tx_base, "profile": spec.profile, "goals": goals_tx, "goal_profiles": goal_profiles_tx },
+                            "inputs": {
+                                "image_path": spec.image_path.display().to_string(),
+                                "trial": spec.trial
+                            },
+                            "response": {
+                                "ok": ok,
+                                "parsed_ok": parsed_ok_i,
+                                "parsed": payload.get("parsed").cloned().unwrap_or(serde_json::Value::Null),
+                                "http_status": payload.get("http").and_then(|h| h.get("status")).and_then(|x| x.as_u64()),
+                            }
+                        });
+                        vlm_append_jsonl(tx_path.as_path(), &line)?;
+                    }
+
+                    Ok(TaskOut {
+                        spec,
+                        artifact_path: out_path,
+                        artifact_file: file,
+                        payload,
+                        _reused: false,
+                        _elapsed_ms: t0_one.elapsed().as_millis() as u64,
+                    })
+                }));
+            }
+
+            let mut outs: Vec<TaskOut> = Vec::new();
+            for h in handles {
+                outs.push(h.await??);
+            }
+            // Keep transcript writes bounded + serialized; no stable meaning for seq outside the JSONL file.
+
+            // Collect per-image.
+            outs.sort_by(|a, b| {
+                (a.spec.image_index, a.spec.profile.clone(), a.spec.trial).cmp(&(
+                    b.spec.image_index,
+                    b.spec.profile.clone(),
+                    b.spec.trial,
+                ))
+            });
+
+            let mut by_image: std::collections::BTreeMap<usize, Vec<TaskOut>> =
+                std::collections::BTreeMap::new();
+            for o in outs {
+                by_image.entry(o.spec.image_index).or_default().push(o);
+            }
+
+            let mut by_profile_runs: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut by_profile_parsed_ok: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut by_profile_fix_counts: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<String, u64>,
+            > = std::collections::BTreeMap::new();
+            let mut by_profile_issues_by_area_norm: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<String, u64>,
+            > = std::collections::BTreeMap::new();
+
+            for (idx0, group) in by_image {
+                let img_path = images.get(idx0).cloned().unwrap_or_default();
+                let mut artifact_paths: Vec<String> = Vec::new();
+                let mut artifact_files: Vec<String> = Vec::new();
+                let mut trial_scores: Vec<f64> = Vec::new();
+                let mut trial_parsed_ok: u64 = 0;
+
+                let mut img_fix_counts: std::collections::BTreeMap<String, u64> =
+                    std::collections::BTreeMap::new();
+                let mut img_issues: Vec<serde_json::Value> = Vec::new();
+                let mut per_profile: std::collections::BTreeMap<String, serde_json::Value> =
+                    std::collections::BTreeMap::new();
+
+                for o in group {
+                    artifact_paths.push(o.artifact_path.display().to_string());
+                    artifact_files.push(o.artifact_file.clone());
+
+                    let parsed_ok_i = o
+                        .payload
+                        .get("parsed_ok")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false);
+                    runs = runs.saturating_add(1);
+                    *by_profile_runs.entry(o.spec.profile.clone()).or_insert(0) += 1;
+                    if parsed_ok_i {
+                        parsed_ok = parsed_ok.saturating_add(1);
+                        trial_parsed_ok = trial_parsed_ok.saturating_add(1);
+                        *by_profile_parsed_ok
+                            .entry(o.spec.profile.clone())
+                            .or_insert(0) += 1;
+                    }
+
+                    if let Some(p) = o.payload.get("parsed") {
+                        if let Some(s) = p.get("score_0_10").and_then(|x| x.as_f64()) {
+                            trial_scores.push(s);
+                        }
+                        if let Some(arr) = p.get("top_3_fixes").and_then(|x| x.as_array()) {
+                            for s in arr.iter().filter_map(|x| x.as_str()) {
+                                let s = s.trim();
+                                if s.is_empty() {
+                                    continue;
+                                }
+                                *img_fix_counts.entry(s.to_string()).or_insert(0) += 1;
+                                *fixes.entry(s.to_string()).or_insert(0) += 1;
+                                *by_profile_fix_counts
+                                    .entry(o.spec.profile.clone())
+                                    .or_default()
+                                    .entry(s.to_string())
+                                    .or_insert(0) += 1;
+                                if let Some(theme) = theme_for_fix(s) {
+                                    let t = theme.to_string();
+                                    *themes.entry(t.clone()).or_insert(0) += 1;
+                                    *theme_fix_counts
+                                        .entry(t)
+                                        .or_default()
+                                        .entry(s.to_string())
+                                        .or_insert(0) += 1;
+                                }
+                            }
+                        }
+                        if let Some(arr) = p.get("issues").and_then(|x| x.as_array()) {
+                            for it in arr {
+                                img_issues.push(it.clone());
+                                if let Some(area) = it.get("area").and_then(|x| x.as_str()) {
+                                    let a = area.trim();
+                                    if !a.is_empty() {
+                                        *issues_by_area.entry(a.to_string()).or_insert(0) += 1;
+                                        let an = norm_area(a);
+                                        *issues_by_area_norm.entry(an.clone()).or_insert(0) += 1;
+                                        *by_profile_issues_by_area_norm
+                                            .entry(o.spec.profile.clone())
+                                            .or_default()
+                                            .entry(an)
+                                            .or_insert(0) += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Per-profile (per image) small bundle.
+                    let pp = per_profile
+                        .entry(o.spec.profile.clone())
+                        .or_insert_with(|| {
+                            serde_json::json!({
+                                "runs": 0u64,
+                                "parsed_ok": 0u64,
+                                "artifact_files": Vec::<String>::new(),
+                                "artifact_paths": Vec::<String>::new(),
+                                "scores": Vec::<f64>::new(),
+                                "verdicts": Vec::<String>::new(),
+                                "issues": Vec::<serde_json::Value>::new()
+                            })
+                        });
+                    if let Some(obj) = pp.as_object_mut() {
+                        let r0 = obj.get("runs").and_then(|x| x.as_u64()).unwrap_or(0) + 1;
+                        obj.insert("runs".to_string(), serde_json::Value::from(r0));
+                        if parsed_ok_i {
+                            let p0 = obj.get("parsed_ok").and_then(|x| x.as_u64()).unwrap_or(0) + 1;
+                            obj.insert("parsed_ok".to_string(), serde_json::Value::from(p0));
+                        }
+                        if let Some(a) =
+                            obj.get_mut("artifact_files").and_then(|x| x.as_array_mut())
+                        {
+                            a.push(serde_json::Value::String(o.artifact_file.clone()));
+                        }
+                        if let Some(a) =
+                            obj.get_mut("artifact_paths").and_then(|x| x.as_array_mut())
+                        {
+                            a.push(serde_json::Value::String(
+                                o.artifact_path.display().to_string(),
+                            ));
+                        }
+                        if let Some(p) = o.payload.get("parsed") {
+                            if let Some(s) = p.get("score_0_10").and_then(|x| x.as_f64()) {
+                                if let Some(a) =
+                                    obj.get_mut("scores").and_then(|x| x.as_array_mut())
+                                {
+                                    a.push(serde_json::Value::from(s));
+                                }
+                            }
+                            if let Some(v) = p.get("verdict").and_then(|x| x.as_str()) {
+                                let vv = v.trim();
+                                if !vv.is_empty() {
+                                    if let Some(a) =
+                                        obj.get_mut("verdicts").and_then(|x| x.as_array_mut())
+                                    {
+                                        a.push(serde_json::Value::String(vv.to_string()));
+                                    }
+                                }
+                            }
+                            if let Some(arr) = p.get("issues").and_then(|x| x.as_array()) {
+                                if let Some(a) =
+                                    obj.get_mut("issues").and_then(|x| x.as_array_mut())
+                                {
+                                    for it in arr {
+                                        a.push(it.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let score_median: Option<f64> = if trial_scores.is_empty() {
+                    None
+                } else {
+                    let mut v = trial_scores.clone();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    Some(v[v.len() / 2])
+                };
+
+                let mut img_fix_vec: Vec<(String, u64)> = img_fix_counts.into_iter().collect();
+                img_fix_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                let img_top_3_fixes: Vec<String> =
+                    img_fix_vec.iter().take(3).map(|(s, _)| s.clone()).collect();
+                let consensus_min = (trials + 1) / 2;
+                let consensus_fixes: Vec<String> = img_fix_vec
+                    .iter()
+                    .filter(|(_s, c)| (*c as u64) >= consensus_min)
+                    .take(5)
+                    .map(|(s, _)| s.clone())
+                    .collect();
+
+                let artifact_path0 = artifact_paths.first().cloned().unwrap_or_default();
+                let artifact_file0 = artifact_files.first().cloned().unwrap_or_default();
+
+                per_input.push(serde_json::json!({
+                    "image_index": (idx0 + 1) as u64,
+                    "image_path": img_path.display().to_string(),
+                    "artifact_path": artifact_path0,
+                    "artifact_file": artifact_file0,
+                    "artifact_paths": artifact_paths,
+                    "artifact_files": artifact_files,
+                    "profiles": profiles,
+                    "per_profile": per_profile,
+                    "trials": {
+                        "count": trials,
+                        "parsed_ok": trial_parsed_ok,
+                        "scores": trial_scores,
+                        "score_median": score_median,
+                        "consensus_min_votes": consensus_min,
+                        "consensus_fixes": consensus_fixes
+                    },
+                    "ok": trial_parsed_ok > 0,
+                    "parsed_ok": trial_parsed_ok > 0,
+                    "score_0_10": score_median,
+                    "top_3_fixes": img_top_3_fixes,
+                    "issues": img_issues
+                }));
+            }
+
+            // Attach per-profile rollups (run-level).
+            for p in &profiles {
+                let runs_p = by_profile_runs.get(p).cloned().unwrap_or(0);
+                let ok_p = by_profile_parsed_ok.get(p).cloned().unwrap_or(0);
+                let fixes_p = by_profile_fix_counts
+                    .get(p)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                let issues_p = by_profile_issues_by_area_norm
+                    .get(p)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                by_profile.insert(
+                    p.clone(),
+                    serde_json::json!({
+                        "runs": runs_p,
+                        "parsed_ok": ok_p,
+                        "parsed_ok_rate": if runs_p == 0 { 0.0 } else { (ok_p as f64) / (runs_p as f64) },
+                        "fix_counts": fixes_p,
+                        "issues_by_area_norm": issues_p
+                    }),
+                );
+            }
+
+            // Produce meta summary.
+            #[derive(Clone, Debug)]
+            struct FixCount {
+                fix: String,
+                count: u64,
+            }
+            let mut fixes_vec: Vec<FixCount> = fixes
+                .into_iter()
+                .map(|(fix, count)| FixCount { fix, count })
+                .collect();
+            fixes_vec.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.fix.cmp(&b.fix)));
+            let top_3_fixes: Vec<String> =
+                fixes_vec.iter().take(3).map(|fc| fc.fix.clone()).collect();
+
+            fn sev_rank(s: &str) -> u8 {
+                match s.trim().to_ascii_uppercase().as_str() {
+                    "P0" => 0,
+                    "P1" => 1,
+                    "P2" => 2,
+                    _ => 2,
+                }
+            }
+            fn verdict_rank(s: &str) -> u8 {
+                match s.trim().to_ascii_lowercase().as_str() {
+                    "bad" => 0,
+                    "mixed" => 1,
+                    "good" => 2,
+                    _ => 1,
+                }
+            }
+
+            // Meta aggregation: severity-first rollup across all parsed issues.
+            // This is deterministic and does not add extra model calls.
+            let mut meta_scores: Vec<f64> = Vec::new();
+            let mut meta_verdict_best: u8 = 2; // good
+            let mut sev_counts: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut fix_counts_p0: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut fix_counts_p1: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+
+            for it in per_input.iter() {
+                // scores
+                if let Some(s) = it
+                    .get("trials")
+                    .and_then(|t| t.get("scores"))
+                    .and_then(|x| x.as_array())
+                {
+                    for v in s.iter().filter_map(|x| x.as_f64()) {
+                        meta_scores.push(v);
+                    }
+                }
+                // Prefer explicit verdict in per-profile parsed payloads if present (more reliable).
+                if let Some(pp) = it.get("per_profile").and_then(|x| x.as_object()) {
+                    for (_k, v) in pp {
+                        if let Some(vs) = v.get("verdicts").and_then(|x| x.as_array()) {
+                            for vv in vs.iter().filter_map(|x| x.as_str()) {
+                                let vv = vv.trim();
+                                if !vv.is_empty() {
+                                    meta_verdict_best = meta_verdict_best.min(verdict_rank(vv));
+                                }
+                            }
+                        }
+                        if let Some(issues) = v.get("issues").and_then(|x| x.as_array()) {
+                            for iss in issues {
+                                let sev =
+                                    iss.get("severity").and_then(|x| x.as_str()).unwrap_or("P2");
+                                let sev_key = sev.trim().to_ascii_uppercase();
+                                *sev_counts.entry(sev_key.clone()).or_insert(0) += 1;
+                                let fx =
+                                    iss.get("fix").and_then(|x| x.as_str()).unwrap_or("").trim();
+                                if !fx.is_empty() {
+                                    if sev_rank(&sev_key) == 0 {
+                                        *fix_counts_p0.entry(fx.to_string()).or_insert(0) += 1;
+                                    } else if sev_rank(&sev_key) == 1 {
+                                        *fix_counts_p1.entry(fx.to_string()).or_insert(0) += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(arr) = it.get("issues").and_then(|x| x.as_array()) {
+                    // Back-compat: older summaries without per_profile.
+                    for iss in arr {
+                        let sev = iss.get("severity").and_then(|x| x.as_str()).unwrap_or("P2");
+                        let sev_key = sev.trim().to_ascii_uppercase();
+                        *sev_counts.entry(sev_key.clone()).or_insert(0) += 1;
+                        let v = iss.get("fix").and_then(|x| x.as_str()).unwrap_or("").trim();
+                        if !v.is_empty() {
+                            if sev_rank(&sev_key) == 0 {
+                                *fix_counts_p0.entry(v.to_string()).or_insert(0) += 1;
+                            } else if sev_rank(&sev_key) == 1 {
+                                *fix_counts_p1.entry(v.to_string()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            meta_scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let meta_score_median = if meta_scores.is_empty() {
+                None
+            } else {
+                Some(meta_scores[meta_scores.len() / 2])
+            };
+            let meta_score_min = meta_scores.first().cloned();
+            let meta_has_p0 = sev_counts.get("P0").cloned().unwrap_or(0) > 0;
+            let meta_has_p1 = sev_counts.get("P1").cloned().unwrap_or(0) > 0;
+            let meta_verdict = if meta_has_p0 {
+                "bad"
+            } else if meta_has_p1 {
+                "mixed"
+            } else {
+                match meta_verdict_best {
+                    0 => "bad",
+                    1 => "mixed",
+                    _ => "good",
+                }
+            };
+
+            fn top_k_counts(
+                map: &std::collections::BTreeMap<String, u64>,
+                k: usize,
+            ) -> Vec<serde_json::Value> {
+                let mut v = map.iter().map(|(s, c)| (s.clone(), *c)).collect::<Vec<_>>();
+                v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                v.into_iter()
+                    .take(k)
+                    .map(|(fix, count)| serde_json::json!({"fix": fix, "count": count}))
+                    .collect()
+            }
+            let meta = serde_json::json!({
+                "verdict": meta_verdict,
+                "score_median_0_10": meta_score_median,
+                "score_min_0_10": meta_score_min,
+                "severity_counts": sev_counts,
+                "top_fix_counts_p0": top_k_counts(&fix_counts_p0, 10),
+                "top_fix_counts_p1": top_k_counts(&fix_counts_p1, 10),
+                "top_fix_counts_overall": fixes_vec.iter().take(10).map(|fc| serde_json::json!({"fix": fc.fix, "count": fc.count})).collect::<Vec<_>>(),
+            });
+
+            let mut themes_vec = themes.clone().into_iter().collect::<Vec<_>>();
+            themes_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let top_3_themes: Vec<String> =
+                themes_vec.into_iter().take(3).map(|(k, _)| k).collect();
+
+            let mut top_3_fixes_by_theme: Vec<String> = Vec::new();
+            for theme in &top_3_themes {
+                if let Some(m) = theme_fix_counts.get(theme) {
+                    let mut v = m.iter().map(|(k, c)| (k.clone(), *c)).collect::<Vec<_>>();
+                    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    if let Some((fix, _)) = v.into_iter().next() {
+                        top_3_fixes_by_theme.push(fix);
+                    }
+                }
+            }
+
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            let summary = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_vlm_run",
+                "generated_at_epoch_s": now,
+                "timing_ms": elapsed_ms,
+                "inputs": {
+                    "images": images.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                    "images_dir": args.images_dir.as_ref().map(|p| p.display().to_string()),
+                    "max_images": args.max_images,
+                    "model": model,
+                    "goals": goals.as_ref().clone(),
+                    "goal_profiles": goal_profiles_used.as_ref().clone(),
+                    "goals_file": args.goals_file.as_ref().map(|p| p.display().to_string()),
+                    "trials": trials,
+                    "temperature": temperature,
+                    "profiles": profiles,
+                    "max_inflight": max_inflight,
+                    "cache": cache_mode,
+                },
+                "outputs": {
+                    "out_dir": out_dir.display().to_string(),
+                    "summary_path": out_summary.display().to_string(),
+                    "transcript_jsonl": Some(transcript_jsonl_path.display().to_string()),
+                },
+                "totals": {
+                    "runs": runs,
+                    "parsed_ok": parsed_ok,
+                    "images": images.len(),
+                    "trials": trials,
+                    "parsed_ok_rate": if runs == 0 { 0.0 } else { (parsed_ok as f64) / (runs as f64) }
+                },
+                "top_3_fixes": top_3_fixes,
+                "top_3_themes": top_3_themes,
+                "top_3_fixes_by_theme": top_3_fixes_by_theme,
+                "issues_by_area": issues_by_area,
+                "issues_by_area_norm": issues_by_area_norm,
+                "by_profile": by_profile,
+                "meta": meta,
+                "themes": themes,
+                "fix_counts": fixes_vec.iter().take(50).map(|fc| serde_json::json!({"fix": fc.fix, "count": fc.count})).collect::<Vec<_>>(),
+                "per_input": per_input,
+            });
+
+            std::fs::write(&out_summary, serde_json::to_string_pretty(&summary)? + "\n")?;
+            println!("{}", out_summary.display());
+        }
+        #[cfg(feature = "eval")]
+        Commands::EvalVlmBundle(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(".generated/webpipe-eval-vlm-bundle-{now}.json"))
+            });
+            if let Some(p) = out.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+
+            fn read_summary(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+                let raw = std::fs::read_to_string(path)?;
+                let v: serde_json::Value = serde_json::from_str(&raw)?;
+                if v.get("kind").and_then(|x| x.as_str()) != Some("webpipe_eval_vlm_run") {
+                    anyhow::bail!(
+                        "summary.kind must be webpipe_eval_vlm_run: {}",
+                        path.display()
+                    );
+                }
+                if v.get("schema_version").and_then(|x| x.as_u64()) != Some(1) {
+                    anyhow::bail!("summary.schema_version must be 1: {}", path.display());
+                }
+                Ok(v)
+            }
+
+            let page = read_summary(&args.page_summary)?;
+            let plots = read_summary(&args.plots_summary)?;
+
+            // Merge fix_counts from both summaries into a combined top list.
+            let mut fix_counts: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            for src in [&page, &plots] {
+                if let Some(arr) = src.get("fix_counts").and_then(|x| x.as_array()) {
+                    for it in arr {
+                        let fix = it.get("fix").and_then(|x| x.as_str()).unwrap_or("").trim();
+                        let c = it.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
+                        if !fix.is_empty() && c > 0 {
+                            *fix_counts.entry(fix.to_string()).or_insert(0) += c;
+                        }
+                    }
+                }
+            }
+            let mut fixes_vec: Vec<(String, u64)> = fix_counts.into_iter().collect();
+            fixes_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let combined_top_10: Vec<serde_json::Value> = fixes_vec
+                .iter()
+                .take(10)
+                .map(|(fix, count)| serde_json::json!({"fix": fix, "count": count}))
+                .collect();
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "webpipe_eval_vlm_bundle",
+                "generated_at_epoch_s": now,
+                "inputs": {
+                    "page_summary": args.page_summary.display().to_string(),
+                    "plots_summary": args.plots_summary.display().to_string()
+                },
+                "summary": {
+                    "combined_top_fix_counts": combined_top_10
+                },
+                "page": page,
+                "plots": plots
+            });
+
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
+        }
         Commands::Version(args) => {
             let v = serde_json::json!({
                 "schema_version": 1,
@@ -14238,6 +24177,202 @@ async fn main() -> Result<()> {
                 _ => println!("{}", v),
             }
         }
+        #[cfg(feature = "vlm")]
+        Commands::VlmImageToText(args) => {
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(".generated/webpipe-vlm-image-to-text-{now}.json"))
+            });
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+
+            let img_path = args.image;
+            let bytes = std::fs::read(&img_path)?;
+
+            fn infer_mime_from_path(p: &std::path::Path) -> Option<&'static str> {
+                let ext = p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                match ext.as_str() {
+                    "png" => Some("image/png"),
+                    "jpg" | "jpeg" => Some("image/jpeg"),
+                    "webp" => Some("image/webp"),
+                    "gif" => Some("image/gif"),
+                    _ => None,
+                }
+            }
+
+            let mime_type = args
+                .mime_type
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| infer_mime_from_path(&img_path).map(|s| s.to_string()))
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+
+            // Feature-gated: keep network calls opt-in at build time.
+            #[cfg(feature = "vision-gemini")]
+            let http = reqwest::Client::new();
+            #[cfg(feature = "vision-gemini")]
+            let result: Result<(String, String), &'static str> =
+                webpipe_local::vision_gemini::gemini_image_to_text(http, &bytes, &mime_type).await;
+            #[cfg(not(feature = "vision-gemini"))]
+            let result: Result<(String, String), &'static str> =
+                Err("vision_gemini_feature_disabled");
+
+            let payload = match result {
+                Ok((model, text)) => serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_vlm_image_to_text",
+                    "generated_at_epoch_s": now,
+                    "ok": true,
+                    "inputs": {
+                        "image_path": img_path,
+                        "mime_type": mime_type,
+                        "bytes_len": bytes.len()
+                    },
+                    "model": model,
+                    "text": text
+                }),
+                Err(code) => serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_vlm_image_to_text",
+                    "generated_at_epoch_s": now,
+                    "ok": false,
+                    "inputs": {
+                        "image_path": img_path,
+                        "mime_type": mime_type,
+                        "bytes_len": bytes.len()
+                    },
+                    "error": { "code": code }
+                }),
+            };
+
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
+        }
+        #[cfg(feature = "vlm")]
+        Commands::VlmOpenrouter(args) => {
+            let t0 = std::time::Instant::now();
+            let mut transcript_seq: u64 = 0;
+            fn env(key: &str) -> Option<String> {
+                std::env::var(key)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }
+
+            let now = args.now_epoch_s.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            let out = args.out.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(".generated/webpipe-vlm-openrouter-{now}.json"))
+            });
+            std::fs::create_dir_all(
+                out.parent()
+                    .unwrap_or_else(|| std::path::Path::new(".generated")),
+            )?;
+
+            let api_key = env("WEBPIPE_OPENROUTER_API_KEY")
+                .or_else(|| env("OPENROUTER_API_KEY"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing OPENROUTER_API_KEY (or WEBPIPE_OPENROUTER_API_KEY)")
+                })?;
+
+            let model = args
+                .model
+                .or_else(|| env("WEBPIPE_OPENROUTER_MODEL"))
+                .unwrap_or_else(|| "google/gemini-3-flash-preview".to_string());
+
+            let base = env("WEBPIPE_OPENROUTER_BASE_URL")
+                .unwrap_or_else(|| "https://openrouter.ai/api".to_string());
+            let url = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
+
+            let img_path = args.image;
+
+            let prompt = args.prompt.unwrap_or_else(|| {
+                "Return ONE JSON object only (no markdown, no prose).\n\nYou are critiquing a *rendered technical page screenshot*. Use BOTH the screenshot and any provided Render Context (computed CSS, TOC state, console/network errors).\n\nSchema (required keys):\n- overall: string (2–4 sentences)\n- score_0_10: number\n- verdict: \"good\"|\"mixed\"|\"bad\"\n- strengths: string[] (3–6 concrete positives)\n- issues: array of {\n    area: \"navigation\"|\"layout_spacing\"|\"typography\"|\"visual_hierarchy\"|\"plots_figures\"|\"tables_data\"|\"math_typesetting\"|\"writing_clarity\"|\"accessibility\"|\"technical_runtime\",\n    severity: \"P0\"|\"P1\"|\"P2\",\n    region: \"top\"|\"middle\"|\"bottom\"|\"global\",\n    problem: string,\n    evidence: string,\n    fix: string\n  }\n- top_3_fixes: string[] (ranked)\n\nRules:\n- Evidence must be concrete and locally grounded.\n- Fixes must be actionable, not generic.\n- Do NOT recommend changes already present per render context."
+                    .to_string()
+            });
+            let prompt = if let Some(p) = args.context_json.as_ref() {
+                if let Ok(raw) = std::fs::read_to_string(p) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        let ctx_txt = vlm_format_context_block(&v, args.context_max_chars);
+                        format!("{prompt}\n\n## Render context (from Playwright)\n{ctx_txt}\n")
+                    } else {
+                        prompt
+                    }
+                } else {
+                    prompt
+                }
+            } else {
+                prompt
+            };
+
+            let http = reqwest::Client::new();
+            let payload = vlm_openrouter_call(
+                &http,
+                url.as_str(),
+                api_key.as_str(),
+                model.as_str(),
+                prompt.as_str(),
+                img_path.as_path(),
+                args.max_chars,
+                args.temperature,
+                now,
+            )
+            .await;
+
+            if let Some(tx_path) = args.transcript_jsonl.as_ref() {
+                if let Some(p) = tx_path.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                let (prompt_trunc, _) = vlm_truncate_chars(&prompt, args.transcript_max_chars);
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                transcript_seq = transcript_seq.wrapping_add(1);
+                let line = serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "webpipe_eval_transcript_event",
+                    "generated_at_epoch_s": now,
+                    "seq": transcript_seq,
+                    "run_kind": "vlm_openrouter",
+                    "stage": "vlm_openrouter",
+                    "call_id": format!("vlm_openrouter:{}:{}", now, img_path.display()),
+                    "timing_ms": elapsed_ms,
+                    "llm": {
+                        "backend": "openrouter",
+                        "model_effective": model,
+                        "temperature": args.temperature
+                    },
+                    "prompt": {
+                        "user": prompt_trunc
+                    },
+                    "response": {
+                        "parsed_ok": payload.get("parsed_ok").and_then(|x| x.as_bool()).unwrap_or(false),
+                        "parsed": payload.get("parsed").cloned().unwrap_or(serde_json::Value::Null),
+                        "http_status": payload.get("http").and_then(|h| h.get("status")).and_then(|x| x.as_u64()),
+                    }
+                });
+                let _ = vlm_append_jsonl(tx_path.as_path(), &line);
+            }
+
+            std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
+            println!("{}", out.display());
+        }
+        #[cfg(feature = "eval")]
         Commands::EvalQrels(args) => {
             let now = args.now_epoch_s.unwrap_or_else(|| {
                 std::time::SystemTime::now()

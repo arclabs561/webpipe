@@ -10,8 +10,47 @@ use std::process::Command;
 /// - This is intentionally "good enough" and deterministic, not a full readability engine.
 /// - Callers should apply their own output bounds (chars) if needed.
 pub fn html_to_text(html: &str, width: usize) -> String {
-    // html2text expects bytes; Cursor avoids allocating a second large buffer.
-    html2text::from_read(Cursor::new(html.as_bytes()), width).unwrap_or_else(|_| html.to_string())
+    fn strip_block(html: &str, tag: &str) -> String {
+        let lower = html.to_ascii_lowercase();
+        let open_pat = format!("<{tag}");
+        let close_pat = format!("</{tag}");
+        let mut out = String::with_capacity(html.len());
+        let mut i = 0usize;
+        while i < html.len() {
+            let Some(start_rel) = lower[i..].find(&open_pat) else {
+                out.push_str(&html[i..]);
+                break;
+            };
+            let start = i + start_rel;
+            out.push_str(&html[i..start]);
+
+            // Find the end of the closing tag: </tag ...>
+            let Some(close_rel) = lower[start..].find(&close_pat) else {
+                // Unterminated block; drop tail.
+                break;
+            };
+            let close_start = start + close_rel;
+            let Some(gt_rel) = lower[close_start..].find('>') else {
+                break;
+            };
+            i = close_start + gt_rel + 1;
+        }
+        out
+    }
+
+    // Keep script/style content out of extracted text (deterministic, safety-first).
+    let s = strip_block(html, "script");
+    let s = strip_block(&s, "style");
+
+    // html2text expects bytes.
+    let out = html2text::from_read(Cursor::new(s.as_bytes()), width).unwrap_or(s);
+    // html2text may emit whitespace/newlines even for “empty” pages; normalize that to empty
+    // so downstream empty-extraction detection is meaningful.
+    if !has_any_text(&out) {
+        String::new()
+    } else {
+        out
+    }
 }
 
 fn norm_ws(s: &str) -> String {
@@ -95,24 +134,33 @@ fn pdf_to_text_shellout(bytes: &[u8]) -> Result<(&'static str, String), &'static
         .map_err(|_| "pdf_shellout_tempfile_write_failed")?;
     let path = tmp.path().to_string_lossy().to_string();
 
-    fn run(bin: &str, args: &[&str]) -> Result<String, &'static str> {
-        let out = Command::new(bin).args(args).output();
-        match out {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err("pdf_shellout_tool_not_found")
-            }
-            Err(_) => Err("pdf_shellout_spawn_failed"),
-            Ok(o) => {
-                if !o.status.success() {
-                    return Err("pdf_shellout_nonzero_exit");
-                }
-                let s = String::from_utf8_lossy(&o.stdout).to_string();
-                if !has_any_text(&s) {
-                    return Err("pdf_shellout_empty_output");
-                }
-                Ok(s)
-            }
+    let timeout = shellout::timeout_from_env_ms("WEBPIPE_PDF_SHELLOUT_TIMEOUT_MS", 25_000);
+    let max_chars = shellout::max_chars_from_env("WEBPIPE_PDF_SHELLOUT_MAX_CHARS", 250_000);
+    let max_stdout_bytes = max_chars.saturating_mul(4).clamp(1_000, 8_000_000);
+
+    fn run(
+        bin: &str,
+        args: &[&str],
+        timeout: std::time::Duration,
+        max_stdout_bytes: usize,
+    ) -> Result<String, &'static str> {
+        let mut cmd = Command::new(bin);
+        cmd.args(args);
+        let out =
+            shellout::run_stdout_bounded(cmd, timeout, max_stdout_bytes).map_err(|e| match e {
+                "shellout_tool_not_found" => "pdf_shellout_tool_not_found",
+                "shellout_spawn_failed" => "pdf_shellout_spawn_failed",
+                "shellout_wait_failed" => "pdf_shellout_wait_failed",
+                "shellout_nonzero_exit" => "pdf_shellout_nonzero_exit",
+                "shellout_timeout" => "pdf_shellout_timeout",
+                "shellout_read_failed" => "pdf_shellout_read_failed",
+                _ => "pdf_shellout_failed",
+            })?;
+        let s = String::from_utf8_lossy(&out).to_string();
+        if !has_any_text(&s) {
+            return Err("pdf_shellout_empty_output");
         }
+        Ok(s)
     }
 
     // Try pdftotext first in auto mode (widely available via poppler).
@@ -131,6 +179,8 @@ fn pdf_to_text_shellout(bytes: &[u8]) -> Result<(&'static str, String), &'static
                 &path,
                 "-",
             ],
+            timeout,
+            max_stdout_bytes,
         ) {
             return Ok(("pdf-pdftotext", s));
         }
@@ -140,7 +190,12 @@ fn pdf_to_text_shellout(bytes: &[u8]) -> Result<(&'static str, String), &'static
     }
 
     if mode == "auto" || mode == "mutool" {
-        if let Ok(s) = run("mutool", &["draw", "-F", "text", "-o", "-", &path]) {
+        if let Ok(s) = run(
+            "mutool",
+            &["draw", "-F", "text", "-o", "-", &path],
+            timeout,
+            max_stdout_bytes,
+        ) {
             return Ok(("pdf-mutool", s));
         }
         return Err("pdf_shellout_failed");
@@ -304,6 +359,34 @@ pub struct ExtractedText {
     pub engine: &'static str,
     pub text: String,
     pub warnings: Vec<&'static str>,
+}
+
+fn clean_extracted_text(mut s: String) -> String {
+    // Make outputs “clean” for downstream JSON/logging/clients:
+    // - Normalize CRLF/CR to LF.
+    // - Replace C0/C1-ish control characters with spaces (except \n/\t).
+    // - Drop BOM/ZERO WIDTH NO-BREAK SPACE.
+    //
+    // Keep this deterministic and Unicode-safe (char-based).
+    s = s.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch == '\u{FEFF}' {
+            // BOM / ZWNBSP: invisible footgun.
+            continue;
+        }
+        if ch == '\u{000C}' {
+            // Formfeed: keep as a paragraph break (helps PDF-ish outputs).
+            out.push('\n');
+            continue;
+        }
+        if (ch <= '\u{001F}' && ch != '\n' && ch != '\t') || ch == '\u{007F}' {
+            out.push(' ');
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn truncate_to_chars(s: &str, max_chars: usize) -> (String, usize, bool) {
@@ -800,7 +883,7 @@ pub fn best_effort_text_from_bytes(
         return match pdf_to_text(bytes) {
             Ok(t) => ExtractedText {
                 engine: "pdf-extract",
-                text: t,
+                text: clean_extracted_text(t),
                 warnings,
             },
             Err(_) => {
@@ -810,7 +893,7 @@ pub fn best_effort_text_from_bytes(
                         warnings.push("pdf_shellout_used");
                         ExtractedText {
                             engine,
-                            text,
+                            text: clean_extracted_text(text),
                             warnings,
                         }
                     }
@@ -829,7 +912,7 @@ pub fn best_effort_text_from_bytes(
 
     // YouTube transcripts (produced by LocalFetcher as text) should have a stable engine.
     if ct0 == "text/x-youtube-transcript" {
-        let text = String::from_utf8_lossy(bytes).to_string();
+        let text = clean_extracted_text(String::from_utf8_lossy(bytes).to_string());
         return ExtractedText {
             engine: "youtube_transcript",
             text,
@@ -948,7 +1031,7 @@ pub fn best_effort_text_from_bytes(
     let is_xml = ct0 == "application/xml" || ct0 == "text/xml" || ct0.ends_with("+xml");
     let is_text = ct0.starts_with("text/") || is_markdown || is_json || is_xml;
     if is_text && !bytes_look_like_html(bytes) {
-        let text = String::from_utf8_lossy(bytes).to_string();
+        let text = clean_extracted_text(String::from_utf8_lossy(bytes).to_string());
         let engine = if is_markdown {
             "markdown"
         } else if is_json {
@@ -967,7 +1050,16 @@ pub fn best_effort_text_from_bytes(
 
     // Default: HTML-ish (or unknown-but-seems-text). Prefer a “main content” extraction when
     // it clearly improves signal; otherwise fall back to whole-page html2text.
-    let html0 = String::from_utf8_lossy(bytes).to_string();
+    // Bound worst-case HTML parsing cost: extraction output is bounded by max_chars anyway.
+    let max_html_bytes =
+        env_usize("WEBPIPE_EXTRACT_MAX_BYTES", 2_000_000).clamp(50_000, 20_000_000);
+    let html_bytes = if bytes.len() > max_html_bytes {
+        warnings.push("extract_input_truncated");
+        &bytes[..max_html_bytes]
+    } else {
+        bytes
+    };
+    let html0 = String::from_utf8_lossy(html_bytes).to_string();
     // Strip script/style/noscript blocks before html2text to avoid counting JS/CSS as “content”.
     // This keeps “script-only” pages as empty (so higher-level fallbacks can trigger).
     let html1 = strip_tag_blocks(&html0, "script");
@@ -1014,7 +1106,7 @@ pub fn best_effort_text_from_bytes(
             warnings.push("boilerplate_reduced");
             return ExtractedText {
                 engine: "html_main",
-                text: main.unwrap(),
+                text: clean_extracted_text(main.unwrap()),
                 warnings,
             };
         }
@@ -1023,7 +1115,7 @@ pub fn best_effort_text_from_bytes(
     if full_ok {
         return ExtractedText {
             engine: "html2text",
-            text: full,
+            text: clean_extracted_text(full),
             warnings,
         };
     }
@@ -1035,7 +1127,7 @@ pub fn best_effort_text_from_bytes(
             warnings.push("hint_text_fallback");
             return ExtractedText {
                 engine: "html_hint",
-                text: norm_ws(&hint),
+                text: clean_extracted_text(norm_ws(&hint)),
                 warnings,
             };
         }

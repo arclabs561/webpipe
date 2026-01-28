@@ -36,6 +36,9 @@ pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
         "chunks_filtered_low_signal" => Some(
             "Some extracted chunks looked like JS/app-shell gunk and were filtered. If you need raw output, try include_text=true or fetch_backend=\"firecrawl\".",
         ),
+        "extract_input_truncated" => Some(
+            "The fetched body was large; extraction only used the first WEBPIPE_EXTRACT_MAX_BYTES bytes. To change this, lower max_bytes or increase WEBPIPE_EXTRACT_MAX_BYTES (server env).",
+        ),
         "firecrawl_fallback_on_low_signal" => Some(
             "Local extraction looked like low-signal app-shell/JS gunk, so we retried this URL via Firecrawl (bounded).",
         ),
@@ -139,4 +142,3 @@ pub(crate) fn error_obj(
         }),
     }
 }
-

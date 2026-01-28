@@ -3,6 +3,8 @@ fn webpipe_version_contract() {
     let bin = assert_cmd::cargo::cargo_bin!("webpipe");
     let out = std::process::Command::new(bin)
         .args(["version"])
+        // Disable `.env` autoload so this contract stays hermetic.
+        .env("WEBPIPE_DOTENV", "0")
         .output()
         .expect("run webpipe version");
 

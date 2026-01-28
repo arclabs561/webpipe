@@ -174,7 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // This should return either:
     // - ok=true (if a provider key is configured), or
-    // - ok=false error.code=not_configured (still a successful tool call).
+    // - ok=false error.code=not_configured (MCP is_error may be true; still returns a structured payload).
     let search = service
         .call_tool(CallToolRequestParam {
             name: "web_search".into(),

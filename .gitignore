@@ -6,6 +6,12 @@ target/
 .idea/
 .vscode/
 
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
 # Secrets (never commit)
 .env
 .env.*

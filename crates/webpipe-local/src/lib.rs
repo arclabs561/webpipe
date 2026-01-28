@@ -13,6 +13,7 @@ pub mod firecrawl;
 pub mod links;
 pub mod ollama;
 pub mod openai_compat;
+pub mod papers;
 pub mod perplexity;
 pub mod search;
 pub mod semantic;
@@ -273,6 +274,10 @@ impl LocalFetcher {
         let client = reqwest::Client::builder()
             .user_agent("webpipe-local/0.1")
             .redirect(reqwest::redirect::Policy::limited(10))
+            // Safety defaults: avoid “hang forever” on DNS/TLS/body stalls.
+            // Per-request timeouts (FetchRequest.timeout_ms) can still override this.
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| Error::Fetch(e.to_string()))?;
         let cache = cache_dir.map(FsCache::new);

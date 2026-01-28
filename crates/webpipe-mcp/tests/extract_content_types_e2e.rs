@@ -109,6 +109,8 @@ async fn web_extract_handles_multiple_content_types() {
         .serve(
             TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                 cmd.args(["mcp-stdio"]);
+                // Disable `.env` autoload so this test stays hermetic.
+                cmd.env("WEBPIPE_DOTENV", "0");
                 // Disable cache for determinism.
                 cmd.env(
                     "WEBPIPE_CACHE_DIR",
@@ -155,13 +157,9 @@ async fn web_extract_handles_multiple_content_types() {
             })
             .await
             .expect("call_tool web_extract");
-        let text = r
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap_or_default();
-        serde_json::from_str(&text).expect("parse web_extract json")
+        r.structured_content
+            .clone()
+            .expect("expected structured_content")
     }
 
     // HTML should use html2text.
@@ -171,6 +169,11 @@ async fn web_extract_handles_multiple_content_types() {
     assert_eq!(v_html["extraction"]["engine"].as_str(), Some("html2text"));
     assert_eq!(v_html["extract"]["engine"].as_str(), Some("html2text"));
     assert!(v_html.get("structure").is_some());
+    assert_eq!(
+        v_html["quality"]["kind"].as_str(),
+        Some("webpipe_extract_quality")
+    );
+    assert!(v_html["extract"].get("quality").is_some());
 
     // Boilerplate-heavy article should prefer html_main.
     let v_article = call_extract(&service, &format!("{base}/article"), None).await;
@@ -188,6 +191,9 @@ async fn web_extract_handles_multiple_content_types() {
     assert!(warnings
         .iter()
         .any(|w| w.as_str() == Some("boilerplate_reduced")));
+    assert!(v_article["quality"]["signals"]["nonempty"]
+        .as_bool()
+        .unwrap_or(false));
     assert!(v_article["structure"]["outline"]
         .as_array()
         .unwrap_or(&vec![])
@@ -209,6 +215,12 @@ async fn web_extract_handles_multiple_content_types() {
         .unwrap_or("");
     assert!(c0.to_lowercase().contains("article"));
     assert!(c0.to_lowercase().contains("attention"));
+    assert!(
+        v_article_q["quality"]["signals"]["query_overlap"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
 
     // JSON should be treated as json/text, not html2text.
     let v_json = call_extract(&service, &format!("{base}/json"), None).await;
@@ -216,6 +228,10 @@ async fn web_extract_handles_multiple_content_types() {
     assert_eq!(v_json["content_type"].as_str(), Some("application/json"));
     assert_eq!(v_json["extraction"]["engine"].as_str(), Some("json"));
     assert_eq!(v_json["extract"]["engine"].as_str(), Some("json"));
+    assert_eq!(
+        v_json["quality"]["kind"].as_str(),
+        Some("webpipe_extract_quality")
+    );
     assert!(v_json["structure"]["outline"]
         .as_array()
         .map(|a| !a.is_empty())
@@ -227,6 +243,10 @@ async fn web_extract_handles_multiple_content_types() {
     assert_eq!(v_md["content_type"].as_str(), Some("text/markdown"));
     assert_eq!(v_md["extraction"]["engine"].as_str(), Some("markdown"));
     assert_eq!(v_md["extract"]["engine"].as_str(), Some("markdown"));
+    assert_eq!(
+        v_md["quality"]["kind"].as_str(),
+        Some("webpipe_extract_quality")
+    );
 
     // JS shell HTML should fall back to hint text.
     let v_shell = call_extract(&service, &format!("{base}/shell"), None).await;
@@ -237,6 +257,10 @@ async fn web_extract_handles_multiple_content_types() {
     assert!(warnings
         .iter()
         .any(|w| w.as_str() == Some("hint_text_fallback")));
+    assert_eq!(
+        v_shell["quality"]["kind"].as_str(),
+        Some("webpipe_extract_quality")
+    );
 
     // Bad PDF should not panic; should warn pdf_extract_failed.
     let v_pdf = call_extract(&service, &format!("{base}/pdf_bad"), None).await;
@@ -248,4 +272,8 @@ async fn web_extract_handles_multiple_content_types() {
     assert!(warnings
         .iter()
         .any(|w| w.as_str() == Some("pdf_extract_failed")));
+    assert_eq!(
+        v_pdf["quality"]["kind"].as_str(),
+        Some("webpipe_extract_quality")
+    );
 }
