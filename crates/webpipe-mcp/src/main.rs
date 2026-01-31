@@ -1,6 +1,8 @@
 #![recursion_limit = "256"]
 
 use anyhow::Result;
+#[cfg(feature = "vlm")]
+use base64::Engine;
 use clap::{Parser, Subcommand};
 #[cfg(feature = "eval")]
 mod eval;

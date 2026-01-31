@@ -115,7 +115,7 @@ fn web_extract_rewrites_github_blob_to_raw_file() {
             .filter_map(|x| x.as_str())
             .collect();
         assert!(
-            codes.iter().any(|c| *c == "github_blob_rewritten_to_raw"),
+            codes.contains(&"github_blob_rewritten_to_raw"),
             "expected github blob rewrite warning; got {codes:?}"
         );
         assert!(

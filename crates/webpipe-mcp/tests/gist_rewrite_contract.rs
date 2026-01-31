@@ -114,7 +114,7 @@ fn web_extract_rewrites_gist_to_raw() {
             .filter_map(|x| x.as_str())
             .collect();
         assert!(
-            codes.iter().any(|c| *c == "gist_rewritten_to_raw"),
+            codes.contains(&"gist_rewritten_to_raw"),
             "expected gist rewrite warning; got {codes:?}"
         );
         assert!(v["extract"]["text"]

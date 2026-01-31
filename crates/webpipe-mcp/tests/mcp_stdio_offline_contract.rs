@@ -193,7 +193,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             })
             .await?;
         assert!(
-            p.messages.len() >= 1,
+            !p.messages.is_empty(),
             "expected >=1 prompt message, got {}",
             p.messages.len()
         );

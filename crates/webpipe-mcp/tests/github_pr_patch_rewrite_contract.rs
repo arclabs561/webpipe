@@ -102,7 +102,7 @@ fn web_extract_rewrites_github_pr_to_patch() {
             .filter_map(|x| x.as_str())
             .collect();
         assert!(
-            codes.iter().any(|c| *c == "github_pr_rewritten_to_patch"),
+            codes.contains(&"github_pr_rewritten_to_patch"),
             "expected github PR rewrite warning; got {codes:?}"
         );
         assert!(v["extract"]["text"].as_str().unwrap_or("").contains("[PATCH]"));

@@ -105,7 +105,7 @@ fn web_extract_rewrites_github_commit_to_patch() {
             .filter_map(|x| x.as_str())
             .collect();
         assert!(
-            codes.iter().any(|c| *c == "github_commit_rewritten_to_patch"),
+            codes.contains(&"github_commit_rewritten_to_patch"),
             "expected github commit rewrite warning; got {codes:?}"
         );
         assert!(v["extract"]["text"].as_str().unwrap_or("").contains("commit"));

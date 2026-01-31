@@ -138,7 +138,7 @@ fn web_explore_extract_crawls_and_finds_linked_page() {
 
         assert_eq!(v["ok"].as_bool(), Some(true));
         let pages = v["pages"].as_array().expect("pages");
-        assert!(pages.len() >= 1);
+        assert!(!pages.is_empty());
         let top = v["top_chunks"].as_array().expect("top_chunks");
         let any = top.iter().any(|c| {
             c.get("text")

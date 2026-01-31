@@ -114,7 +114,7 @@ fn web_extract_rewrites_arxiv_abs_to_pdf_on_same_host() {
             .filter_map(|x| x.as_str())
             .collect();
         assert!(
-            codes.iter().any(|c| *c == "arxiv_abs_rewritten_to_pdf"),
+            codes.contains(&"arxiv_abs_rewritten_to_pdf"),
             "expected arxiv rewrite warning; got {codes:?}"
         );
 

@@ -139,9 +139,7 @@ This is the real README content, not the GitHub app shell.
             .filter_map(|x| x.as_str())
             .collect();
         assert!(
-            codes
-                .iter()
-                .any(|c| *c == "github_repo_rewritten_to_raw_readme"),
+            codes.contains(&"github_repo_rewritten_to_raw_readme"),
             "expected github rewrite warning; got {codes:?}"
         );
         assert!(v.get("attempts").is_some(), "expected attempts object");

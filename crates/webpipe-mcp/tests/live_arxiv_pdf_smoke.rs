@@ -99,7 +99,7 @@ fn webpipe_live_arxiv_pdf_smoke_opt_in() {
         );
         assert!(v["chunks"].is_array(), "expected chunks array");
         assert!(
-            v["chunks"].as_array().unwrap().len() > 0,
+            !v["chunks"].as_array().unwrap().is_empty(),
             "expected at least one chunk"
         );
 

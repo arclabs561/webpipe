@@ -139,7 +139,7 @@ It includes a timeline, affected package names, and mitigation steps.
             .filter_map(|x| x.as_str())
             .collect();
         assert!(
-            portal_issues.iter().any(|x| *x == "gunk"),
+            portal_issues.contains(&"gunk"),
             "expected portal quality to include 'gunk'; got issues={portal_issues:?}"
         );
         assert_eq!(
@@ -160,7 +160,7 @@ It includes a timeline, affected package names, and mitigation steps.
             .filter_map(|x| x.as_str())
             .collect();
         assert!(
-            !article_issues.iter().any(|x| *x == "gunk"),
+            !article_issues.contains(&"gunk"),
             "expected article not gunk; got issues={article_issues:?} full={}",
             s
         );
