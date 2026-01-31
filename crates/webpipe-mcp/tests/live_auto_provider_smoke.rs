@@ -11,6 +11,16 @@ fn get_env_any(keys: &[&str]) -> Option<String> {
     None
 }
 
+fn payload_from_result(result: &rmcp::model::CallToolResult) -> Option<serde_json::Value> {
+    result.structured_content.clone().or_else(|| {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
+    })
+}
+
 #[test]
 fn webpipe_live_auto_search_smoke_opt_in() {
     // This test makes a real paid network call. Opt-in only.
@@ -79,15 +89,9 @@ fn webpipe_live_auto_search_smoke_opt_in() {
             })
             .await?;
 
-        let s = resp
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap_or_default();
-        let v: serde_json::Value = serde_json::from_str(&s)?;
+        let v = payload_from_result(&resp).ok_or("missing structured_content")?;
 
-        assert_eq!(v["schema_version"].as_u64(), Some(1));
+        assert_eq!(v["schema_version"].as_u64(), Some(2));
         assert_eq!(v["kind"].as_str(), Some("web_search"));
         assert_eq!(v["ok"].as_bool(), Some(true));
         assert_eq!(v["request"]["provider"].as_str(), Some("auto"));

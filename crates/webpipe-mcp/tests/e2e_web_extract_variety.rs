@@ -56,9 +56,7 @@ async fn webpipe_web_extract_handles_js_shell_redirects_long_pages_and_link_farm
         let mut s = String::new();
         s.push_str("<html><body><main><h1>Index</h1><ul>");
         for i in 0..60 {
-            s.push_str(&format!(
-                r#"<li><a href="/article?x={i}">link{i}</a></li>"#
-            ));
+            s.push_str(&format!(r#"<li><a href="/article?x={i}">link{i}</a></li>"#));
         }
         s.push_str("</ul></main></body></html>");
         s
@@ -157,10 +155,13 @@ async fn webpipe_web_extract_handles_js_shell_redirects_long_pages_and_link_farm
         }),
     )
     .await;
-    assert_eq!(v_spa["schema_version"].as_u64(), Some(1));
+    assert_eq!(v_spa["schema_version"].as_u64(), Some(2));
     assert_eq!(v_spa["kind"].as_str(), Some("web_extract"));
     assert_eq!(v_spa["ok"].as_bool(), Some(true));
-    assert!(v_spa.get("warnings").is_some(), "expected warnings array to exist");
+    assert!(
+        v_spa.get("warnings").is_some(),
+        "expected warnings array to exist"
+    );
 
     // Redirect: final_url should land on /article.
     let v_redir = call(
@@ -184,7 +185,10 @@ async fn webpipe_web_extract_handles_js_shell_redirects_long_pages_and_link_farm
     )
     .await;
     assert_eq!(v_redir["ok"].as_bool(), Some(true));
-    assert!(v_redir["final_url"].as_str().unwrap_or("").contains("/article"));
+    assert!(v_redir["final_url"]
+        .as_str()
+        .unwrap_or("")
+        .contains("/article"));
 
     // Link farm: include_links bounded.
     let v_links = call(
@@ -209,7 +213,12 @@ async fn webpipe_web_extract_handles_js_shell_redirects_long_pages_and_link_farm
     )
     .await;
     assert_eq!(v_links["ok"].as_bool(), Some(true));
-    let links = v_links.get("links").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let links = v_links
+        .get("extract")
+        .and_then(|e| e.get("links"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     assert!(!links.is_empty(), "expected some links extracted");
     assert!(links.len() <= 10, "links should be bounded");
 
@@ -241,8 +250,8 @@ async fn webpipe_web_extract_handles_js_shell_redirects_long_pages_and_link_farm
         .cloned()
         .unwrap_or_default();
     assert!(
-        ws.iter().any(|w| w.as_str() == Some("body_truncated_by_max_bytes")),
+        ws.iter()
+            .any(|w| w.as_str() == Some("body_truncated_by_max_bytes")),
         "expected body_truncated_by_max_bytes warning"
     );
 }
-

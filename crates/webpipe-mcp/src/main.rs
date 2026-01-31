@@ -1635,7 +1635,8 @@ mod mcp {
     };
     use webpipe_local::LocalFetcher;
 
-    const SCHEMA_VERSION: u64 = 1;
+    // Breaking output shape changes (legacy field removal) are tracked via schema_version.
+    const SCHEMA_VERSION: u64 = 2;
 
     fn p<T>(v: T) -> Parameters<Option<T>> {
         Parameters(Some(v))
@@ -3104,7 +3105,10 @@ mod mcp {
             .get("truncated")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let text = payload
+            .get("body_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let text_truncated = payload
             .get("text_truncated")
             .and_then(|v| v.as_bool())
@@ -3341,26 +3345,34 @@ mod mcp {
 
     fn web_extract_markdown(payload: &serde_json::Value) -> String {
         let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-        let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let url = payload
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let final_url = payload
             .get("final_url")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
         let engine = payload
-            .get("extraction")
+            .get("extract")
             .and_then(|e| e.get("engine"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
-        let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let text = payload
+            .get("extract")
+            .and_then(|e| e.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let chunks = payload
             .get("extract")
             .and_then(|e| e.get("chunks"))
-            .and_then(|v| v.as_array())
-            .or_else(|| payload.get("chunks").and_then(|v| v.as_array()));
+            .and_then(|v| v.as_array());
         let links_n = payload
-            .get("links")
+            .get("extract")
+            .and_then(|e| e.get("links"))
             .and_then(|v| v.as_array())
             .map(|a| a.len());
 
@@ -3384,7 +3396,11 @@ mod mcp {
             md.push_str(engine);
             md.push_str("`\n");
         }
-        if let Some(n) = payload.get("text_chars").and_then(|v| v.as_u64()) {
+        if let Some(n) = payload
+            .get("extract")
+            .and_then(|e| e.get("text_chars"))
+            .and_then(|v| v.as_u64())
+        {
             md.push_str("- **text_chars**: ");
             md.push_str(&n.to_string());
             md.push('\n');
@@ -3592,7 +3608,10 @@ mod mcp {
             .get("started_at_epoch_s")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let now = payload.get("now_epoch_s").and_then(|v| v.as_u64()).unwrap_or(0);
+        let now = payload
+            .get("now_epoch_s")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let tool_calls = payload.get("tool_calls").and_then(|v| v.as_object());
         let warning_counts = payload
             .get("warnings")
@@ -3828,7 +3847,11 @@ mod mcp {
 
     fn arxiv_search_markdown(payload: &serde_json::Value) -> String {
         let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-        let query = payload.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let query = payload
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let papers = payload.get("papers").and_then(|v| v.as_array());
         let total = payload.get("total_results").and_then(|v| v.as_u64());
         let page = payload.get("page").and_then(|v| v.as_u64());
@@ -3903,9 +3926,21 @@ mod mcp {
         } else if let Some(ps) = papers {
             for (i, p) in ps.iter().take(10).enumerate() {
                 let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
-                let arxiv_id = p.get("arxiv_id").and_then(|v| v.as_str()).unwrap_or("").trim();
-                let url = p.get("abs_url").and_then(|v| v.as_str()).unwrap_or("").trim();
-                let pdf = p.get("pdf_url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let arxiv_id = p
+                    .get("arxiv_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let url = p
+                    .get("abs_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let pdf = p
+                    .get("pdf_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
                 let year = p.get("year").and_then(|v| v.as_u64());
                 let authors = p
                     .get("authors")
@@ -4044,7 +4079,11 @@ mod mcp {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let pdf = p.get("pdf_url").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let pdf = p
+                .get("pdf_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             let year = p.get("year").and_then(|v| v.as_u64());
             md.push_str("## Paper\n\n");
             if !title.is_empty() {
@@ -4103,7 +4142,11 @@ mod mcp {
 
     fn web_cache_search_extract_markdown(payload: &serde_json::Value) -> String {
         let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-        let query = payload.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let query = payload
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let cache_dir = payload
             .get("cache_dir")
             .and_then(|v| v.as_str())
@@ -4176,12 +4219,20 @@ mod mcp {
         } else if let Some(rs) = results {
             for (i, doc) in rs.iter().take(5).enumerate() {
                 let url = doc.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
-                let title = doc.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let title = doc
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
                 md.push_str(&format!(
                     "{}. **{}**\n",
                     i + 1,
                     if title.is_empty() {
-                        if url.is_empty() { "(untitled)" } else { url }
+                        if url.is_empty() {
+                            "(untitled)"
+                        } else {
+                            url
+                        }
                     } else {
                         title
                     }
@@ -4442,6 +4493,13 @@ mod mcp {
         timeout_ms: Option<u64>,
         #[serde(default)]
         max_bytes: Option<u64>,
+        /// If true, and the first fetch is truncated by max_bytes, retry once with a larger max_bytes
+        /// (bounded) to recover tail content (default: auto for PDFs; false otherwise).
+        #[serde(default)]
+        retry_on_truncation: Option<bool>,
+        /// Upper bound for the truncation retry max_bytes (default: 10_000_000; max: 20_000_000).
+        #[serde(default)]
+        truncation_retry_max_bytes: Option<u64>,
         /// Allow cache reads (default: true).
         #[serde(default)]
         cache_read: Option<bool>,
@@ -4466,6 +4524,12 @@ mod mcp {
         /// If true, compute semantic chunk scores using embeddings (default: false; requires feature).
         #[serde(default)]
         semantic_rerank: Option<bool>,
+        /// If true, and semantic_rerank=false, opportunistically run a single semantic rerank pass
+        /// when lexical chunk scoring appears ineffective (default: true).
+        ///
+        /// This is bounded (top_k only) and only uses embeddings if configured.
+        #[serde(default)]
+        semantic_auto_fallback: Option<bool>,
         /// Max semantic chunks to return when semantic_rerank=true (default: 5; max: 50).
         #[serde(default)]
         semantic_top_k: Option<usize>,
@@ -4822,6 +4886,164 @@ mod mcp {
         pub(crate) compact: Option<bool>,
     }
 
+    /// Arguments for `web_explore_extract`.
+    ///
+    /// This is a bounded local crawl starting from a URL:
+    /// fetch → extract → extract links → expand frontier (within bounds) → return merged top chunks.
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
+    struct WebExploreExtractArgs {
+        /// Starting URL (required).
+        start_url: String,
+        /// Optional query used for chunk scoring + frontier prioritization.
+        #[serde(default)]
+        query: Option<String>,
+        /// Max pages to fetch/extract (default: 10; max: 50).
+        #[serde(default)]
+        max_pages: Option<usize>,
+        /// Max crawl depth from start_url (default: 2; max: 5). Depth 0 means only start_url.
+        #[serde(default)]
+        max_depth: Option<usize>,
+        /// If true, only follow links on the same host as start_url (default: true).
+        #[serde(default)]
+        same_host_only: Option<bool>,
+        /// Max links to consider per page (default: 50; max: 500).
+        #[serde(default)]
+        max_links_per_page: Option<usize>,
+        /// Fetch timeout per page (ms).
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Max bytes per page.
+        #[serde(default)]
+        max_bytes: Option<u64>,
+        /// Width used for HTML->text extraction (default: 100).
+        #[serde(default)]
+        width: Option<usize>,
+        /// Max chars of extracted text per page (default: 20_000; max: 200_000).
+        #[serde(default)]
+        max_chars: Option<usize>,
+        /// Max chunks per page (default: 5; max: 50).
+        #[serde(default)]
+        top_chunks: Option<usize>,
+        /// Max chars per chunk (default: 500; max: 5_000).
+        #[serde(default)]
+        max_chunk_chars: Option<usize>,
+        /// If true, do not perform any network calls; fetch becomes cache-only.
+        #[serde(default)]
+        no_network: Option<bool>,
+        #[serde(default)]
+        cache_read: Option<bool>,
+        #[serde(default)]
+        cache_write: Option<bool>,
+        #[serde(default)]
+        cache_ttl_s: Option<u64>,
+        /// If true, include per-page extracted links (default: false).
+        #[serde(default)]
+        include_links: Option<bool>,
+    }
+
+    /// Arguments for `repo_ingest`.
+    ///
+    /// This is gitingest-like functionality: turn a repo into a bounded text corpus.
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
+    struct RepoIngestArgs {
+        /// Repository URL (currently: GitHub-style https://github.com/<owner>/<repo>).
+        repo_url: String,
+        /// Optional ref/branch/tag (default: repo default_branch, else main/master).
+        #[serde(default)]
+        reference: Option<String>,
+        /// Optional include patterns (glob-ish: `*` and `?`). If set, only matching files are kept.
+        /// Examples: `["*.rs", "*.md", "src/*"]`.
+        #[serde(default)]
+        include_patterns: Option<Vec<String>>,
+        /// Optional exclude patterns (glob-ish: `*` and `?`). Matching files are dropped.
+        /// Examples: `["node_modules/*", "target/*", "*.min.js"]`.
+        #[serde(default)]
+        exclude_patterns: Option<Vec<String>>,
+        /// Max files to ingest (default: 100; max: 500).
+        #[serde(default)]
+        max_files: Option<usize>,
+        /// Max total bytes fetched across all files (default: 1_000_000; max: 10_000_000).
+        #[serde(default)]
+        max_total_bytes: Option<u64>,
+        /// Max bytes per file fetch (default: 200_000; max: 1_000_000).
+        #[serde(default)]
+        max_file_bytes: Option<u64>,
+        /// Fetch timeout per request (ms).
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// If true, include combined_text (default: true).
+        #[serde(default)]
+        include_combined_text: Option<bool>,
+        /// If true, do not perform any network calls (cache-only raw fetch; GitHub API calls are disabled).
+        #[serde(default)]
+        no_network: Option<bool>,
+        #[serde(default)]
+        cache_read: Option<bool>,
+        #[serde(default)]
+        cache_write: Option<bool>,
+        #[serde(default)]
+        cache_ttl_s: Option<u64>,
+    }
+
+    /// Arguments for `web_sitemap_extract`.
+    ///
+    /// This is a bounded “index discovery” tool:
+    /// - fetch robots.txt (optional)
+    /// - fetch sitemap URLs (robots + /sitemap.xml)
+    /// - extract <loc> URLs (bounded)
+    /// - optionally call `web_search_extract(urls=[...])` to return top_chunks
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
+    struct WebSitemapExtractArgs {
+        /// Site root URL (required). Example: https://docs.example.com/
+        site_url: String,
+        /// Optional query to run extraction/ranking over the discovered URLs.
+        #[serde(default)]
+        query: Option<String>,
+        /// Max sitemap URLs to fetch (default: 3; max: 10).
+        #[serde(default)]
+        max_sitemaps: Option<usize>,
+        /// Max URLs to take from sitemaps (default: 200; max: 2000).
+        #[serde(default)]
+        max_urls: Option<usize>,
+        /// If true, only keep URLs that start with site_url (default: true).
+        #[serde(default)]
+        restrict_prefix: Option<bool>,
+        /// If true, also try fetching /sitemap.xml even if robots.txt is missing (default: true).
+        #[serde(default)]
+        try_default_sitemap: Option<bool>,
+        /// Fetch timeout per request (ms).
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Max bytes per request.
+        #[serde(default)]
+        max_bytes: Option<u64>,
+        /// If true, do not perform any network calls (cache-only).
+        #[serde(default)]
+        no_network: Option<bool>,
+        #[serde(default)]
+        cache_read: Option<bool>,
+        #[serde(default)]
+        cache_write: Option<bool>,
+        #[serde(default)]
+        cache_ttl_s: Option<u64>,
+        /// If true, run extract+rank over discovered URLs (default: true when query is non-empty).
+        #[serde(default)]
+        extract: Option<bool>,
+        /// Bounds for extraction if extract=true.
+        #[serde(default)]
+        fetch_backend: Option<String>,
+        #[serde(default)]
+        max_results: Option<usize>,
+        #[serde(default)]
+        width: Option<usize>,
+        #[serde(default)]
+        max_chars: Option<usize>,
+        #[serde(default)]
+        top_chunks: Option<usize>,
+        #[serde(default)]
+        max_chunk_chars: Option<usize>,
+    }
+
     /// Arguments for `web_deep_research`.
     ///
     /// This is an agentic evidence-gathering tool:
@@ -5008,7 +5230,7 @@ mod mcp {
         start_char: usize,
         end_char: usize,
         text: String,
-        warnings_count: usize,
+        warning_penalty: i64,
         cache_hit: bool,
     }
 
@@ -5256,6 +5478,7 @@ mod mcp {
             candidates: &[(usize, usize, String)],
             top_k: usize,
         ) -> webpipe_local::semantic::SemanticRerankResult {
+            let t0 = std::time::Instant::now();
             let top_k = top_k.max(1);
             let q = query.trim();
             if q.is_empty() || candidates.is_empty() {
@@ -5288,6 +5511,9 @@ mod mcp {
                 let t: String = ch.text.chars().take(1200).collect();
                 inputs.push(t);
             }
+            // Proxy “cost units”: number of embeddings requested (query + each candidate).
+            // We intentionally do not try to guess tokens/$ pricing here.
+            let embedding_units = inputs.len() as u64;
 
             let client = match webpipe_local::openai_compat::OpenAiCompatClient::new(
                 self.http.clone(),
@@ -5309,6 +5535,12 @@ mod mcp {
             let embs = match client.embeddings(inputs, timeout_ms).await {
                 Ok(v) => v,
                 Err(_) => {
+                    self.stats_record_llm_backend(
+                        "openrouter_embeddings",
+                        false,
+                        t0.elapsed().as_millis() as u64,
+                        None,
+                    );
                     warnings.push("semantic_embeddings_failed_fallback_to_lexical");
                     let mut out =
                         webpipe_local::semantic::semantic_rerank_chunks(query, candidates, top_k);
@@ -5318,6 +5550,12 @@ mod mcp {
             };
 
             if embs.len() != pre.chunks.len() + 1 {
+                self.stats_record_llm_backend(
+                    "openrouter_embeddings",
+                    false,
+                    t0.elapsed().as_millis() as u64,
+                    None,
+                );
                 warnings.push("semantic_embeddings_bad_shape_fallback_to_lexical");
                 let mut out =
                     webpipe_local::semantic::semantic_rerank_chunks(query, candidates, top_k);
@@ -5341,6 +5579,13 @@ mod mcp {
             pre.backend = "openrouter_embeddings".to_string();
             pre.model_id = Some(model);
             pre.warnings.extend(warnings);
+            self.stats_record_llm_backend_units(
+                "openrouter_embeddings",
+                true,
+                embedding_units,
+                t0.elapsed().as_millis() as u64,
+                None,
+            );
             pre
         }
 
@@ -5445,6 +5690,26 @@ mod mcp {
             Self::stats_record_provider(&mut s.llm_backends, name, ok, 0, elapsed_ms, http_429);
         }
 
+        fn stats_record_llm_backend_units(
+            &self,
+            name: &str,
+            ok: bool,
+            cost_units: u64,
+            elapsed_ms: u64,
+            err: Option<&str>,
+        ) {
+            let http_429 = err.is_some_and(|m| is_http_status(m, 429));
+            let mut s = self.stats_lock();
+            Self::stats_record_provider(
+                &mut s.llm_backends,
+                name,
+                ok,
+                cost_units,
+                elapsed_ms,
+                http_429,
+            );
+        }
+
         fn stats_record_fetch_backend(
             &self,
             name: &str,
@@ -5455,6 +5720,243 @@ mod mcp {
             let http_429 = err.is_some_and(|m| is_http_status(m, 429));
             let mut s = self.stats_lock();
             Self::stats_record_provider(&mut s.fetch_backends, name, ok, 0, elapsed_ms, http_429);
+        }
+
+        async fn maybe_rewrite_github_repo_url(
+            &self,
+            url: &str,
+            timeout_ms: u64,
+            max_bytes: u64,
+            no_network: bool,
+            cache_read: bool,
+            cache_write: bool,
+            cache_ttl_s: Option<u64>,
+        ) -> (String, Option<serde_json::Value>) {
+            let Some(cands) = webpipe_local::rewrite::github_repo_raw_readme_candidates(url) else {
+                return (url.to_string(), None);
+            };
+            // Bounded: try a small number of candidates.
+            let mut tried: Vec<serde_json::Value> = Vec::new();
+            for cand in cands.into_iter().take(6) {
+                let req = FetchRequest {
+                    url: cand.clone(),
+                    timeout_ms: Some(timeout_ms.min(10_000)),
+                    max_bytes: Some(max_bytes.min(1_000_000)),
+                    headers: BTreeMap::new(),
+                    cache: FetchCachePolicy {
+                        read: cache_read || no_network,
+                        write: if no_network { false } else { cache_write },
+                        ttl_s: cache_ttl_s,
+                    },
+                };
+                let t0 = std::time::Instant::now();
+                let resp = if no_network {
+                    self.fetcher.cache_get(&req).ok().flatten()
+                } else {
+                    self.fetcher.fetch(&req).await.ok()
+                };
+                match resp {
+                    Some(r) if (200..300).contains(&(r.status as i32)) => {
+                        tried.push(serde_json::json!({
+                            "url": cand,
+                            "ok": true,
+                            "status": r.status,
+                            "content_type": r.content_type,
+                            "elapsed_ms": t0.elapsed().as_millis()
+                        }));
+                        let attempts = serde_json::json!({
+                            "kind": "github_repo_raw_readme",
+                            "from": url,
+                            "to": r.url,
+                            "tried": tried
+                        });
+                        return (r.url, Some(attempts));
+                    }
+                    Some(r) => {
+                        tried.push(serde_json::json!({
+                            "url": cand,
+                            "ok": false,
+                            "status": r.status,
+                            "content_type": r.content_type,
+                            "elapsed_ms": t0.elapsed().as_millis()
+                        }));
+                    }
+                    None => {
+                        tried.push(serde_json::json!({
+                            "url": cand,
+                            "ok": false,
+                            "error": if no_network { "cache_miss_or_error" } else { "fetch_failed" },
+                            "elapsed_ms": t0.elapsed().as_millis()
+                        }));
+                    }
+                }
+            }
+            (
+                url.to_string(),
+                Some(serde_json::json!({
+                    "kind": "github_repo_raw_readme",
+                    "from": url,
+                    "to": url,
+                    "tried": tried
+                })),
+            )
+        }
+
+        fn maybe_rewrite_github_blob_url(&self, url: &str) -> (String, Option<serde_json::Value>) {
+            let Some(cands) = webpipe_local::rewrite::github_blob_raw_candidates(url) else {
+                return (url.to_string(), None);
+            };
+            let to = cands.into_iter().next().unwrap_or_else(|| url.to_string());
+            if to == url {
+                return (url.to_string(), None);
+            }
+            (
+                to.clone(),
+                Some(serde_json::json!({
+                    "kind": "github_blob_to_raw",
+                    "from": url,
+                    "to": to
+                })),
+            )
+        }
+
+        fn maybe_rewrite_github_pr_or_commit_url(
+            &self,
+            url: &str,
+        ) -> (String, Option<serde_json::Value>, Option<&'static str>) {
+            if let Some(mut c) = webpipe_local::rewrite::github_pr_patch_candidates(url) {
+                let to = c.remove(0);
+                return (
+                    to.clone(),
+                    Some(serde_json::json!({
+                        "kind": "github_pr_to_patch",
+                        "from": url,
+                        "to": to,
+                        "candidates": c
+                    })),
+                    Some("github_pr_rewritten_to_patch"),
+                );
+            }
+            if let Some(mut c) = webpipe_local::rewrite::github_commit_patch_candidates(url) {
+                let to = c.remove(0);
+                return (
+                    to.clone(),
+                    Some(serde_json::json!({
+                        "kind": "github_commit_to_patch",
+                        "from": url,
+                        "to": to,
+                        "candidates": c
+                    })),
+                    Some("github_commit_rewritten_to_patch"),
+                );
+            }
+            (url.to_string(), None, None)
+        }
+
+        fn maybe_rewrite_gist_url(&self, url: &str) -> (String, Option<serde_json::Value>) {
+            let Some(cands) = webpipe_local::rewrite::gist_raw_candidates(url) else {
+                return (url.to_string(), None);
+            };
+            let to = cands.into_iter().next().unwrap_or_else(|| url.to_string());
+            if to == url {
+                return (url.to_string(), None);
+            }
+            (
+                to.clone(),
+                Some(serde_json::json!({
+                    "kind": "gist_to_raw",
+                    "from": url,
+                    "to": to
+                })),
+            )
+        }
+
+        fn github_api_base_from_env() -> String {
+            std::env::var("WEBPIPE_GITHUB_API_BASE")
+                .ok()
+                .unwrap_or_else(|| "https://api.github.com".to_string())
+                .trim()
+                .trim_end_matches('/')
+                .to_string()
+        }
+
+        fn github_token_from_env() -> Option<String> {
+            // Never log/echo this; only use to set Authorization headers.
+            for k in ["WEBPIPE_GITHUB_TOKEN", "GITHUB_TOKEN"] {
+                if let Ok(v) = std::env::var(k) {
+                    let t = v.trim().to_string();
+                    if !t.is_empty() {
+                        return Some(t);
+                    }
+                }
+            }
+            None
+        }
+
+        fn maybe_rewrite_github_issue_url(
+            &self,
+            url: &str,
+        ) -> (String, Option<serde_json::Value>, bool) {
+            let api_base = Self::github_api_base_from_env();
+            let Some(cands) = webpipe_local::rewrite::github_issue_api_candidates(url, &api_base)
+            else {
+                return (url.to_string(), None, false);
+            };
+            let to = cands.into_iter().next().unwrap_or_else(|| url.to_string());
+            if to == url {
+                return (url.to_string(), None, false);
+            }
+            (
+                to.clone(),
+                Some(serde_json::json!({
+                    "kind": "github_issue_to_api",
+                    "from": url,
+                    "to": to
+                })),
+                true,
+            )
+        }
+
+        fn maybe_rewrite_github_release_url(
+            &self,
+            url: &str,
+        ) -> (String, Option<serde_json::Value>, bool) {
+            let api_base = Self::github_api_base_from_env();
+            let Some(cands) = webpipe_local::rewrite::github_release_api_candidates(url, &api_base)
+            else {
+                return (url.to_string(), None, false);
+            };
+            let to = cands.into_iter().next().unwrap_or_else(|| url.to_string());
+            if to == url {
+                return (url.to_string(), None, false);
+            }
+            (
+                to.clone(),
+                Some(serde_json::json!({
+                    "kind": "github_release_to_api",
+                    "from": url,
+                    "to": to
+                })),
+                true,
+            )
+        }
+
+        fn maybe_rewrite_arxiv_abs_url(&self, url: &str) -> (String, Option<serde_json::Value>) {
+            let Some(cands) = webpipe_local::rewrite::arxiv_abs_pdf_candidates(url) else {
+                return (url.to_string(), None);
+            };
+            let to = cands.into_iter().next().unwrap_or_else(|| url.to_string());
+            if to == url {
+                return (url.to_string(), None);
+            }
+            (
+                to.clone(),
+                Some(serde_json::json!({
+                    "kind": "arxiv_abs_to_pdf",
+                    "from": url,
+                    "to": to
+                })),
+            )
         }
 
         fn stats_record_warnings(&self, warnings: &[&'static str]) {
@@ -5576,12 +6078,45 @@ mod mcp {
                 .cloned()
                 .collect();
             // Never return an empty list if we had chunks; fall back to original.
+            //
+            // Important: still report `filtered=true` in this case. “All chunks look low-signal”
+            // is exactly the scenario where callers need a warning, even if we must fail-open.
             if out.is_empty() {
                 out = chunks;
-                return (out, false);
+                return (out, true);
             }
             let filtered = out.len() < chunks.len();
             (out, filtered)
+        }
+
+        fn warning_penalty(warnings: &[&'static str]) -> i64 {
+            // Heuristic severity weights. These are intentionally small and stable:
+            // - hard blockers/challenges should dominate
+            // - soft quality degradations are additive but not overwhelming
+            // - informational warnings (cache_only) should not penalize
+            let mut p: i64 = 0;
+            for w in warnings {
+                match normalize_warning_code(w) {
+                    "blocked_by_js_challenge" => p += 100,
+                    "empty_extraction" => p += 80,
+                    "main_content_low_signal" => p += 25,
+                    "chunks_filtered_low_signal" => p += 15,
+                    "body_truncated_by_max_bytes" => p += 12,
+                    "text_truncated_by_max_chars" => p += 8,
+                    "retried_due_to_truncation" => p += 3,
+                    "truncation_retry_failed" => p += 8,
+                    "pdf_extract_failed" => p += 15,
+                    "pdf_shellout_used" => p += 2,
+                    "pdf_shellout_unavailable" => p += 15,
+                    "pandoc_failed" => p += 12,
+                    "image_no_text_extraction" => p += 30,
+                    "media_no_text_extraction" => p += 30,
+                    "unsafe_request_headers_dropped" => p += 0,
+                    "cache_only" => p += 0,
+                    _ => p += 1,
+                }
+            }
+            p
         }
 
         fn tokenize_for_overlap(query: &str) -> Vec<String> {
@@ -5752,14 +6287,14 @@ mod mcp {
                     // Multi-objective selection:
                     // - maximize score
                     // - prefer cache hits (cheaper / more reproducible)
-                    // - prefer fewer warnings (higher reliability)
+                    // - prefer lower warning severity (higher reliability)
                     // - prefer shorter chunks (bounded evidence packs)
                     let metrics: Vec<Vec<f32>> = candidates
                         .iter()
                         .map(|c| {
                             let score = c.score as f32;
                             let cache = if c.cache_hit { 1.0 } else { 0.0 };
-                            let warnings = -(c.warnings_count as f32);
+                            let warnings = -(c.warning_penalty as f32);
                             let len = -(c.text.chars().count() as f32);
                             vec![score, cache, warnings, len]
                         })
@@ -5770,14 +6305,14 @@ mod mcp {
 
                     if let Some(frontier) = frontier {
                         let mut idxs = frontier;
-                        // Stable, deterministic tie-break: high score, then fewer warnings, then cache, then URL.
+                        // Stable, deterministic tie-break: high score, then lower warning penalty, then cache, then URL.
                         idxs.sort_by(|&ia, &ib| {
                             let a = &candidates[ia];
                             let b = &candidates[ib];
                             let ka = Self::score_key(a.score);
                             let kb = Self::score_key(b.score);
                             kb.cmp(&ka)
-                                .then_with(|| a.warnings_count.cmp(&b.warnings_count))
+                                .then_with(|| a.warning_penalty.cmp(&b.warning_penalty))
                                 .then_with(|| (b.cache_hit as u8).cmp(&(a.cache_hit as u8)))
                                 .then_with(|| a.url.cmp(&b.url))
                         });
@@ -5801,7 +6336,7 @@ mod mcp {
                             let ka = Self::score_key(a.score);
                             let kb = Self::score_key(b.score);
                             kb.cmp(&ka)
-                                .then_with(|| a.warnings_count.cmp(&b.warnings_count))
+                                .then_with(|| a.warning_penalty.cmp(&b.warning_penalty))
                                 .then_with(|| (b.cache_hit as u8).cmp(&(a.cache_hit as u8)))
                                 .then_with(|| a.url.cmp(&b.url))
                         });
@@ -5825,6 +6360,7 @@ mod mcp {
                         let ka = Self::score_key(a.score);
                         let kb = Self::score_key(b.score);
                         kb.cmp(&ka)
+                            .then_with(|| a.warning_penalty.cmp(&b.warning_penalty))
                             .then_with(|| a.url.cmp(&b.url))
                             .then_with(|| a.start_char.cmp(&b.start_char))
                     });
@@ -6161,6 +6697,9 @@ mod mcp {
                         "web_seed_search_extract",
                         "web_fetch",
                         "web_extract",
+                        "web_explore_extract",
+                        "web_sitemap_extract",
+                        "repo_ingest",
                         "web_search",
                         "web_search_extract",
                         "web_cache_search_extract",
@@ -6173,6 +6712,9 @@ mod mcp {
                         "meta": ["webpipe_meta", "webpipe_usage", "webpipe_usage_reset"],
                         "seeds": ["web_seed_urls", "web_seed_search_extract"],
                         "fetch_extract": ["web_fetch", "web_extract"],
+                        "explore": ["web_explore_extract"],
+                        "sitemap": ["web_sitemap_extract"],
+                        "ingest": ["repo_ingest"],
                         "search": ["web_search", "web_search_extract", "web_cache_search_extract"],
                         "research": ["web_deep_research", "paper_search", "arxiv_search", "arxiv_enrich"]
                     },
@@ -6183,12 +6725,20 @@ mod mcp {
                     // Values for paper_search.backends
                     "paper_backends": ["semantic_scholar", "openalex", "google_scholar_serpapi"],
                     // Values for extraction engines
-                    "extraction_engines": ["html2text", "html_main", "html_hint", "text", "json", "xml", "markdown", "pdf-extract", "pdf-pdftotext", "pdf-mutool", "youtube_transcript", "pandoc", "image", "image_ocr", "media", "media_subtitles", "gemini_vision"],
+                    "extraction_engines": ["html2text", "html_main", "readability", "html_hint", "text", "json", "xml", "markdown", "pdf-extract", "pdf-pdftotext", "pdf-mutool", "youtube_transcript", "pandoc", "image", "image_ocr", "media", "media_subtitles", "gemini_vision"],
                     // Environment knobs (names only; no values) for opportunistic local tooling + multimodal.
                     "knobs": [
                         "WEBPIPE_SEARXNG_ENDPOINT",
                         "WEBPIPE_SEARXNG_ENDPOINTS",
                         "WEBPIPE_ARXIV_ENDPOINT",
+                        "WEBPIPE_ARXIV_REWRITE_HOSTS",
+                        "WEBPIPE_GITHUB_API_BASE",
+                        "WEBPIPE_GITHUB_RAW_HOST",
+                        "WEBPIPE_GITHUB_TOKEN",
+                        "WEBPIPE_GITHUB_REWRITE_HOSTS",
+                        "WEBPIPE_GITHUB_REWRITE_BRANCHES",
+                        "WEBPIPE_GIST_REWRITE_HOSTS",
+                        "WEBPIPE_GIST_RAW_HOST",
                         "WEBPIPE_SERPAPI_API_KEY",
                         "SERPAPI_API_KEY",
                         "WEBPIPE_PERPLEXITY_ENDPOINT",
@@ -6254,17 +6804,28 @@ mod mcp {
                             "provider": "auto",
                             "auto_mode": "fallback",
                             "fetch_backend": "local",
-                            "selection_mode": "score",
+                            // Prefer Pareto by default: it tends to produce a cleaner evidence pack
+                            // (cache hits, fewer warnings, shorter chunks) without sacrificing relevance.
+                            "selection_mode": "pareto",
                             "exploration": "balanced",
                             "agentic": true,
                             "max_results": 5,
                             "max_urls": 3,
+                            // Prefer auto_plus when we have a query: do a bounded hint pre-pass to avoid
+                            // burning max_urls on portal/app-shell pages.
+                            "url_selection_mode": "auto_plus",
                             "timeout_ms": 20_000,
                             "max_bytes": 5_000_000,
                             "top_chunks": 5,
                             "max_chunk_chars": 500,
                             "include_links": false,
                             "include_text": false,
+                            // Prefer structure-aware chunking when possible.
+                            "include_structure": true,
+                            // When Firecrawl is configured, a bounded fallback on low-signal/empty extraction
+                            // improves real-world success rate on JS-heavy sites.
+                            "firecrawl_fallback_on_empty_extraction": true,
+                            "firecrawl_fallback_on_low_signal": true,
                             "no_network": false,
                             "cache": { "read": true, "write": true }
                         },
@@ -6273,11 +6834,16 @@ mod mcp {
                             "fetch_backend": "local",
                             "timeout_ms": 20_000,
                             "max_bytes": 5_000_000,
+                            // Default to a bounded tail-recovery retry for PDFs (xref/trailer often lives at the end).
+                            // For non-PDF pages, callers can opt in per-request with retry_on_truncation=true.
+                            "retry_on_truncation": null,
+                            "truncation_retry_max_bytes": 10_000_000,
                             "width": 100,
                             "max_chars": 20_000,
                             "top_chunks": 5,
                             "max_chunk_chars": 500,
-                            "include_structure": false,
+                            // Default to structure output; it improves chunk quality and debuggability.
+                            "include_structure": true,
                             "include_text": true,
                             "include_links": false,
                             "no_network": false,
@@ -6310,6 +6876,8 @@ mod mcp {
                             "no_network": false,
                         "timeout_ms": 20_000,
                         "max_bytes": 5_000_000,
+                        "retry_on_truncation": null,
+                        "truncation_retry_max_bytes": 10_000_000,
                         "width": 100,
                         "max_chars": 20_000,
                         "max_chars_max": 200_000,
@@ -6321,11 +6889,12 @@ mod mcp {
                         "include_links": false,
                         "max_links": 50,
                         "max_links_max": 500,
-                        "include_structure": false,
+                        "include_structure": true,
                         "max_outline_items": 25,
                         "max_blocks": 40,
                         "max_block_chars": 400,
                         "semantic_rerank": false,
+                        "semantic_auto_fallback": true,
                         "semantic_top_k": 5
                     },
                     "web_cache_search_extract": {
@@ -6352,15 +6921,16 @@ mod mcp {
                     "web_search_extract": {
                         "provider": "auto",
                         "auto_mode": "fallback",
-                        "selection_mode": "score",
+                        "selection_mode": "pareto",
                         "fetch_backend": "local",
                             "no_network": false,
-                        "firecrawl_fallback_on_empty_extraction": false,
-                        "firecrawl_fallback_on_low_signal": false,
+                        // Defaults are “smart” in code: these only activate when Firecrawl is configured.
+                        "firecrawl_fallback_on_empty_extraction": true,
+                        "firecrawl_fallback_on_low_signal": true,
                         "exploration": "balanced",
                         "max_results": 5,
                         "max_urls": 3,
-                        "url_selection_mode": "auto",
+                        "url_selection_mode": "auto_plus",
                         "agentic": true,
                         "agentic_selector": "auto",
                         "agentic_max_search_rounds": 1,
@@ -6379,7 +6949,7 @@ mod mcp {
                         "max_links": 25,
                         "max_links_max": 500,
                         "include_text": false,
-                        "include_structure": false,
+                        "include_structure": true,
                         "max_outline_items": 25,
                         "max_blocks": 40,
                         "max_block_chars": 400,
@@ -6411,7 +6981,7 @@ mod mcp {
                 },
                 "tool_output_summary": {
                     "web_fetch": "Fetch a URL (cache-aware). Returns status/content_type/bytes_len and optional bounded text/headers.",
-                    "web_extract": "Fetch+extract readable text/chunks (bounded). Returns extraction.engine, text_chars, top_chunks, warnings/hints.",
+                    "web_extract": "Fetch+extract readable text/chunks (bounded). Returns extract.engine, text_chars, top_chunks, warnings/hints.",
                     "web_search": "Search only (bounded). Returns results[] with url/title/content and provider selection when provider=auto.",
                     "web_search_extract": "Main tool: optional search -> fetch -> extract -> rank top_chunks across URLs (bounded).",
                     "web_cache_search_extract": "Cache-only search: scan WEBPIPE_CACHE_DIR -> extract -> top_chunks (no network).",
@@ -6633,6 +7203,8 @@ mod mcp {
                         top_chunks: Some(top_chunks),
                         max_chunk_chars: Some(max_chunk_chars),
                         max_bytes: Some(max_bytes),
+                        retry_on_truncation: None,
+                        truncation_retry_max_bytes: None,
                         include_links: Some(false),
                         max_links: Some(0),
                         include_text: Some(include_text),
@@ -6641,6 +7213,7 @@ mod mcp {
                         max_blocks: None,
                         max_block_chars: None,
                         semantic_rerank: Some(false),
+                        semantic_auto_fallback: Some(false),
                         semantic_top_k: None,
                         cache_read: Some(cache_read),
                         cache_write: Some(cache_write),
@@ -6652,16 +7225,18 @@ mod mcp {
 
                 let ok = v["ok"].as_bool().unwrap_or(false);
                 let engine = v
-                    .get("extraction")
+                    .get("extract")
                     .and_then(|x| x.get("engine"))
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string());
                 let chunks = v
-                    .get("chunks")
+                    .get("extract")
+                    .and_then(|x| x.get("chunks"))
                     .and_then(|x| x.as_array())
                     .cloned()
                     .unwrap_or_default();
                 let warnings = v
+                    // web_extract returns warnings at top-level.
                     .get("warnings")
                     .and_then(|x| x.as_array())
                     .cloned()
@@ -7043,7 +7618,7 @@ mod mcp {
                 }
             });
             if !semantic.is_null() {
-                payload["semantic"] = semantic;
+                payload["request"]["semantic"] = semantic;
             }
             add_envelope_fields(&mut payload, "arxiv_search", t0.elapsed().as_millis());
             let md = arxiv_search_markdown(&payload);
@@ -7188,6 +7763,1520 @@ mod mcp {
         }
 
         #[tool(
+            description = "Local crawl: fetch+extract starting from start_url, follow on-page links (bounded), and return merged top chunks (cache-aware; JSON output)",
+            annotations(
+                title = "Explore+extract",
+                read_only_hint = true,
+                open_world_hint = true
+            )
+        )]
+        async fn web_explore_extract(
+            &self,
+            params: Parameters<Option<WebExploreExtractArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            let args = params.0.unwrap_or_default();
+            self.stats_inc_tool("web_explore_extract");
+            let t0 = std::time::Instant::now();
+
+            let start_url = args.start_url.trim().to_string();
+            if start_url.is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(ErrorCode::InvalidParams, "start_url must be non-empty", "Pass a valid URL like https://example.com/docs/.")
+                });
+                add_envelope_fields(
+                    &mut payload,
+                    "web_explore_extract",
+                    t0.elapsed().as_millis(),
+                );
+                return Ok(tool_result(payload));
+            }
+            let base = match reqwest::Url::parse(&start_url) {
+                Ok(u) => u,
+                Err(_) => {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": error_obj(ErrorCode::InvalidUrl, "invalid start_url", "Pass a valid absolute URL (including scheme).")
+                    });
+                    add_envelope_fields(
+                        &mut payload,
+                        "web_explore_extract",
+                        t0.elapsed().as_millis(),
+                    );
+                    return Ok(tool_result(payload));
+                }
+            };
+            let base_host = base.host_str().unwrap_or("").to_string();
+
+            let query = args.query.unwrap_or_default();
+            let qkey = Self::query_key(&query).unwrap_or_default();
+            let q_toks: Vec<&str> = qkey
+                .split(|ch: char| !ch.is_alphanumeric())
+                .filter(|t| t.len() >= 2)
+                .collect();
+
+            let max_pages = args.max_pages.unwrap_or(10).clamp(1, 50);
+            let max_depth = args.max_depth.unwrap_or(2).clamp(0, 5);
+            let same_host_only = args.same_host_only.unwrap_or(true);
+            let max_links_per_page = args.max_links_per_page.unwrap_or(50).min(500);
+
+            let timeout_ms = args.timeout_ms.unwrap_or(20_000).min(60_000);
+            let max_bytes = args.max_bytes.unwrap_or(5_000_000);
+            let width = args.width.unwrap_or(100).clamp(20, 240);
+            let max_chars = args.max_chars.unwrap_or(20_000).min(200_000);
+            let top_chunks = args.top_chunks.unwrap_or(5).min(50);
+            let max_chunk_chars = args.max_chunk_chars.unwrap_or(500).min(5_000);
+
+            let no_network = args.no_network.unwrap_or(false);
+            let cache_read = args.cache_read.unwrap_or(true);
+            let cache_write = args.cache_write.unwrap_or(true);
+            let cache_ttl_s = args.cache_ttl_s;
+            let include_links = args.include_links.unwrap_or(false);
+
+            fn score_for_query(q_toks: &[&str], url: &str, label: &str) -> u64 {
+                if q_toks.is_empty() {
+                    return 0;
+                }
+                let key = webpipe_local::textprep::scrub(&format!("{url} {label}"));
+                let mut s = 0u64;
+                for t in q_toks {
+                    if key.contains(t) {
+                        s += 1;
+                    }
+                }
+                s
+            }
+
+            #[derive(Clone)]
+            struct FrontierItem {
+                depth: usize,
+                url: String,
+                score: u64,
+                ord: u64,
+            }
+
+            let mut frontier: Vec<FrontierItem> = vec![FrontierItem {
+                depth: 0,
+                url: start_url.clone(),
+                score: score_for_query(&q_toks, &start_url, ""),
+                ord: 0,
+            }];
+            let mut ord = 1u64;
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+            let mut pages_out: Vec<serde_json::Value> = Vec::new();
+            let mut merged_chunks: Vec<serde_json::Value> = Vec::new();
+
+            while !frontier.is_empty() && pages_out.len() < max_pages {
+                // Stable pick: max score, then lowest insertion order.
+                let mut best_i = 0usize;
+                for i in 1..frontier.len() {
+                    let a = &frontier[i];
+                    let b = &frontier[best_i];
+                    if a.score > b.score || (a.score == b.score && a.ord < b.ord) {
+                        best_i = i;
+                    }
+                }
+                let item = frontier.swap_remove(best_i);
+                if item.depth > max_depth {
+                    continue;
+                }
+                let canon = item
+                    .url
+                    .split('#')
+                    .next()
+                    .unwrap_or(item.url.as_str())
+                    .trim()
+                    .to_string();
+                if canon.is_empty() || !seen.insert(canon.clone()) {
+                    continue;
+                }
+
+                // Apply bounded rewrites before fetch.
+                let (u0, arxiv_attempts) = self.maybe_rewrite_arxiv_abs_url(&item.url);
+                let (u0b, gh_issue_attempts, gh_issue_rewrote) =
+                    self.maybe_rewrite_github_issue_url(&u0);
+                let (u0c, gh_release_attempts, gh_release_rewrote) =
+                    self.maybe_rewrite_github_release_url(&u0b);
+                let (u1, gh_patch_attempts, gh_patch_warn) =
+                    self.maybe_rewrite_github_pr_or_commit_url(&u0c);
+                let (u2, github_blob_attempts) = self.maybe_rewrite_github_blob_url(&u1);
+                let (u3, gist_attempts) = self.maybe_rewrite_gist_url(&u2);
+                let (fetch_url, github_repo_attempts) = self
+                    .maybe_rewrite_github_repo_url(
+                        &u3,
+                        timeout_ms,
+                        max_bytes,
+                        no_network,
+                        cache_read,
+                        cache_write,
+                        cache_ttl_s,
+                    )
+                    .await;
+                let arxiv_rewrote = u0 != item.url;
+                let github_patch_rewrote = u1 != u0;
+                let github_blob_rewrote = u2 != u1;
+                let gist_rewrote = u3 != u2;
+                let github_repo_rewrote = fetch_url != u3;
+                let mut attempts_map = serde_json::Map::new();
+                if let Some(a) = arxiv_attempts {
+                    attempts_map.insert("arxiv_rewrite".to_string(), a);
+                }
+                if let Some(a) = gh_issue_attempts {
+                    attempts_map.insert("github_issue_rewrite".to_string(), a);
+                }
+                if let Some(a) = gh_release_attempts {
+                    attempts_map.insert("github_release_rewrite".to_string(), a);
+                }
+                if let Some(a) = gh_patch_attempts {
+                    attempts_map.insert("github_patch_rewrite".to_string(), a);
+                }
+                if let Some(a) = github_blob_attempts {
+                    attempts_map.insert("github_blob_rewrite".to_string(), a);
+                }
+                if let Some(a) = gist_attempts {
+                    attempts_map.insert("gist_rewrite".to_string(), a);
+                }
+                if let Some(a) = github_repo_attempts {
+                    attempts_map.insert("github_repo_rewrite".to_string(), a);
+                }
+
+                let req = FetchRequest {
+                    url: fetch_url.clone(),
+                    timeout_ms: Some(timeout_ms),
+                    max_bytes: Some(max_bytes),
+                    headers: BTreeMap::new(),
+                    cache: FetchCachePolicy {
+                        read: cache_read || no_network,
+                        write: if no_network { false } else { cache_write },
+                        ttl_s: cache_ttl_s,
+                    },
+                };
+
+                let per_t0 = std::time::Instant::now();
+                let fetched = if no_network {
+                    self.fetcher.cache_get(&req).ok().flatten()
+                } else {
+                    self.fetcher.fetch(&req).await.ok()
+                };
+
+                let Some(resp) = fetched else {
+                    let mut warnings: Vec<&'static str> = Vec::new();
+                    if no_network {
+                        warnings.push("cache_only");
+                        warnings.push("no_network_may_require_warm_cache");
+                    }
+                    if arxiv_rewrote {
+                        warnings.push("arxiv_abs_rewritten_to_pdf");
+                    }
+                    if gh_issue_rewrote {
+                        warnings.push("github_issue_rewritten_to_api");
+                    }
+                    if gh_release_rewrote {
+                        warnings.push("github_release_rewritten_to_api");
+                    }
+                    if github_patch_rewrote {
+                        if let Some(w) = gh_patch_warn {
+                            warnings.push(w);
+                        }
+                    }
+                    if github_blob_rewrote {
+                        warnings.push("github_blob_rewritten_to_raw");
+                    }
+                    if gist_rewrote {
+                        warnings.push("gist_rewritten_to_raw");
+                    }
+                    if github_repo_rewrote {
+                        warnings.push("github_repo_rewritten_to_raw_readme");
+                    }
+                    let mut one = serde_json::json!({
+                        "ok": false,
+                        "url": item.url,
+                        "fetched_url": fetch_url,
+                        "error": error_obj(ErrorCode::FetchFailed, "fetch failed", "Fetch failed (or cache miss in no_network mode)."),
+                        "elapsed_ms": per_t0.elapsed().as_millis()
+                    });
+                    if !warnings.is_empty() {
+                        one["warnings"] = serde_json::json!(warnings);
+                        let codes = warning_codes_from(&warnings);
+                        one["warning_codes"] = serde_json::json!(codes.clone());
+                        one["warning_hints"] = warning_hints_from(&codes);
+                    }
+                    one["attempts"] = if attempts_map.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::Object(attempts_map)
+                    };
+                    pages_out.push(one);
+                    continue;
+                };
+
+                let resp_bytes = resp.bytes.clone();
+                let resp_ct = resp.content_type.clone();
+                let resp_final_url = resp.final_url.clone();
+                let resp_status = resp.status;
+
+                let bytes2 = resp_bytes.clone();
+                let ct2 = resp_ct.clone();
+                let fu2 = resp_final_url.clone();
+                let query0 = if query.trim().is_empty() {
+                    None
+                } else {
+                    Some(query.clone())
+                };
+                let pipeline = match tokio::task::spawn_blocking(move || {
+                    let cfg = webpipe_local::extract::ExtractPipelineCfg {
+                        query: query0.as_deref(),
+                        width,
+                        max_chars,
+                        top_chunks,
+                        max_chunk_chars,
+                        include_structure: false,
+                        max_outline_items: 0,
+                        max_blocks: 0,
+                        max_block_chars: 0,
+                    };
+                    webpipe_local::extract::extract_pipeline_from_bytes(
+                        bytes2.as_ref(),
+                        ct2.as_deref(),
+                        fu2.as_str(),
+                        cfg,
+                    )
+                })
+                .await
+                {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let cfg = webpipe_local::extract::ExtractPipelineCfg {
+                            query: None,
+                            width,
+                            max_chars,
+                            top_chunks,
+                            max_chunk_chars,
+                            include_structure: false,
+                            max_outline_items: 0,
+                            max_blocks: 0,
+                            max_block_chars: 0,
+                        };
+                        webpipe_local::extract::extract_pipeline_from_bytes(&[], None, "", cfg)
+                    }
+                };
+
+                let extracted = pipeline.extracted;
+                let mut warnings: Vec<&'static str> = Vec::new();
+                if resp.truncated {
+                    warnings.push("body_truncated_by_max_bytes");
+                }
+                if arxiv_rewrote {
+                    warnings.push("arxiv_abs_rewritten_to_pdf");
+                }
+                if gh_issue_rewrote {
+                    warnings.push("github_issue_rewritten_to_api");
+                }
+                if gh_release_rewrote {
+                    warnings.push("github_release_rewritten_to_api");
+                }
+                if github_patch_rewrote {
+                    if let Some(w) = gh_patch_warn {
+                        warnings.push(w);
+                    }
+                }
+                if github_blob_rewrote {
+                    warnings.push("github_blob_rewritten_to_raw");
+                }
+                if gist_rewrote {
+                    warnings.push("gist_rewritten_to_raw");
+                }
+                if github_repo_rewrote {
+                    warnings.push("github_repo_rewritten_to_raw_readme");
+                }
+                for w in &extracted.warnings {
+                    warnings.push(*w);
+                }
+                if no_network {
+                    warnings.push("cache_only");
+                }
+
+                // Optional: extract link candidates for frontier expansion (HTML only).
+                let mut link_cands: Vec<webpipe_local::links::LinkCandidate> = Vec::new();
+                let is_html = webpipe_local::extract::bytes_look_like_html(resp_bytes.as_ref())
+                    || resp_ct
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .starts_with("text/html");
+                if is_html && max_links_per_page > 0 {
+                    let html = String::from_utf8_lossy(resp_bytes.as_ref()).to_string();
+                    link_cands = webpipe_local::links::extract_link_candidates(
+                        &html,
+                        Some(resp_final_url.as_str()),
+                        max_links_per_page,
+                    );
+                }
+
+                // Expand frontier.
+                if item.depth < max_depth {
+                    for lc in link_cands.iter().take(max_links_per_page) {
+                        if frontier.len() >= 500 {
+                            break;
+                        }
+                        if same_host_only {
+                            if let Ok(u) = reqwest::Url::parse(&lc.url) {
+                                if u.host_str().unwrap_or("") != base_host {
+                                    continue;
+                                }
+                            }
+                        }
+                        let s = score_for_query(&q_toks, &lc.url, &lc.text);
+                        frontier.push(FrontierItem {
+                            depth: item.depth + 1,
+                            url: lc.url.clone(),
+                            score: s,
+                            ord,
+                        });
+                        ord = ord.saturating_add(1);
+                    }
+                }
+
+                // Merge chunks (annotate with page URL).
+                for c in pipeline.chunks.clone().into_iter() {
+                    let mut v = serde_json::to_value(&c).unwrap_or_else(|_| serde_json::json!({}));
+                    v["page_url"] = serde_json::json!(&item.url);
+                    v["depth"] = serde_json::json!(item.depth);
+                    merged_chunks.push(v);
+                }
+
+                let mut one = serde_json::json!({
+                    "ok": true,
+                    "url": item.url,
+                    "fetched_url": resp.url,
+                    "final_url": resp.final_url,
+                    "status": resp_status,
+                    "content_type": resp_ct,
+                    "bytes": resp_bytes.len(),
+                    "truncated": resp.truncated,
+                    "extract": {
+                        "engine": extracted.engine,
+                        "width": width,
+                        "max_chars": max_chars,
+                        "top_chunks": top_chunks,
+                        "max_chunk_chars": max_chunk_chars,
+                        "chunks": pipeline.chunks
+                    },
+                    "elapsed_ms": per_t0.elapsed().as_millis()
+                });
+                if include_links {
+                    one["links"] = serde_json::json!(link_cands
+                        .iter()
+                        .map(|c| c.url.clone())
+                        .collect::<Vec<_>>());
+                }
+                if !warnings.is_empty() {
+                    one["warnings"] = serde_json::json!(warnings);
+                    let codes = warning_codes_from(&warnings);
+                    one["warning_codes"] = serde_json::json!(codes.clone());
+                    one["warning_hints"] = warning_hints_from(&codes);
+                }
+                one["attempts"] = if attempts_map.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::Object(attempts_map)
+                };
+                pages_out.push(one);
+            }
+
+            // Sort merged chunks by score desc (stable-ish by insertion order).
+            merged_chunks.sort_by(|a, b| {
+                let ascore = a.get("score").and_then(|x| x.as_u64()).unwrap_or(0);
+                let bscore = b.get("score").and_then(|x| x.as_u64()).unwrap_or(0);
+                bscore.cmp(&ascore)
+            });
+            let merged_top = merged_chunks
+                .into_iter()
+                .take((max_pages * top_chunks).min(50))
+                .collect::<Vec<_>>();
+
+            let mut payload = serde_json::json!({
+                "ok": true,
+                "start_url": start_url,
+                "query": if query.trim().is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+                "request": {
+                    "max_pages": max_pages,
+                    "max_depth": max_depth,
+                    "same_host_only": same_host_only,
+                    "max_links_per_page": max_links_per_page,
+                    "timeout_ms": timeout_ms,
+                    "max_bytes": max_bytes,
+                    "width": width,
+                    "max_chars": max_chars,
+                    "top_chunks": top_chunks,
+                    "max_chunk_chars": max_chunk_chars,
+                    "no_network": no_network,
+                    "cache_read": cache_read,
+                    "cache_write": cache_write,
+                    "cache_ttl_s": cache_ttl_s,
+                    "include_links": include_links
+                },
+                "pages": pages_out,
+                "top_chunks": merged_top,
+                "timings_ms": { "total": t0.elapsed().as_millis() }
+            });
+            add_envelope_fields(
+                &mut payload,
+                "web_explore_extract",
+                t0.elapsed().as_millis(),
+            );
+            Ok(tool_result(payload))
+        }
+
+        #[tool(
+            description = "Repo ingest (gitingest-like): list a GitHub repo tree and fetch a bounded set of files as a combined text corpus (bounded; cache-aware; JSON output)",
+            annotations(title = "Repo ingest", read_only_hint = true, open_world_hint = true)
+        )]
+        async fn repo_ingest(
+            &self,
+            params: Parameters<Option<RepoIngestArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            let args = params.0.unwrap_or_default();
+            self.stats_inc_tool("repo_ingest");
+            let t0 = std::time::Instant::now();
+
+            let repo_url = args.repo_url.trim().to_string();
+            if repo_url.is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(ErrorCode::InvalidParams, "repo_url must be non-empty", "Pass a repo URL like https://github.com/owner/repo.")
+                });
+                add_envelope_fields(&mut payload, "repo_ingest", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
+            let u = match reqwest::Url::parse(&repo_url) {
+                Ok(u) => u,
+                Err(_) => {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": error_obj(ErrorCode::InvalidUrl, "invalid repo_url", "Pass a valid absolute URL (including scheme).")
+                    });
+                    add_envelope_fields(&mut payload, "repo_ingest", t0.elapsed().as_millis());
+                    return Ok(tool_result(payload));
+                }
+            };
+            let scheme = u.scheme().to_string();
+            let parts: Vec<&str> = u.path().trim_matches('/').split('/').collect();
+            if parts.len() < 2 {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(ErrorCode::InvalidParams, "repo_url path must be /<owner>/<repo>", "Pass a GitHub-style repo URL.")
+                });
+                add_envelope_fields(&mut payload, "repo_ingest", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
+            let owner = parts[0].trim().to_string();
+            let repo = parts[1].trim().trim_end_matches(".git").to_string();
+            if owner.is_empty() || repo.is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(ErrorCode::InvalidParams, "repo_url missing owner/repo", "Pass a GitHub-style repo URL like https://github.com/owner/repo.")
+                });
+                add_envelope_fields(&mut payload, "repo_ingest", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
+
+            let max_files = args.max_files.unwrap_or(100).clamp(1, 500);
+            let max_total_bytes = args.max_total_bytes.unwrap_or(1_000_000).min(10_000_000);
+            let max_file_bytes = args.max_file_bytes.unwrap_or(200_000).min(1_000_000);
+            let timeout_ms = args.timeout_ms.unwrap_or(20_000).min(60_000);
+            let include_combined_text = args.include_combined_text.unwrap_or(true);
+            let no_network = args.no_network.unwrap_or(false);
+            let cache_read = args.cache_read.unwrap_or(true);
+            let cache_write = args.cache_write.unwrap_or(true);
+            let cache_ttl_s = args.cache_ttl_s;
+            let include_patterns: Vec<String> = args
+                .include_patterns
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let exclude_patterns: Vec<String> = args
+                .exclude_patterns
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let api_base = std::env::var("WEBPIPE_GITHUB_API_BASE")
+                .ok()
+                .unwrap_or_else(|| "https://api.github.com".to_string())
+                .trim()
+                .trim_end_matches('/')
+                .to_string();
+            let raw_host = std::env::var("WEBPIPE_GITHUB_RAW_HOST")
+                .ok()
+                .unwrap_or_else(|| "raw.githubusercontent.com".to_string())
+                .trim()
+                .to_string();
+            let github_token = Self::github_token_from_env();
+
+            if no_network {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(
+                        ErrorCode::NotSupported,
+                        "repo_ingest requires network for repo listing",
+                        "repo_ingest needs the GitHub API to list files. Run once with no_network=false to warm cache, then you can re-fetch raw files with no_network=true."
+                    ),
+                    "request": {
+                        "repo_url": repo_url,
+                        "no_network": true
+                    }
+                });
+                add_envelope_fields(&mut payload, "repo_ingest", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
+
+            // Resolve reference (default_branch) via API, then fall back.
+            let mut reference = args.reference.clone().unwrap_or_default();
+            let mut api_attempts: Vec<serde_json::Value> = Vec::new();
+            if reference.trim().is_empty() {
+                let url = format!("{api_base}/repos/{owner}/{repo}");
+                let t1 = std::time::Instant::now();
+                let mut req = self.http.get(url.clone()).header("user-agent", "webpipe");
+                if let Some(tok) = github_token.as_ref() {
+                    req = req.header("authorization", format!("Bearer {tok}"));
+                }
+                let r = req
+                    .timeout(std::time::Duration::from_millis(timeout_ms))
+                    .send()
+                    .await;
+                match r {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let v = resp
+                            .json::<serde_json::Value>()
+                            .await
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        let br = v
+                            .get("default_branch")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        api_attempts.push(serde_json::json!({
+                            "endpoint": "repos",
+                            "url": url,
+                            "status": status,
+                            "auth": github_token.as_ref().is_some(),
+                            "elapsed_ms": t1.elapsed().as_millis()
+                        }));
+                        if !br.is_empty() {
+                            reference = br;
+                        }
+                    }
+                    Err(_) => {
+                        api_attempts.push(serde_json::json!({
+                            "endpoint": "repos",
+                            "url": url,
+                            "error": "request_failed",
+                            "auth": github_token.as_ref().is_some(),
+                            "elapsed_ms": t1.elapsed().as_millis()
+                        }));
+                    }
+                }
+            }
+            if reference.trim().is_empty() {
+                reference = "main".to_string();
+            }
+
+            // List tree via API.
+            let tree_url =
+                format!("{api_base}/repos/{owner}/{repo}/git/trees/{reference}?recursive=1");
+            let t2 = std::time::Instant::now();
+            let mut tree_req = self
+                .http
+                .get(tree_url.clone())
+                .header("user-agent", "webpipe");
+            if let Some(tok) = github_token.as_ref() {
+                tree_req = tree_req.header("authorization", format!("Bearer {tok}"));
+            }
+            let tree_resp = tree_req
+                .timeout(std::time::Duration::from_millis(timeout_ms))
+                .send()
+                .await;
+            let tree_v = match tree_resp {
+                Ok(resp) => {
+                    api_attempts.push(serde_json::json!({
+                        "endpoint": "trees",
+                        "url": tree_url,
+                        "status": resp.status().as_u16(),
+                        "auth": github_token.as_ref().is_some(),
+                        "elapsed_ms": t2.elapsed().as_millis()
+                    }));
+                    resp.json::<serde_json::Value>()
+                        .await
+                        .unwrap_or_else(|_| serde_json::json!({}))
+                }
+                Err(_) => {
+                    api_attempts.push(serde_json::json!({
+                        "endpoint": "trees",
+                        "url": tree_url,
+                        "error": "request_failed",
+                        "auth": github_token.as_ref().is_some(),
+                        "elapsed_ms": t2.elapsed().as_millis()
+                    }));
+                    serde_json::json!({})
+                }
+            };
+            let tree = tree_v
+                .get("tree")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            fn glob_match_simple(pat: &str, text: &str) -> bool {
+                // Simple glob: `*` matches any sequence, `?` matches one char.
+                // Bounded DP, char-based (safe for Unicode).
+                let p: Vec<char> = pat.chars().collect();
+                let t: Vec<char> = text.chars().collect();
+                let mut dp = vec![vec![false; t.len() + 1]; p.len() + 1];
+                dp[0][0] = true;
+                for i in 1..=p.len() {
+                    if p[i - 1] == '*' {
+                        dp[i][0] = dp[i - 1][0];
+                    }
+                }
+                for i in 1..=p.len() {
+                    for j in 1..=t.len() {
+                        dp[i][j] = match p[i - 1] {
+                            '*' => dp[i - 1][j] || dp[i][j - 1],
+                            '?' => dp[i - 1][j - 1],
+                            c => dp[i - 1][j - 1] && c == t[j - 1],
+                        };
+                    }
+                }
+                dp[p.len()][t.len()]
+            }
+
+            fn include_path(
+                path: &str,
+                include_patterns: &[String],
+                exclude_patterns: &[String],
+            ) -> bool {
+                let p = path.trim();
+                if p.is_empty() {
+                    return false;
+                }
+                let pl = p.to_ascii_lowercase();
+                for bad in [
+                    "/.git/",
+                    "node_modules/",
+                    "target/",
+                    "dist/",
+                    "build/",
+                    "vendor/",
+                    ".min.",
+                ] {
+                    if pl.contains(bad) {
+                        return false;
+                    }
+                }
+                let mut base = false;
+                if pl.starts_with("readme") || pl == "readme.md" {
+                    base = true;
+                }
+                if pl.starts_with("docs/") || pl.starts_with("doc/") {
+                    base = true;
+                }
+                if pl.starts_with("src/") || pl.starts_with("crates/") {
+                    base = true;
+                }
+                let exts = [
+                    ".md", ".rst", ".txt", ".rs", ".py", ".js", ".ts", ".tsx", ".go", ".java",
+                    ".kt", ".c", ".h", ".cpp", ".hpp", ".toml", ".yaml", ".yml", ".json",
+                ];
+                base = base || exts.iter().any(|e| pl.ends_with(e));
+
+                let mut ok = base;
+                if !include_patterns.is_empty() {
+                    ok = include_patterns.iter().any(|pat| glob_match_simple(pat, p));
+                }
+                if !ok {
+                    return false;
+                }
+                if !exclude_patterns.is_empty() {
+                    if exclude_patterns.iter().any(|pat| glob_match_simple(pat, p)) {
+                        return false;
+                    }
+                }
+                true
+            }
+
+            let mut paths: Vec<String> = Vec::new();
+            for node in tree {
+                let typ = node.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                if typ != "blob" {
+                    continue;
+                }
+                let path = node
+                    .get("path")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if include_path(&path, &include_patterns, &exclude_patterns) {
+                    paths.push(path);
+                }
+            }
+            paths.sort();
+            paths.dedup();
+            paths.truncate(max_files);
+
+            let mut files_out: Vec<serde_json::Value> = Vec::new();
+            let mut total_fetched: u64 = 0;
+            let mut combined = String::new();
+            let mut files_text = String::new();
+            let mut warnings: Vec<&'static str> = Vec::new();
+
+            // Pre-compute a simple directory tree for the selected paths (for gitingest-like output).
+            #[derive(Default)]
+            struct DirNode {
+                dirs: BTreeMap<String, DirNode>,
+                files: Vec<String>,
+            }
+            fn insert_path(root: &mut DirNode, path: &str) {
+                let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                if parts.is_empty() {
+                    return;
+                }
+                let mut cur = root;
+                for (i, part) in parts.iter().enumerate() {
+                    if i + 1 == parts.len() {
+                        cur.files.push((*part).to_string());
+                    } else {
+                        cur = cur.dirs.entry((*part).to_string()).or_default();
+                    }
+                }
+            }
+            fn render_tree(
+                out: &mut String,
+                node: &DirNode,
+                prefix: &str,
+                is_last: bool,
+                name: &str,
+            ) {
+                let branch = if prefix.is_empty() {
+                    "└── "
+                } else if is_last {
+                    "└── "
+                } else {
+                    "├── "
+                };
+                out.push_str(prefix);
+                out.push_str(branch);
+                out.push_str(name);
+                out.push('\n');
+
+                let child_prefix = if prefix.is_empty() {
+                    "    ".to_string()
+                } else if is_last {
+                    format!("{prefix}    ")
+                } else {
+                    format!("{prefix}│   ")
+                };
+
+                let mut dirs: Vec<(&String, &DirNode)> = node.dirs.iter().collect();
+                dirs.sort_by(|a, b| a.0.cmp(b.0));
+                let mut files = node.files.clone();
+                files.sort();
+                files.dedup();
+
+                let total = dirs.len() + files.len();
+                let mut idx = 0usize;
+                for (dname, dnode) in dirs {
+                    idx += 1;
+                    let last = idx == total;
+                    render_tree(out, dnode, &child_prefix, last, dname);
+                }
+                for fname in files {
+                    idx += 1;
+                    let last = idx == total;
+                    let branch2 = if last { "└── " } else { "├── " };
+                    out.push_str(&child_prefix);
+                    out.push_str(branch2);
+                    out.push_str(&fname);
+                    out.push('\n');
+                }
+            }
+
+            let mut tree_root = DirNode::default();
+            for p in &paths {
+                insert_path(&mut tree_root, p);
+            }
+            let root_name = format!("{owner}-{repo}/");
+            let mut tree_text = String::new();
+            tree_text.push_str("Directory structure:\n");
+            render_tree(&mut tree_text, &tree_root, "", true, &root_name);
+
+            let mut files_analyzed: u64 = 0;
+            for path in paths {
+                if total_fetched >= max_total_bytes {
+                    warnings.push("repo_ingest_total_bytes_capped");
+                    break;
+                }
+                let t = std::time::Instant::now();
+                let mut attempts: Vec<serde_json::Value> = Vec::new();
+                let mut best_url: Option<String> = None;
+
+                // Attempt 1: raw host (fast path for public repos).
+                let raw_url = format!("{scheme}://{raw_host}/{owner}/{repo}/{reference}/{path}");
+                let raw_req = FetchRequest {
+                    url: raw_url.clone(),
+                    timeout_ms: Some(timeout_ms),
+                    max_bytes: Some(max_file_bytes),
+                    headers: BTreeMap::new(),
+                    cache: FetchCachePolicy {
+                        read: cache_read,
+                        write: cache_write,
+                        ttl_s: cache_ttl_s,
+                    },
+                };
+                let mut best: Option<webpipe_core::FetchResponse> = None;
+                match self.fetcher.fetch(&raw_req).await {
+                    Ok(r) => {
+                        attempts.push(serde_json::json!({
+                            "kind": "raw_host",
+                            "url": raw_url,
+                            "status": r.status,
+                            "bytes": r.bytes.len()
+                        }));
+                        // Only accept as "best" when it looks like a real success.
+                        if r.status >= 200 && r.status < 300 && !r.bytes.is_empty() {
+                            best = Some(r);
+                            best_url = Some(raw_req.url.clone());
+                        }
+                    }
+                    Err(_) => {
+                        attempts.push(serde_json::json!({
+                            "kind": "raw_host",
+                            "url": raw_url,
+                            "error": "request_failed"
+                        }));
+                    }
+                }
+
+                // Attempt 2 (bounded fallback): GitHub contents API raw media type.
+                if best.is_none() && github_token.is_some() {
+                    let mut base_u =
+                        reqwest::Url::parse(&format!("{api_base}/repos/{owner}/{repo}/contents"))
+                            .map_err(|_| {
+                            McpError::internal_error("invalid WEBPIPE_GITHUB_API_BASE", None)
+                        })?;
+                    {
+                        let mut segs = base_u.path_segments_mut().expect("path_segments");
+                        for seg in path.split('/') {
+                            if !seg.is_empty() {
+                                segs.push(seg);
+                            }
+                        }
+                    }
+                    base_u.query_pairs_mut().append_pair("ref", &reference);
+                    let contents_url = base_u.to_string();
+
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "accept".to_string(),
+                        "application/vnd.github.raw+json".to_string(),
+                    );
+                    headers.insert("user-agent".to_string(), "webpipe".to_string());
+                    if let Some(tok) = github_token.as_ref() {
+                        headers.insert("authorization".to_string(), format!("Bearer {tok}"));
+                    }
+
+                    let api_req = FetchRequest {
+                        url: contents_url.clone(),
+                        timeout_ms: Some(timeout_ms),
+                        max_bytes: Some(max_file_bytes),
+                        headers,
+                        cache: FetchCachePolicy {
+                            read: cache_read,
+                            write: cache_write,
+                            ttl_s: cache_ttl_s,
+                        },
+                    };
+                    match self.fetcher.fetch(&api_req).await {
+                        Ok(r) => {
+                            attempts.push(serde_json::json!({
+                                "kind": "api_contents_raw",
+                                "url": contents_url,
+                                "status": r.status,
+                                "bytes": r.bytes.len()
+                            }));
+                            if r.status >= 200 && r.status < 300 && !r.bytes.is_empty() {
+                                best = Some(r);
+                                best_url = Some(api_req.url.clone());
+                            }
+                        }
+                        Err(_) => {
+                            attempts.push(serde_json::json!({
+                                "kind": "api_contents_raw",
+                                "url": contents_url,
+                                "error": "request_failed"
+                            }));
+                        }
+                    }
+                }
+
+                let Some(r) = best else {
+                    warnings.push("repo_ingest_fetch_failed");
+                    files_out.push(serde_json::json!({
+                        "path": path,
+                        "url": best_url.unwrap_or_else(|| raw_req.url.clone()),
+                        "ok": false,
+                        "attempts": attempts,
+                        "error": "fetch_failed",
+                        "elapsed_ms": t.elapsed().as_millis()
+                    }));
+                    continue;
+                };
+
+                let bytes = r.bytes;
+                let mut is_binary = bytes.iter().any(|b| *b == 0);
+                // Heuristic: huge non-text blobs should be treated as binary even without NUL.
+                if bytes.len() > 500_000 {
+                    is_binary = true;
+                }
+                let truncated = r.truncated;
+                total_fetched = total_fetched.saturating_add(bytes.len() as u64);
+                let text = if is_binary {
+                    warnings.push("repo_ingest_skipped_binary");
+                    String::new()
+                } else {
+                    String::from_utf8_lossy(bytes.as_ref()).to_string()
+                };
+                let (excerpt, _n, clipped) = Self::truncate_to_chars(&text, 10_000);
+                files_out.push(serde_json::json!({
+                    "path": path,
+                    "url": best_url.unwrap_or_else(|| raw_req.url.clone()),
+                    "status": r.status,
+                    "content_type": r.content_type,
+                    "bytes": bytes.len(),
+                    "truncated": truncated,
+                    "binary": is_binary,
+                    "excerpt_chars": excerpt.chars().count(),
+                    "excerpt_truncated": clipped,
+                    "attempts": attempts,
+                    "elapsed_ms": t.elapsed().as_millis()
+                }));
+                if include_combined_text && !is_binary {
+                    files_analyzed = files_analyzed.saturating_add(1);
+                    // Gitingest-like delimiter.
+                    let delim = "================================================";
+                    files_text.push_str(delim);
+                    files_text.push('\n');
+                    files_text.push_str("FILE: ");
+                    files_text.push_str(&path);
+                    files_text.push('\n');
+                    files_text.push_str(delim);
+                    files_text.push('\n');
+                    files_text.push_str(&text);
+                    files_text.push_str("\n\n");
+                }
+            }
+
+            // Bound combined output.
+            let mut combined_out = serde_json::Value::Null;
+            if include_combined_text {
+                let summary_text =
+                    format!("Repository: {owner}/{repo}\nFiles analyzed: {files_analyzed}\n");
+                combined.clear();
+                combined.push_str(&summary_text);
+                combined.push('\n');
+                combined.push_str(&tree_text);
+                combined.push('\n');
+                combined.push_str(&files_text);
+
+                let (t, _n, clipped) = Self::truncate_to_chars(&combined, 200_000);
+                let approx_tokens = (t.chars().count() as f64 / 4.0).ceil() as u64;
+                combined_out = serde_json::json!(t);
+                if clipped {
+                    warnings.push("repo_ingest_combined_text_truncated");
+                }
+
+                // Additive: expose gitingest-style components.
+                // Keep these bounded too.
+                let (sum2, _n2, _) = Self::truncate_to_chars(&summary_text, 5_000);
+                let (tree2, _n3, _) = Self::truncate_to_chars(&tree_text, 50_000);
+                let (files2, _n4, files_clipped) = Self::truncate_to_chars(&files_text, 200_000);
+                if files_clipped {
+                    warnings.push("repo_ingest_files_text_truncated");
+                }
+                // We attach these after payload creation below.
+                // (see payload building)
+                // Store in locals for insertion.
+                let summary_text_bounded = sum2;
+                let tree_text_bounded = tree2;
+                let files_text_bounded = files2;
+
+                // Create payload below and insert these fields there.
+                // We'll temporarily stash these in warnings via payload locals.
+                // (Rust: we can't move after borrowing `warnings`, so compute here.)
+                let mut payload = serde_json::json!({
+                    "ok": true,
+                    "repo": { "owner": owner, "name": repo },
+                    "repo_url": repo_url,
+                    "reference": reference,
+                    "request": {
+                        "max_files": max_files,
+                        "max_total_bytes": max_total_bytes,
+                        "max_file_bytes": max_file_bytes,
+                        "timeout_ms": timeout_ms,
+                        "include_combined_text": include_combined_text,
+                        "include_patterns": include_patterns,
+                        "exclude_patterns": exclude_patterns,
+                        "github_token_configured": github_token.as_ref().is_some(),
+                        "cache": { "read": cache_read, "write": cache_write, "ttl_s": cache_ttl_s },
+                        "api_base": api_base,
+                        "raw_host": raw_host
+                    },
+                    "api_attempts": api_attempts,
+                    "files": files_out,
+                    "total_bytes_fetched": total_fetched,
+                    "combined_text": combined_out,
+                    "summary_text": summary_text_bounded,
+                    "tree_text": tree_text_bounded,
+                    "files_text": files_text_bounded,
+                    "estimated_tokens": approx_tokens,
+                    "timings_ms": { "total": t0.elapsed().as_millis() }
+                });
+                if !warnings.is_empty() {
+                    warnings.sort();
+                    warnings.dedup();
+                    payload["warnings"] = serde_json::json!(warnings);
+                    let codes = warning_codes_from(&warnings);
+                    payload["warning_codes"] = serde_json::json!(codes.clone());
+                    payload["warning_hints"] = warning_hints_from(&codes);
+                }
+                add_envelope_fields(&mut payload, "repo_ingest", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
+
+            let mut payload = serde_json::json!({
+                "ok": true,
+                "repo": { "owner": owner, "name": repo },
+                "repo_url": repo_url,
+                "reference": reference,
+                "request": {
+                    "max_files": max_files,
+                    "max_total_bytes": max_total_bytes,
+                    "max_file_bytes": max_file_bytes,
+                    "timeout_ms": timeout_ms,
+                    "include_combined_text": include_combined_text,
+                    "include_patterns": include_patterns,
+                    "exclude_patterns": exclude_patterns,
+                    "github_token_configured": github_token.as_ref().is_some(),
+                    "cache": { "read": cache_read, "write": cache_write, "ttl_s": cache_ttl_s },
+                    "api_base": api_base,
+                    "raw_host": raw_host
+                },
+                "api_attempts": api_attempts,
+                "files": files_out,
+                "total_bytes_fetched": total_fetched,
+                "combined_text": combined_out,
+                "timings_ms": { "total": t0.elapsed().as_millis() }
+            });
+            if !warnings.is_empty() {
+                warnings.sort();
+                warnings.dedup();
+                payload["warnings"] = serde_json::json!(warnings);
+                let codes = warning_codes_from(&warnings);
+                payload["warning_codes"] = serde_json::json!(codes.clone());
+                payload["warning_hints"] = warning_hints_from(&codes);
+            }
+            add_envelope_fields(&mut payload, "repo_ingest", t0.elapsed().as_millis());
+            Ok(tool_result(payload))
+        }
+
+        #[tool(
+            description = "Sitemap discovery: fetch robots.txt/sitemaps (bounded), extract URL list, and optionally extract+rank content for a query (bounded; cache-aware; JSON output)",
+            annotations(
+                title = "Sitemap+extract",
+                read_only_hint = true,
+                open_world_hint = true
+            )
+        )]
+        async fn web_sitemap_extract(
+            &self,
+            params: Parameters<Option<WebSitemapExtractArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            let args = params.0.unwrap_or_default();
+            self.stats_inc_tool("web_sitemap_extract");
+            let t0 = std::time::Instant::now();
+
+            let site_url = args.site_url.trim().to_string();
+            if site_url.is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(ErrorCode::InvalidParams, "site_url must be non-empty", "Pass a site root URL like https://docs.example.com/.")
+                });
+                add_envelope_fields(
+                    &mut payload,
+                    "web_sitemap_extract",
+                    t0.elapsed().as_millis(),
+                );
+                return Ok(tool_result(payload));
+            }
+            let base = match reqwest::Url::parse(&site_url) {
+                Ok(u) => u,
+                Err(_) => {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": error_obj(ErrorCode::InvalidUrl, "invalid site_url", "Pass a valid absolute URL (including scheme).")
+                    });
+                    add_envelope_fields(
+                        &mut payload,
+                        "web_sitemap_extract",
+                        t0.elapsed().as_millis(),
+                    );
+                    return Ok(tool_result(payload));
+                }
+            };
+            let restrict_prefix = args.restrict_prefix.unwrap_or(true);
+            let try_default_sitemap = args.try_default_sitemap.unwrap_or(true);
+            let max_sitemaps = args.max_sitemaps.unwrap_or(3).clamp(1, 10);
+            let max_urls = args.max_urls.unwrap_or(200).clamp(1, 2000);
+            let timeout_ms = args.timeout_ms.unwrap_or(20_000).min(60_000);
+            let max_bytes = args.max_bytes.unwrap_or(2_000_000).min(10_000_000);
+            let no_network = args.no_network.unwrap_or(false);
+            let cache_read = args.cache_read.unwrap_or(true);
+            let cache_write = args.cache_write.unwrap_or(true);
+            let cache_ttl_s = args.cache_ttl_s;
+
+            let query = args.query.unwrap_or_default();
+            let do_extract = args.extract.unwrap_or_else(|| !query.trim().is_empty());
+
+            fn parse_sitemaps_from_robots(txt: &str) -> Vec<String> {
+                let mut out = Vec::new();
+                for line in txt.lines() {
+                    let l = line.trim();
+                    if l.len() < 8 {
+                        continue;
+                    }
+                    let ll = l.to_ascii_lowercase();
+                    if ll.starts_with("sitemap:") {
+                        let rest = l.splitn(2, ':').nth(1).unwrap_or("").trim();
+                        if !rest.is_empty() {
+                            out.push(rest.to_string());
+                        }
+                    }
+                }
+                out
+            }
+
+            fn maybe_gunzip(bytes: &[u8]) -> Option<Vec<u8>> {
+                use std::io::Read as _;
+                let mut out = Vec::new();
+                let mut gz = flate2::read::GzDecoder::new(bytes);
+                gz.read_to_end(&mut out).ok()?;
+                Some(out)
+            }
+
+            fn parse_loc_urls(xml: &str, max: usize) -> Vec<String> {
+                // Minimal sitemap parser: find <loc>...</loc> tags.
+                // This avoids bringing in a heavy DOM parser and is deterministic.
+                let mut out = Vec::new();
+                let mut i = 0usize;
+                while out.len() < max {
+                    let Some(s) = xml[i..].find("<loc>") else {
+                        break;
+                    };
+                    let start = i + s + "<loc>".len();
+                    let Some(e) = xml[start..].find("</loc>") else {
+                        break;
+                    };
+                    let end = start + e;
+                    let u = xml[start..end].trim();
+                    if !u.is_empty() {
+                        out.push(u.to_string());
+                    }
+                    i = end + "</loc>".len();
+                }
+                out
+            }
+
+            fn looks_like_sitemap_index(xml: &str) -> bool {
+                let x = xml.to_ascii_lowercase();
+                x.contains("<sitemapindex") && x.contains("<sitemap")
+            }
+
+            let mut attempts: Vec<serde_json::Value> = Vec::new();
+            let mut sitemap_urls: Vec<String> = Vec::new();
+
+            // robots.txt (optional)
+            let robots_url = base.join("robots.txt").ok().map(|u| u.to_string());
+            if let Some(robots_url) = robots_url {
+                let req = FetchRequest {
+                    url: robots_url.clone(),
+                    timeout_ms: Some(timeout_ms),
+                    max_bytes: Some(max_bytes.min(500_000)),
+                    headers: BTreeMap::new(),
+                    cache: FetchCachePolicy {
+                        read: cache_read || no_network,
+                        write: if no_network { false } else { cache_write },
+                        ttl_s: cache_ttl_s,
+                    },
+                };
+                let t = std::time::Instant::now();
+                let fetched = if no_network {
+                    self.fetcher.cache_get(&req).ok().flatten()
+                } else {
+                    self.fetcher.fetch(&req).await.ok()
+                };
+                if let Some(r) = fetched {
+                    let txt = String::from_utf8_lossy(r.bytes.as_ref()).to_string();
+                    let mut s = parse_sitemaps_from_robots(&txt);
+                    sitemap_urls.append(&mut s);
+                    attempts.push(serde_json::json!({
+                        "kind": "robots",
+                        "url": robots_url,
+                        "ok": true,
+                        "status": r.status,
+                        "elapsed_ms": t.elapsed().as_millis()
+                    }));
+                } else {
+                    attempts.push(serde_json::json!({
+                        "kind": "robots",
+                        "url": robots_url,
+                        "ok": false,
+                        "elapsed_ms": t.elapsed().as_millis()
+                    }));
+                }
+            }
+
+            if try_default_sitemap {
+                // Common defaults:
+                // - relative to provided site_url (e.g. https://docs.example.com/sitemap.xml)
+                // - at origin root (e.g. https://docs.example.com/sitemap.xml when site_url is https://docs.example.com/docs/)
+                if let Some(host) = base.host_str() {
+                    let mut root = base.clone();
+                    root.set_path("/");
+                    root.set_query(None);
+                    root.set_fragment(None);
+                    if let Ok(u) = root.join("sitemap.xml") {
+                        sitemap_urls.push(u.to_string());
+                    } else {
+                        // Fall back: construct manually when join fails (should be rare).
+                        sitemap_urls.push(format!("{}://{host}/sitemap.xml", root.scheme()));
+                    }
+                }
+                if let Ok(u) = base.join("sitemap.xml") {
+                    sitemap_urls.push(u.to_string());
+                }
+            }
+            // Preserve insertion order (robots-derived first), but dedup deterministically.
+            let mut seen = std::collections::BTreeSet::<String>::new();
+            let mut s2: Vec<String> = Vec::new();
+            for u in sitemap_urls.into_iter() {
+                let k = u.trim().to_string();
+                if k.is_empty() {
+                    continue;
+                }
+                if seen.insert(k.clone()) {
+                    s2.push(k);
+                }
+            }
+            sitemap_urls = s2;
+            sitemap_urls.truncate(max_sitemaps);
+
+            let mut discovered: Vec<String> = Vec::new();
+            // BFS over sitemap URLs (handles sitemapindex indirection).
+            let mut queue: std::collections::VecDeque<String> =
+                sitemap_urls.iter().cloned().collect();
+            let mut seen_sitemaps = std::collections::BTreeSet::<String>::new();
+            let mut fetched_sitemaps = 0usize;
+            while let Some(su) = queue.pop_front() {
+                if fetched_sitemaps >= max_sitemaps {
+                    break;
+                }
+                let su0 = su.trim().to_string();
+                if su0.is_empty() || !seen_sitemaps.insert(su0.clone()) {
+                    continue;
+                }
+                let req = FetchRequest {
+                    url: su0.clone(),
+                    timeout_ms: Some(timeout_ms),
+                    max_bytes: Some(max_bytes),
+                    headers: BTreeMap::new(),
+                    cache: FetchCachePolicy {
+                        read: cache_read || no_network,
+                        write: if no_network { false } else { cache_write },
+                        ttl_s: cache_ttl_s,
+                    },
+                };
+                let t = std::time::Instant::now();
+                let fetched = if no_network {
+                    self.fetcher.cache_get(&req).ok().flatten()
+                } else {
+                    self.fetcher.fetch(&req).await.ok()
+                };
+                if let Some(r) = fetched {
+                    let mut bytes = r.bytes.clone();
+                    let ct = r.content_type.as_deref().unwrap_or("").to_ascii_lowercase();
+                    let is_gz = su0.to_ascii_lowercase().ends_with(".gz")
+                        || ct.contains("gzip")
+                        || ct.contains("application/x-gzip");
+                    if is_gz {
+                        if let Some(b) = maybe_gunzip(&bytes) {
+                            bytes = b;
+                        }
+                    }
+                    let xml = String::from_utf8_lossy(bytes.as_ref()).to_string();
+                    if looks_like_sitemap_index(&xml) {
+                        // Extract sitemap URLs from <loc> and enqueue them.
+                        for u in parse_loc_urls(&xml, 2000) {
+                            queue.push_back(u);
+                        }
+                    } else {
+                        let mut locs = parse_loc_urls(&xml, max_urls.saturating_mul(2).min(20_000));
+                        discovered.append(&mut locs);
+                    }
+                    attempts.push(serde_json::json!({
+                        "kind": "sitemap",
+                        "url": su0,
+                        "ok": true,
+                        "status": r.status,
+                        "elapsed_ms": t.elapsed().as_millis()
+                    }));
+                    fetched_sitemaps += 1;
+                } else {
+                    attempts.push(serde_json::json!({
+                        "kind": "sitemap",
+                        "url": su0,
+                        "ok": false,
+                        "elapsed_ms": t.elapsed().as_millis()
+                    }));
+                    fetched_sitemaps += 1;
+                }
+                if discovered.len() >= max_urls {
+                    break;
+                }
+            }
+
+            // Normalize + restrict
+            let prefix = if restrict_prefix {
+                site_url.clone()
+            } else {
+                String::new()
+            };
+            let mut urls: Vec<String> = Vec::new();
+            for u in discovered {
+                if urls.len() >= max_urls {
+                    break;
+                }
+                let uu = u.trim();
+                if uu.is_empty() {
+                    continue;
+                }
+                if restrict_prefix && !uu.starts_with(prefix.as_str()) {
+                    continue;
+                }
+                urls.push(uu.to_string());
+            }
+            urls.sort();
+            urls.dedup();
+            urls.truncate(max_urls);
+
+            let mut payload = serde_json::json!({
+                "ok": true,
+                "site_url": site_url,
+                "request": {
+                    "max_sitemaps": max_sitemaps,
+                    "max_urls": max_urls,
+                    "restrict_prefix": restrict_prefix,
+                    "try_default_sitemap": try_default_sitemap,
+                    "timeout_ms": timeout_ms,
+                    "max_bytes": max_bytes,
+                    "no_network": no_network,
+                    "cache": { "read": cache_read, "write": cache_write, "ttl_s": cache_ttl_s },
+                    "extract": do_extract
+                },
+                "attempts": attempts,
+                "sitemaps": sitemap_urls,
+                "urls": urls
+            });
+
+            if do_extract && !urls.is_empty() {
+                let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
+                let max_results = args.max_results.unwrap_or(0);
+                let width = args.width.unwrap_or(100);
+                let max_chars = args.max_chars.unwrap_or(20_000);
+                let top_chunks = args.top_chunks.unwrap_or(5);
+                let max_chunk_chars = args.max_chunk_chars.unwrap_or(500);
+
+                let r = self
+                    .web_search_extract(p(WebSearchExtractArgs {
+                        query: if query.trim().is_empty() {
+                            None
+                        } else {
+                            Some(query.clone())
+                        },
+                        urls: Some(urls.clone()),
+                        url_selection_mode: Some("query_rank".to_string()),
+                        provider: Some("auto".to_string()),
+                        auto_mode: Some("fallback".to_string()),
+                        selection_mode: Some("pareto".to_string()),
+                        fetch_backend: Some(fetch_backend),
+                        no_network: Some(no_network),
+                        firecrawl_fallback_on_empty_extraction: Some(false),
+                        firecrawl_fallback_on_low_signal: Some(false),
+                        max_results: if max_results == 0 {
+                            None
+                        } else {
+                            Some(max_results)
+                        },
+                        max_urls: Some(10),
+                        timeout_ms: Some(timeout_ms),
+                        max_bytes: Some(max_bytes.min(5_000_000)),
+                        retry_on_truncation: Some(false),
+                        truncation_retry_max_bytes: None,
+                        width: Some(width),
+                        max_chars: Some(max_chars),
+                        top_chunks: Some(top_chunks),
+                        max_chunk_chars: Some(max_chunk_chars),
+                        include_links: Some(false),
+                        include_structure: Some(false),
+                        max_outline_items: None,
+                        max_blocks: None,
+                        max_block_chars: None,
+                        semantic_rerank: Some(false),
+                        semantic_top_k: None,
+                        max_links: None,
+                        include_text: Some(false),
+                        cache_read: Some(cache_read),
+                        cache_write: Some(cache_write),
+                        cache_ttl_s,
+                        exploration: Some("wide".to_string()),
+                        agentic: Some(false),
+                        agentic_selector: None,
+                        agentic_max_search_rounds: None,
+                        agentic_frontier_max: None,
+                        planner_max_calls: Some(0),
+                        compact: Some(true),
+                    }))
+                    .await?;
+                payload["extract"] = payload_from_result(&r);
+            }
+
+            add_envelope_fields(
+                &mut payload,
+                "web_sitemap_extract",
+                t0.elapsed().as_millis(),
+            );
+            Ok(tool_result(payload))
+        }
+
+        #[tool(
             description = "Search (or use urls) → fetch → extract → rank chunks (bounded; cache-aware; Markdown + structured JSON output)",
             annotations(
                 title = "Search+extract",
@@ -7221,7 +9310,9 @@ mod mcp {
             let include_links = args.include_links.unwrap_or(false);
             let max_links = args.max_links.unwrap_or(25).min(500);
             let include_text = args.include_text.unwrap_or(false);
-            let include_structure = args.include_structure.unwrap_or(false);
+            // Default to structure output: it improves chunk selection and debuggability,
+            // and it is bounded by max_outline_items/max_blocks/max_block_chars.
+            let include_structure = args.include_structure.unwrap_or(true);
             let max_outline_items = args.max_outline_items.unwrap_or(25).min(200);
             let max_blocks = args.max_blocks.unwrap_or(40).min(200);
             let max_block_chars = args.max_block_chars.unwrap_or(400).min(2000);
@@ -7241,23 +9332,31 @@ mod mcp {
 
             let requested_provider = args.provider.unwrap_or_else(|| "auto".to_string());
             let requested_auto_mode = args.auto_mode.unwrap_or_else(|| "fallback".to_string());
-            let selection_mode = args.selection_mode.unwrap_or_else(|| "score".to_string());
+            // Prefer Pareto by default: tends to produce cleaner evidence packs.
+            let selection_mode = args.selection_mode.unwrap_or_else(|| "pareto".to_string());
             let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
             let no_network = args.no_network.unwrap_or(false);
             let cache_read_effective = cache_read || no_network;
             let cache_write_effective = if no_network { false } else { cache_write };
+            // Prefer auto_plus by default when we have a query: bounded hint prepass to avoid portals.
             let url_selection_mode = args
                 .url_selection_mode
-                .unwrap_or_else(|| "auto".to_string());
+                .unwrap_or_else(|| "auto_plus".to_string());
             let firecrawl_fallback_on_empty_extraction = if no_network {
                 false
             } else {
-                args.firecrawl_fallback_on_empty_extraction.unwrap_or(false)
+                let configured =
+                    has_env("WEBPIPE_FIRECRAWL_API_KEY") || has_env("FIRECRAWL_API_KEY");
+                args.firecrawl_fallback_on_empty_extraction
+                    .unwrap_or(configured && fetch_backend == "local")
             };
             let firecrawl_fallback_on_low_signal = if no_network {
                 false
             } else {
-                args.firecrawl_fallback_on_low_signal.unwrap_or(false)
+                let configured =
+                    has_env("WEBPIPE_FIRECRAWL_API_KEY") || has_env("FIRECRAWL_API_KEY");
+                args.firecrawl_fallback_on_low_signal
+                    .unwrap_or(configured && fetch_backend == "local")
             };
 
             // Width vs depth preset: only fills in defaults when those fields were not explicitly set.
@@ -8301,13 +10400,20 @@ Rules:
                     let r = match fc.fetch_markdown(url, timeout_ms, max_age_ms).await {
                         Ok(r) => r,
                         Err(e) => {
+                            let msg = e.to_string();
+                            self.stats_record_fetch_backend(
+                                "firecrawl",
+                                false,
+                                per_t0.elapsed().as_millis() as u64,
+                                Some(msg.as_str()),
+                            );
                             firecrawl_disabled = true;
                             per_url.push(serde_json::json!({
                                     "url": url,
                                     "ok": false,
                                     "stage": "fetch",
                                     "fetch_backend": "firecrawl",
-                                    "error": error_obj(ErrorCode::FetchFailed, e.to_string(), "Firecrawl fetch failed for this URL."),
+                                    "error": error_obj(ErrorCode::FetchFailed, msg, "Firecrawl fetch failed for this URL."),
                                     "elapsed_ms": per_t0.elapsed().as_millis()
                                 }));
                             continue;
@@ -8324,6 +10430,12 @@ Rules:
                             "bytes": bytes_len
                         }
                     });
+                    self.stats_record_fetch_backend(
+                        "firecrawl",
+                        true,
+                        per_t0.elapsed().as_millis() as u64,
+                        None,
+                    );
                     (
                         md.clone(),
                         md_bytes,
@@ -8341,8 +10453,25 @@ Rules:
                         },
                     )
                 } else {
+                    let (url0, arxiv_attempts) = self.maybe_rewrite_arxiv_abs_url(url);
+                    let (url1, gh_patch_attempts, _gh_patch_warn) =
+                        self.maybe_rewrite_github_pr_or_commit_url(&url0);
+                    let (url2, github_blob_attempts) = self.maybe_rewrite_github_blob_url(&url1);
+                    let (url3, gist_attempts) = self.maybe_rewrite_gist_url(&url2);
+                    let (fetch_url, github_repo_attempts) = self
+                        .maybe_rewrite_github_repo_url(
+                            &url3,
+                            timeout_ms,
+                            max_bytes,
+                            no_network,
+                            cache_read,
+                            cache_write,
+                            cache_ttl_s,
+                        )
+                        .await;
+
                     let req = FetchRequest {
-                        url: url.clone(),
+                        url: fetch_url.clone(),
                         timeout_ms: Some(timeout_ms),
                         max_bytes: Some(max_bytes),
                         headers: BTreeMap::new(),
@@ -8352,10 +10481,26 @@ Rules:
                             ttl_s: cache_ttl_s,
                         },
                     };
+                    let github_repo_attempts0 = github_repo_attempts;
+                    let github_blob_attempts0 = github_blob_attempts;
+                    let gh_patch_attempts0 = gh_patch_attempts;
+                    let gist_attempts0 = gist_attempts;
+                    let arxiv_attempts0 = arxiv_attempts;
+                    let fetch_url0 = fetch_url.clone();
+
                     let mut fetched = if no_network {
                         match self.fetcher.cache_get(&req) {
                             Ok(Some(r)) => r,
                             Ok(None) => {
+                                self.stats_record_fetch_backend(
+                                    "local",
+                                    false,
+                                    per_t0.elapsed().as_millis() as u64,
+                                    Some("cache_miss_no_network"),
+                                );
+                                let warns: Vec<&'static str> =
+                                    vec!["no_network_may_require_warm_cache"];
+                                let codes = warning_codes_from(&warns);
                                 per_url.push(serde_json::json!({
                                         "url": url,
                                         "ok": false,
@@ -8363,22 +10508,32 @@ Rules:
                                         "fetch_backend": "local",
                                         "no_network": true,
                                         "error": error_obj(
-                                            ErrorCode::NotSupported,
+                                            ErrorCode::FetchFailed,
                                             "cache miss in no_network mode",
                                             "Warm the cache first (run without no_network), or set no_network=false."
                                         ),
+                                        "warnings": warns,
+                                        "warning_codes": codes.clone(),
+                                        "warning_hints": warning_hints_from(&codes),
                                         "elapsed_ms": per_t0.elapsed().as_millis()
                                     }));
                                 continue;
                             }
                             Err(e) => {
+                                let msg = e.to_string();
+                                self.stats_record_fetch_backend(
+                                    "local",
+                                    false,
+                                    per_t0.elapsed().as_millis() as u64,
+                                    Some(msg.as_str()),
+                                );
                                 per_url.push(serde_json::json!({
                                         "url": url,
                                         "ok": false,
                                         "stage": "fetch",
                                         "fetch_backend": "local",
                                         "no_network": true,
-                                        "error": error_obj(ErrorCode::CacheError, e.to_string(), "Cache read failed in no_network mode."),
+                                        "error": error_obj(ErrorCode::CacheError, msg, "Cache read failed in no_network mode."),
                                         "elapsed_ms": per_t0.elapsed().as_millis()
                                     }));
                                 continue;
@@ -8388,12 +10543,19 @@ Rules:
                         match self.fetcher.fetch(&req).await {
                             Ok(r) => r,
                             Err(e) => {
+                                let msg = e.to_string();
+                                self.stats_record_fetch_backend(
+                                    "local",
+                                    false,
+                                    per_t0.elapsed().as_millis() as u64,
+                                    Some(msg.as_str()),
+                                );
                                 per_url.push(serde_json::json!({
                                         "url": url,
                                         "ok": false,
                                         "stage": "fetch",
                                         "fetch_backend": "local",
-                                        "error": error_obj(ErrorCode::FetchFailed, e.to_string(), "Fetch failed for this URL."),
+                                        "error": error_obj(ErrorCode::FetchFailed, msg, "Fetch failed for this URL."),
                                         "elapsed_ms": per_t0.elapsed().as_millis()
                                     }));
                                 continue;
@@ -8429,7 +10591,7 @@ Rules:
                                 "max_bytes": max_bytes
                             }));
                             let req2 = FetchRequest {
-                                url: url.clone(),
+                                url: fetch_url0.clone(),
                                 timeout_ms: Some(timeout_ms),
                                 max_bytes: Some(retry_cap),
                                 headers: BTreeMap::new(),
@@ -8462,6 +10624,21 @@ Rules:
                     }
                     if local_retry_obj.is_some() {
                         let mut a = serde_json::Map::new();
+                        if let Some(g) = arxiv_attempts0.clone() {
+                            a.insert("arxiv_rewrite".to_string(), g);
+                        }
+                        if let Some(g) = gh_patch_attempts0.clone() {
+                            a.insert("github_patch_rewrite".to_string(), g);
+                        }
+                        if let Some(g) = github_blob_attempts0.clone() {
+                            a.insert("github_blob_rewrite".to_string(), g);
+                        }
+                        if let Some(g) = gist_attempts0.clone() {
+                            a.insert("gist_rewrite".to_string(), g);
+                        }
+                        if let Some(g) = github_repo_attempts0.clone() {
+                            a.insert("github_repo_rewrite".to_string(), g);
+                        }
                         if let Some(obj) = local_attempt_obj.take() {
                             a.insert("local".to_string(), obj);
                         }
@@ -8469,7 +10646,36 @@ Rules:
                             a.insert("local_retry".to_string(), obj);
                         }
                         attempts = serde_json::Value::Object(a);
+                    } else if arxiv_attempts0.is_some()
+                        || gh_patch_attempts0.is_some()
+                        || github_blob_attempts0.is_some()
+                        || gist_attempts0.is_some()
+                        || github_repo_attempts0.is_some()
+                    {
+                        let mut a = serde_json::Map::new();
+                        if let Some(g) = arxiv_attempts0.clone() {
+                            a.insert("arxiv_rewrite".to_string(), g);
+                        }
+                        if let Some(g) = gh_patch_attempts0.clone() {
+                            a.insert("github_patch_rewrite".to_string(), g);
+                        }
+                        if let Some(g) = github_blob_attempts0.clone() {
+                            a.insert("github_blob_rewrite".to_string(), g);
+                        }
+                        if let Some(g) = gist_attempts0.clone() {
+                            a.insert("gist_rewrite".to_string(), g);
+                        }
+                        if let Some(g) = github_repo_attempts0.clone() {
+                            a.insert("github_repo_rewrite".to_string(), g);
+                        }
+                        attempts = serde_json::Value::Object(a);
                     }
+                    self.stats_record_fetch_backend(
+                        "local",
+                        true,
+                        per_t0.elapsed().as_millis() as u64,
+                        None,
+                    );
                     let local_final_url = fetched.final_url.clone();
                     let local_status = fetched.status;
                     let local_content_type = fetched.content_type.clone();
@@ -8918,6 +11124,13 @@ Rules:
                 if filtered_low_signal {
                     warnings.push("chunks_filtered_low_signal");
                 }
+                // Explicitly mark “all chunks look low-signal” even if we had to fail-open.
+                // This makes it easier for clients/agents to decide to switch backends/URLs.
+                let all_low_signal =
+                    !chunks.is_empty() && chunks.iter().all(Self::chunk_is_low_signal);
+                if all_low_signal {
+                    warnings.push("all_chunks_low_signal");
+                }
 
                 let page_signal = chunks.iter().map(|c| c.score).max().unwrap_or(0);
                 // Stuck detection: repeated low-signal pages should trigger an extra search round (if allowed),
@@ -8953,7 +11166,7 @@ Rules:
                 }
 
                 // Collect chunk candidates with per-URL provenance signals for selection.
-                let warnings_count = warnings.len();
+                let warning_penalty = Self::warning_penalty(&warnings);
                 let cache_hit = fetch_source == "cache";
                 for c in &chunks {
                     all_chunks.push(ChunkCandidate {
@@ -8962,7 +11175,7 @@ Rules:
                         start_char: c.start_char,
                         end_char: c.end_char,
                         text: c.text.clone(),
-                        warnings_count,
+                        warning_penalty,
                         cache_hit,
                     });
                 }
@@ -9000,7 +11213,6 @@ Rules:
                     extracted_obj.engine,
                     &warnings,
                 );
-                one["quality"] = quality.clone();
                 one["extract"]["quality"] = quality;
                 if !warnings.is_empty() {
                     one["warnings"] = serde_json::json!(warnings);
@@ -9057,7 +11269,6 @@ Rules:
                         "content_type",
                         "bytes",
                         "elapsed_ms",
-                        "quality",
                         "warnings",
                         "warning_codes",
                         "warning_hints",
@@ -9371,7 +11582,8 @@ Rules:
             let width = args.width.unwrap_or(100).clamp(20, 240);
             let top_chunks = args.top_chunks.unwrap_or(5).min(50);
             let max_chunk_chars = args.max_chunk_chars.unwrap_or(500).min(5_000);
-            let include_structure = args.include_structure.unwrap_or(false);
+            // Default to structure output for higher-quality chunk selection.
+            let include_structure = args.include_structure.unwrap_or(true);
             let max_outline_items = args.max_outline_items.unwrap_or(25).min(200);
             let max_blocks = args.max_blocks.unwrap_or(40).min(200);
             let max_block_chars = args.max_block_chars.unwrap_or(400).min(2000);
@@ -10971,7 +13183,7 @@ Rules:
                     "include_headers": include_headers
                 });
                 if include_text {
-                    payload["text"] = serde_json::json!(text);
+                    payload["body_text"] = serde_json::json!(text);
                 }
                 if include_headers {
                     payload["headers"] = serde_json::json!({});
@@ -11104,7 +13316,7 @@ Rules:
                                 serde_json::json!(dropped_request_headers);
                         }
                         if include_text {
-                            payload["text"] = serde_json::json!(text);
+                            payload["body_text"] = serde_json::json!(text);
                         }
                         if include_headers {
                             payload["headers"] = serde_json::json!(resp.headers);
@@ -11113,15 +13325,20 @@ Rules:
                         return Ok(tool_result_markdown_with_json(payload, md));
                     }
                     Ok(None) => {
+                        let warns: Vec<&'static str> = vec!["no_network_may_require_warm_cache"];
+                        let codes = warning_codes_from(&warns);
                         let mut payload = serde_json::json!({
                             "ok": false,
                             "url": url,
                             "error": error_obj(
-                                ErrorCode::NotSupported,
+                                ErrorCode::FetchFailed,
                                 "cache miss in no_network mode",
                                 "Warm the cache first (run without no_network), or set no_network=false."
                             ),
-                            "request": { "fetch_backend": "local", "no_network": true, "cache": { "read": true, "write": false, "ttl_s": req.cache.ttl_s } }
+                            "request": { "fetch_backend": "local", "no_network": true, "cache": { "read": true, "write": false, "ttl_s": req.cache.ttl_s } },
+                            "warnings": warns,
+                            "warning_codes": codes.clone(),
+                            "warning_hints": warning_hints_from(&codes)
                         });
                         add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
                         let md = web_fetch_markdown(&payload);
@@ -11263,7 +13480,7 @@ Rules:
             }
 
             if include_text {
-                payload["text"] = serde_json::json!(text);
+                payload["body_text"] = serde_json::json!(text);
             }
 
             if include_headers {
@@ -13027,11 +15244,13 @@ Rules:
             // Default behavior: return full extracted text when no query is provided (users asked for “extract”),
             // but keep it off when query is provided (callers usually want bounded chunks).
             let include_text = args.include_text.unwrap_or(args.query.is_none());
-            let include_structure = args.include_structure.unwrap_or(false);
+            // Default to structure output for higher-quality chunk selection and better debugging.
+            let include_structure = args.include_structure.unwrap_or(true);
             let max_outline_items = args.max_outline_items.unwrap_or(25).min(200);
             let max_blocks = args.max_blocks.unwrap_or(40).min(200);
             let max_block_chars = args.max_block_chars.unwrap_or(400).min(2000);
             let semantic_rerank = args.semantic_rerank.unwrap_or(false);
+            let semantic_auto_fallback = args.semantic_auto_fallback.unwrap_or(true);
             let semantic_top_k = args.semantic_top_k.unwrap_or(5).min(50);
             let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
             let no_network = args.no_network.unwrap_or(false);
@@ -13041,6 +15260,11 @@ Rules:
             } else {
                 args.cache_write.unwrap_or(true)
             };
+            let retry_on_truncation_arg = args.retry_on_truncation;
+            let truncation_retry_max_bytes = args
+                .truncation_retry_max_bytes
+                .unwrap_or(10_000_000)
+                .min(20_000_000);
 
             let url = args.url.unwrap_or_default();
             let t0 = std::time::Instant::now();
@@ -13244,13 +15468,6 @@ Rules:
                     "content_type": "text/markdown",
                     "bytes": md_raw_bytes,
                     "truncated": clipped,
-                    "text_chars": n,
-                    "text_truncated": clipped,
-                    "extraction": {
-                        "engine": "firecrawl",
-                        "width": width,
-                        "max_chars": max_chars
-                    },
                     "timings_ms": {
                         "total": t0.elapsed().as_millis(),
                         "firecrawl_fetch": r.elapsed_ms
@@ -13272,13 +15489,7 @@ Rules:
                     "max_blocks": max_blocks,
                     "max_block_chars": max_block_chars
                 });
-                if include_text {
-                    payload["text"] = serde_json::json!(text);
-                }
-                if include_links {
-                    payload["links"] = serde_json::json!([]);
-                    warnings.push("links_unavailable_for_firecrawl");
-                }
+                // Canonical output: extraction results live under payload.extract (no legacy mirrors).
                 if !warnings.is_empty() {
                     payload["warnings"] = serde_json::json!(warnings);
                     let codes = warning_codes_from(&warnings);
@@ -13292,7 +15503,7 @@ Rules:
                     t0.elapsed().as_millis() as u64,
                     None,
                 );
-                // Unify: add `extract` object (keep existing top-level fields for back-compat).
+                // Canonical extract object.
                 payload["extract"] = serde_json::json!({
                     "engine": "firecrawl",
                     "width": width,
@@ -13302,19 +15513,16 @@ Rules:
                     "top_chunks": top_chunks,
                     "max_chunk_chars": max_chunk_chars
                 });
+                if include_text {
+                    payload["extract"]["text"] = serde_json::json!(text);
+                }
                 if include_structure {
                     if let Some(s) = pipeline.structure.as_ref() {
-                        payload["structure"] = serde_json::json!(s);
                         payload["extract"]["structure"] = serde_json::json!(s);
                     }
                 }
                 if let Some(q) = args.query.as_deref() {
                     if !q.trim().is_empty() {
-                        payload["query"] = serde_json::json!(q);
-                        payload["chunks"] = serde_json::json!(pipeline.chunks);
-                        payload["extraction"]["top_chunks"] = serde_json::json!(top_chunks);
-                        payload["extraction"]["max_chunk_chars"] =
-                            serde_json::json!(max_chunk_chars);
                         payload["extract"]["chunks"] = serde_json::json!(pipeline.chunks);
                     }
                 }
@@ -13346,18 +15554,80 @@ Rules:
                             warnings: vec!["semantic_rerank_task_failed"],
                         }
                     });
-                    payload["semantic"] = serde_json::json!(sem);
                     payload["extract"]["semantic"] = serde_json::json!(sem);
                 }
                 if include_links {
                     payload["extract"]["links"] = serde_json::json!([]);
                     payload["extract"]["max_links"] = serde_json::json!(max_links);
+                    warnings.push("links_unavailable_for_firecrawl");
+                }
+                if !warnings.is_empty() {
+                    payload["warnings"] = serde_json::json!(warnings);
+                    let codes = warning_codes_from(&warnings);
+                    payload["warning_codes"] = serde_json::json!(codes.clone());
+                    payload["warning_hints"] = warning_hints_from(&codes);
+                    self.stats_record_warnings(&warnings);
                 }
                 return Ok(tool_result(payload));
             }
 
+            // arXiv rewrite: /abs/<id> → /pdf/<id>.pdf
+            let (url0, arxiv_attempts) = self.maybe_rewrite_arxiv_abs_url(&url);
+            // GitHub issue rewrite: /issues/<n> → GitHub API JSON (no network)
+            let (url0b, gh_issue_attempts, gh_issue_rewrote) =
+                self.maybe_rewrite_github_issue_url(&url0);
+            // GitHub release rewrite: /releases/... → GitHub API JSON (no network)
+            let (url0c, gh_release_attempts, gh_release_rewrote) =
+                self.maybe_rewrite_github_release_url(&url0b);
+            // GitHub PR/commit rewrite: /pull/<n> or /commit/<sha> → .patch (no network)
+            let (url1, gh_patch_attempts, gh_patch_warn) =
+                self.maybe_rewrite_github_pr_or_commit_url(&url0c);
+            // GitHub blob rewrite: /blob/<ref>/<path> → raw file (no network)
+            let (url2, github_blob_attempts) = self.maybe_rewrite_github_blob_url(&url1);
+            // Gist rewrite: gist page → /raw (no network)
+            let (url3, gist_attempts) = self.maybe_rewrite_gist_url(&url2);
+            // GitHub repo root rewrite: prefer raw README over GitHub app shell (network probe)
+            let (fetch_url, github_repo_attempts) = self
+                .maybe_rewrite_github_repo_url(
+                    &url3,
+                    args.timeout_ms.unwrap_or(20_000),
+                    args.max_bytes.unwrap_or(5_000_000),
+                    no_network,
+                    args.cache_read.unwrap_or(true),
+                    args.cache_write.unwrap_or(true),
+                    args.cache_ttl_s,
+                )
+                .await;
+            let arxiv_rewrote = url0 != url;
+            let github_patch_rewrote = url1 != url0;
+            let github_blob_rewrote = url2 != url1;
+            let gist_rewrote = url3 != url2;
+            let github_repo_rewrote = fetch_url != url3;
+            let mut attempts_map = serde_json::Map::new();
+            if let Some(a) = arxiv_attempts {
+                attempts_map.insert("arxiv_rewrite".to_string(), a);
+            }
+            if let Some(a) = gh_issue_attempts {
+                attempts_map.insert("github_issue_rewrite".to_string(), a);
+            }
+            if let Some(a) = gh_release_attempts {
+                attempts_map.insert("github_release_rewrite".to_string(), a);
+            }
+            if let Some(a) = gh_patch_attempts {
+                attempts_map.insert("github_patch_rewrite".to_string(), a);
+            }
+            if let Some(a) = github_blob_attempts {
+                attempts_map.insert("github_blob_rewrite".to_string(), a);
+            }
+            if let Some(a) = gist_attempts {
+                attempts_map.insert("gist_rewrite".to_string(), a);
+            }
+            if let Some(a) = github_repo_attempts {
+                attempts_map.insert("github_repo_rewrite".to_string(), a);
+            }
+
             let req = FetchRequest {
-                url: url.clone(),
+                url: fetch_url.clone(),
                 timeout_ms: args.timeout_ms.or(Some(20_000)),
                 max_bytes: args.max_bytes.or(Some(5_000_000)),
                 headers: BTreeMap::new(),
@@ -13377,24 +15647,42 @@ Rules:
                 match self.fetcher.cache_get(&req) {
                     Ok(Some(r)) => r,
                     Ok(None) => {
+                        self.stats_record_fetch_backend(
+                            "local",
+                            false,
+                            t0.elapsed().as_millis() as u64,
+                            Some("cache_miss_no_network"),
+                        );
+                        let warns: Vec<&'static str> = vec!["no_network_may_require_warm_cache"];
+                        let codes = warning_codes_from(&warns);
                         let mut payload = serde_json::json!({
                             "ok": false,
                             "url": url,
                             "error": error_obj(
-                                ErrorCode::NotSupported,
+                                ErrorCode::FetchFailed,
                                 "cache miss in no_network mode",
                                 "Warm the cache first (run without no_network), or set no_network=false."
                             ),
-                            "request": { "fetch_backend": "local", "no_network": true, "cache": { "read": true, "write": false, "ttl_s": req.cache.ttl_s } }
+                            "request": { "fetch_backend": "local", "no_network": true, "cache": { "read": true, "write": false, "ttl_s": req.cache.ttl_s } },
+                            "warnings": warns,
+                            "warning_codes": codes.clone(),
+                            "warning_hints": warning_hints_from(&codes)
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
                         return Ok(tool_result(payload));
                     }
                     Err(e) => {
+                        let msg = e.to_string();
+                        self.stats_record_fetch_backend(
+                            "local",
+                            false,
+                            t0.elapsed().as_millis() as u64,
+                            Some(&msg),
+                        );
                         let mut payload = serde_json::json!({
                             "ok": false,
                             "url": url,
-                            "error": error_obj(ErrorCode::CacheError, e.to_string(), "Cache read failed in no_network mode."),
+                            "error": error_obj(ErrorCode::CacheError, msg, "Cache read failed in no_network mode."),
                             "request": { "fetch_backend": "local", "no_network": true }
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
@@ -13402,9 +15690,16 @@ Rules:
                     }
                 }
             } else {
-                match self.fetcher.fetch(&req).await {
+                let mut r = match self.fetcher.fetch(&req).await {
                     Ok(r) => r,
                     Err(e) => {
+                        let msg = e.to_string();
+                        self.stats_record_fetch_backend(
+                            "local",
+                            false,
+                            t0.elapsed().as_millis() as u64,
+                            Some(&msg),
+                        );
                         let (code, hint) = match &e {
                             WebpipeError::InvalidUrl(_) => (
                                 ErrorCode::InvalidUrl,
@@ -13438,7 +15733,7 @@ Rules:
                         let mut payload = serde_json::json!({
                             "ok": false,
                             "url": url,
-                            "error": error_obj(code, e.to_string(), hint),
+                            "error": error_obj(code, msg, hint),
                             "request": {
                                 "fetch_backend": fetch_backend,
                                 "no_network": no_network,
@@ -13452,7 +15747,62 @@ Rules:
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
                         return Ok(tool_result(payload));
                     }
+                };
+
+                // Optional bounded truncation retry (tail-recovery). Useful for PDFs (xref/trailer often at end).
+                let retry_on_truncation = retry_on_truncation_arg.unwrap_or_else(|| {
+                    Self::content_type_is_pdf(r.content_type.as_deref())
+                        || Self::url_looks_like_pdf(r.final_url.as_str())
+                        || webpipe_local::extract::bytes_look_like_pdf(&r.bytes)
+                });
+                if retry_on_truncation && r.truncated && !r.bytes.is_empty() {
+                    let from = req.max_bytes.unwrap_or(0);
+                    let to = (from.saturating_mul(5))
+                        .max(1_000_000)
+                        .min(truncation_retry_max_bytes);
+                    if to > from && !no_network {
+                        let mut req2 = req.clone();
+                        req2.max_bytes = Some(to);
+                        // Avoid reusing a truncated cache entry when trying to recover tail content.
+                        req2.cache.read = false;
+                        let t1 = std::time::Instant::now();
+                        match self.fetcher.fetch(&req2).await {
+                            Ok(r2) => {
+                                attempts_map.insert(
+                                    "truncation_retry".to_string(),
+                                    serde_json::json!({
+                                        "from_max_bytes": from,
+                                        "to_max_bytes": to,
+                                        "elapsed_ms": t1.elapsed().as_millis(),
+                                        "ok": true,
+                                        "status": r2.status,
+                                        "bytes": r2.bytes.len(),
+                                        "truncated": r2.truncated
+                                    }),
+                                );
+                                // Prefer the larger response when it is not truncated or contains more bytes.
+                                if (!r2.truncated && r.truncated) || r2.bytes.len() > r.bytes.len()
+                                {
+                                    r = r2;
+                                }
+                            }
+                            Err(_) => {
+                                attempts_map.insert(
+                                    "truncation_retry".to_string(),
+                                    serde_json::json!({
+                                        "from_max_bytes": from,
+                                        "to_max_bytes": to,
+                                        "elapsed_ms": t1.elapsed().as_millis(),
+                                        "ok": false,
+                                        "error": "fetch_failed"
+                                    }),
+                                );
+                            }
+                        }
+                    }
                 }
+
+                r
             };
 
             // From this point on, treat response parts as owned so we can offload extraction/chunking
@@ -13608,6 +15958,20 @@ Rules:
             if resp_body_truncated {
                 warnings.push("body_truncated_by_max_bytes");
             }
+            if attempts_map.contains_key("truncation_retry") {
+                // Additive: indicates we attempted a tail-recovery fetch.
+                // (The attempts_map entry contains details.)
+                let ok = attempts_map
+                    .get("truncation_retry")
+                    .and_then(|v| v.get("ok"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if ok {
+                    warnings.push("truncation_retry_used");
+                } else {
+                    warnings.push("truncation_retry_failed");
+                }
+            }
             if clipped {
                 warnings.push("text_truncated_by_max_chars");
             }
@@ -13629,23 +15993,52 @@ Rules:
             {
                 warnings.push("main_content_low_signal");
             }
+            // Treat “script-only / no-semantic-tags” HTML as low-signal even when it yields a tiny
+            // amount of text (e.g., inline JS).
+            if (extracted.engine.starts_with("html_") || extracted.engine == "html2text")
+                && n <= 200
+                && pipeline
+                    .structure
+                    .as_ref()
+                    .map(|s| s.blocks.is_empty() || s.structure_text.trim().is_empty())
+                    .unwrap_or(true)
+            {
+                warnings.push("main_content_low_signal");
+            }
+            if arxiv_rewrote {
+                warnings.push("arxiv_abs_rewritten_to_pdf");
+            }
+            if gh_issue_rewrote {
+                warnings.push("github_issue_rewritten_to_api");
+            }
+            if gh_release_rewrote {
+                warnings.push("github_release_rewritten_to_api");
+            }
+            if github_patch_rewrote {
+                if let Some(w) = gh_patch_warn {
+                    warnings.push(w);
+                }
+            }
+            if github_blob_rewrote {
+                warnings.push("github_blob_rewritten_to_raw");
+            }
+            if gist_rewrote {
+                warnings.push("gist_rewritten_to_raw");
+            }
+            if github_repo_rewrote {
+                warnings.push("github_repo_rewritten_to_raw_readme");
+            }
 
             let mut payload = serde_json::json!({
                 "ok": true,
                 "fetch_backend": "local",
-                "url": resp_url,
+                "url": url,
+                "fetched_url": resp_url,
                 "final_url": resp_final_url,
                 "status": resp_status,
                 "content_type": resp_content_type,
                 "bytes": resp_bytes.len(),
                 "truncated": resp_body_truncated || clipped,
-                "text_chars": n,
-                "text_truncated": clipped,
-                "extraction": {
-                    "engine": extracted.engine,
-                    "width": width,
-                    "max_chars": max_chars
-                },
                 "timings_ms": {
                     "total": t0.elapsed().as_millis()
                 }
@@ -13657,6 +16050,8 @@ Rules:
                 "no_network": no_network,
                 "timeout_ms": req.timeout_ms,
                 "max_bytes": req.max_bytes,
+                "retry_on_truncation": retry_on_truncation_arg,
+                "truncation_retry_max_bytes": truncation_retry_max_bytes,
                 "cache": { "read": req.cache.read, "write": req.cache.write, "ttl_s": req.cache.ttl_s },
                 "width": width,
                 "max_chars": max_chars,
@@ -13669,6 +16064,7 @@ Rules:
                 "max_blocks": max_blocks,
                 "max_block_chars": max_block_chars,
                 "semantic_rerank": semantic_rerank,
+                "semantic_auto_fallback": semantic_auto_fallback,
                 "semantic_top_k": semantic_top_k
             });
 
@@ -13682,11 +16078,7 @@ Rules:
                 payload["warning_hints"] = warning_hints_from(&codes);
             }
 
-            if include_text {
-                payload["text"] = serde_json::json!(text);
-            }
-
-            // Unify with other tools: include an `extract` object (keep existing fields for back-compat).
+            // Canonical extract object (no legacy mirrors).
             payload["extract"] = serde_json::json!({
                 "engine": extracted.engine,
                 "width": width,
@@ -13697,6 +16089,9 @@ Rules:
                 "max_chunk_chars": max_chunk_chars,
                 "chunks": pipeline.chunks
             });
+            if include_text {
+                payload["extract"]["text"] = serde_json::json!(text);
+            }
             // Deterministic quality scorecard (tail-risk detector).
             // Additive: safe for existing consumers.
             let quality = Self::quality_scorecard(
@@ -13706,7 +16101,6 @@ Rules:
                 extracted.engine,
                 &warnings,
             );
-            payload["quality"] = quality.clone();
             payload["extract"]["quality"] = quality;
 
             if let Some(vm) = vision_model.as_ref() {
@@ -13715,17 +16109,12 @@ Rules:
 
             if include_structure {
                 if let Some(s) = pipeline.structure.as_ref() {
-                    payload["structure"] = serde_json::json!(s);
                     payload["extract"]["structure"] = serde_json::json!(s);
                 }
             }
 
             if let Some(q) = payload["request"]["query"].as_str().map(|s| s.to_string()) {
-                payload["query"] = serde_json::json!(&q);
-                payload["chunks"] = serde_json::json!(pipeline.chunks);
-                payload["extraction"]["top_chunks"] = serde_json::json!(top_chunks);
-                payload["extraction"]["max_chunk_chars"] = serde_json::json!(max_chunk_chars);
-
+                let auto_ok = semantic_auto_fallback && !semantic_rerank;
                 if semantic_rerank {
                     let cands: Vec<(usize, usize, String)> = pipeline
                         .chunks
@@ -13748,15 +16137,37 @@ Rules:
                             warnings: vec!["semantic_rerank_task_failed"],
                         }
                     });
-                    payload["semantic"] = serde_json::json!(sem);
+                    payload["extract"]["semantic"] = serde_json::json!(sem);
+                } else if auto_ok
+                    && Self::openrouter_api_key_from_env().is_some()
+                    && n >= 1500
+                    && !pipeline.chunks.is_empty()
+                    && pipeline.chunks.iter().all(|c| c.score <= 1)
+                    && extracted.engine != "unknown"
+                    && extracted.engine != "html_hint"
+                {
+                    // Single bounded pass: only when lexical chunk scoring looks ineffective.
+                    let cands: Vec<(usize, usize, String)> = pipeline
+                        .chunks
+                        .iter()
+                        .map(|c| (c.start_char, c.end_char, c.text.clone()))
+                        .collect();
+                    let sem = self
+                        .semantic_rerank_chunks_best(&q, &cands, semantic_top_k)
+                        .await;
+                    if sem.ok {
+                        warnings.push("semantic_auto_fallback_used");
+                        payload["warnings"] = serde_json::json!(warnings);
+                        let codes = warning_codes_from(&warnings);
+                        payload["warning_codes"] = serde_json::json!(codes.clone());
+                        payload["warning_hints"] = warning_hints_from(&codes);
+                    }
                     payload["extract"]["semantic"] = serde_json::json!(sem);
                 }
             }
 
             if include_links {
                 if is_pdf_like {
-                    payload["links"] = serde_json::json!([]);
-                    payload["extraction"]["max_links"] = serde_json::json!(max_links);
                     payload["extract"]["links"] = serde_json::json!([]);
                     payload["extract"]["max_links"] = serde_json::json!(max_links);
                 } else {
@@ -13772,13 +16183,17 @@ Rules:
                     })
                     .await
                     .unwrap_or_else(|_| Vec::new());
-                    payload["links"] = serde_json::json!(links);
-                    payload["extraction"]["max_links"] = serde_json::json!(max_links);
                     payload["extract"]["links"] = serde_json::json!(links);
                     payload["extract"]["max_links"] = serde_json::json!(max_links);
                 }
             }
 
+            self.stats_record_fetch_backend("local", true, t0.elapsed().as_millis() as u64, None);
+            payload["attempts"] = if attempts_map.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::Object(attempts_map)
+            };
             let md = web_extract_markdown(&payload);
             Ok(tool_result_markdown_with_json(payload, md))
         }
@@ -13957,24 +16372,23 @@ Rules:
             let (text, mime_type) = match uri.as_str() {
                 "webpipe://meta" => {
                     let r = self.webpipe_meta().await?;
-                    let v = r
-                        .structured_content
-                        .clone()
-                        .ok_or_else(|| McpError::internal_error("webpipe_meta missing structured_content".to_string(), None))?;
+                    let v = r.structured_content.clone().ok_or_else(|| {
+                        McpError::internal_error(
+                            "webpipe_meta missing structured_content".to_string(),
+                            None,
+                        )
+                    })?;
                     let s = serde_json::to_string(&v).unwrap_or_default();
                     (s, "application/json".to_string())
                 }
                 "webpipe://usage" => {
                     let r = self.webpipe_usage(Parameters(None)).await?;
-                    let v = r
-                        .structured_content
-                        .clone()
-                        .ok_or_else(|| {
-                            McpError::internal_error(
-                                "webpipe_usage missing structured_content".to_string(),
-                                None,
-                            )
-                        })?;
+                    let v = r.structured_content.clone().ok_or_else(|| {
+                        McpError::internal_error(
+                            "webpipe_usage missing structured_content".to_string(),
+                            None,
+                        )
+                    })?;
                     let s = serde_json::to_string(&v).unwrap_or_default();
                     (s, "application/json".to_string())
                 }
@@ -14229,6 +16643,33 @@ Rules:
         }
 
         #[test]
+        fn filter_low_signal_chunks_fail_open_is_still_marked_filtered() {
+            // If all chunks look like bundle/app-shell gunk, we must fail-open (return something),
+            // but we should still return `filtered=true` so callers can react.
+            let chunks = vec![
+                webpipe_local::extract::ScoredChunk {
+                    start_char: 0,
+                    end_char: 50,
+                    score: 9,
+                    text: "webpackChunk.push([0,{\"suppressHydrationWarning\":true}]);".to_string(),
+                },
+                webpipe_local::extract::ScoredChunk {
+                    start_char: 51,
+                    end_char: 120,
+                    score: 7,
+                    text: "window.__NUXT__={};(function(a,b,c,d){var e,f,g;})();".to_string(),
+                },
+            ];
+            let (out, filtered) = WebpipeMcp::filter_low_signal_chunks(chunks.clone());
+            assert!(filtered, "fail-open should still be marked filtered");
+            assert_eq!(
+                out.len(),
+                chunks.len(),
+                "fail-open should keep original chunks"
+            );
+        }
+
+        #[test]
         fn truncate_to_chars_is_utf8_safe_and_consistent() {
             let s = "aé🙂中";
             let (out, n, clipped) = WebpipeMcp::truncate_to_chars(s, 3);
@@ -14283,7 +16724,7 @@ Rules:
                         start_char: start,
                         end_char: end,
                         text: texts[i].clone(),
-                        warnings_count: warnings[i],
+                        warning_penalty: warnings[i] as i64,
                         cache_hit: cache_hits[i],
                     });
                 }
@@ -14319,7 +16760,7 @@ Rules:
                         start_char: start,
                         end_char: end,
                         text: texts[i].clone(),
-                        warnings_count: warnings[i],
+                        warning_penalty: warnings[i] as i64,
                         cache_hit: cache_hits[i],
                     });
                 }
@@ -14336,12 +16777,22 @@ Rules:
                 let sb: Vec<_> = b.iter().map(sig).collect();
                 prop_assert_eq!(sa, sb);
 
-                // Sorted by (score desc, url asc, start_char asc) per implementation.
+                // Sorted by (score desc, warning_penalty asc, url asc, start_char asc) per implementation.
                 for w in a.windows(2) {
                     let x = &w[0];
                     let y = &w[1];
-                    let kx = (-(WebpipeMcp::score_key(x.score)), x.url.clone(), x.start_char);
-                    let ky = (-(WebpipeMcp::score_key(y.score)), y.url.clone(), y.start_char);
+                    let kx = (
+                        -(WebpipeMcp::score_key(x.score)),
+                        x.warning_penalty,
+                        x.url.clone(),
+                        x.start_char,
+                    );
+                    let ky = (
+                        -(WebpipeMcp::score_key(y.score)),
+                        y.warning_penalty,
+                        y.url.clone(),
+                        y.start_char,
+                    );
                     prop_assert!(kx <= ky);
                 }
             }
@@ -14388,7 +16839,7 @@ Rules:
                 .await
                 .expect("call");
             let v = payload_from_call_tool_result(&r);
-            assert_eq!(v["schema_version"].as_u64(), Some(1));
+            assert_eq!(v["schema_version"].as_u64(), Some(2));
             assert_eq!(v["kind"].as_str(), Some("web_search"));
             assert_eq!(v["ok"].as_bool(), Some(false));
             assert_eq!(v["provider"].as_str(), Some("auto"));
@@ -14531,7 +16982,7 @@ Rules:
                 .expect("call");
 
             let v = payload_from_call_tool_result(&r);
-            assert_eq!(v["schema_version"].as_u64(), Some(1));
+            assert_eq!(v["schema_version"].as_u64(), Some(2));
             assert_eq!(v["kind"].as_str(), Some("web_deep_research"));
             assert_eq!(v["ok"].as_bool(), Some(false));
             assert_eq!(
@@ -14662,7 +17113,7 @@ Rules:
                 .expect("call");
 
             let v = payload_from_call_tool_result(&r);
-            assert_eq!(v["schema_version"].as_u64(), Some(1));
+            assert_eq!(v["schema_version"].as_u64(), Some(2));
             assert_eq!(v["kind"].as_str(), Some("web_deep_research"));
             assert_eq!(v["ok"].as_bool(), Some(true));
             assert_eq!(v["provider"].as_str(), Some("ollama"));
@@ -16427,6 +18878,8 @@ Rules:
                     max_links: Some(10),
                     timeout_ms: Some(2_000),
                     max_bytes: Some(200_000),
+                    retry_on_truncation: None,
+                    truncation_retry_max_bytes: None,
                     cache_read: Some(true),
                     cache_write: Some(true),
                     cache_ttl_s: None,
@@ -16435,6 +18888,7 @@ Rules:
                     max_blocks: None,
                     max_block_chars: None,
                     semantic_rerank: None,
+                    semantic_auto_fallback: None,
                     semantic_top_k: None,
                 }))
                 .await
@@ -16445,7 +18899,11 @@ Rules:
             assert_eq!(v["ok"].as_bool(), Some(true));
             // Script-only HTML should be treated as "no useful main content" (either empty or low-signal),
             // without requiring a specific extraction engine behavior.
-            let n = v["text_chars"].as_u64().unwrap_or(0);
+            let n = v
+                .get("extract")
+                .and_then(|e| e.get("text_chars"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
             assert!(
                 n <= 200,
                 "unexpectedly large text_chars={n} for script-only HTML"
@@ -16702,6 +19160,8 @@ Rules:
                     max_links: Some(10),
                     timeout_ms: Some(2_000),
                     max_bytes: Some(200_000),
+                    retry_on_truncation: None,
+                    truncation_retry_max_bytes: None,
                     cache_read: Some(false),
                     cache_write: Some(false),
                     cache_ttl_s: None,
@@ -16710,6 +19170,7 @@ Rules:
                     max_blocks: None,
                     max_block_chars: None,
                     semantic_rerank: None,
+                    semantic_auto_fallback: None,
                     semantic_top_k: None,
                 }))
                 .await
@@ -16720,13 +19181,13 @@ Rules:
             assert_eq!(v["ok"].as_bool(), Some(true));
             assert_eq!(v["fetch_backend"].as_str(), Some("firecrawl"));
             assert_eq!(v["bytes"].as_u64(), Some(expected_bytes));
-            assert_eq!(v["text_chars"].as_u64(), Some(expected_bytes));
+            assert_eq!(v["extract"]["text_chars"].as_u64(), Some(expected_bytes));
         }
 
         #[tokio::test]
         async fn warning_codes_normalize_links_unavailable_for_firecrawl() {
             // Offline: Firecrawl path always has links unavailable (we return []), so it emits
-            // legacy warning `links_unavailable_for_firecrawl` and canonical code `links_unavailable`.
+            // canonical warning code `links_unavailable`.
             let _env = EnvGuard::new(&[
                 "WEBPIPE_CACHE_DIR",
                 "WEBPIPE_FIRECRAWL_API_KEY",
@@ -16771,6 +19232,8 @@ Rules:
                     max_links: Some(10),
                     timeout_ms: Some(2_000),
                     max_bytes: Some(200_000),
+                    retry_on_truncation: None,
+                    truncation_retry_max_bytes: None,
                     cache_read: Some(false),
                     cache_write: Some(false),
                     cache_ttl_s: None,
@@ -16779,20 +19242,21 @@ Rules:
                     max_blocks: None,
                     max_block_chars: None,
                     semantic_rerank: None,
+                    semantic_auto_fallback: None,
                     semantic_top_k: None,
                 }))
                 .await
                 .expect("call");
 
             let v = payload_from_call_tool_result(&r);
-            let warns = v["warnings"].as_array().unwrap();
-            let codes = v["warning_codes"].as_array().unwrap();
-            assert!(warns
-                .iter()
-                .any(|x| x.as_str() == Some("links_unavailable_for_firecrawl")));
-            assert!(codes
-                .iter()
-                .any(|x| x.as_str() == Some("links_unavailable")));
+            let empty: Vec<serde_json::Value> = vec![];
+            let codes = v["warning_codes"].as_array().unwrap_or(&empty);
+            assert!(
+                codes
+                    .iter()
+                    .any(|x| x.as_str() == Some("links_unavailable")),
+                "expected links_unavailable in warning_codes"
+            );
         }
 
         #[tokio::test]
@@ -16926,7 +19390,7 @@ Rules:
             let v = payload_from_call_tool_result(&r);
             assert_eq!(v["ok"].as_bool(), Some(true));
             assert_eq!(v["kind"].as_str(), Some("web_seed_urls"));
-            assert_eq!(v["schema_version"].as_u64(), Some(1));
+            assert_eq!(v["schema_version"].as_u64(), Some(2));
             assert_eq!(v["max"].as_u64(), Some(2));
             assert_eq!(v["ids"].as_array().map(|a| a.len()), Some(2));
             let seeds = v["seeds"].as_array().expect("seeds array");
@@ -17205,6 +19669,8 @@ Rules:
                     max_links: None,
                     timeout_ms: None,
                     max_bytes: None,
+                    retry_on_truncation: None,
+                    truncation_retry_max_bytes: None,
                     cache_read: None,
                     cache_write: None,
                     cache_ttl_s: None,
@@ -17213,6 +19679,7 @@ Rules:
                     max_blocks: None,
                     max_block_chars: None,
                     semantic_rerank: None,
+                    semantic_auto_fallback: None,
                     semantic_top_k: None,
                 })))
                 .await
@@ -22367,8 +24834,37 @@ Rules:
 
                 match res {
                     Ok(Ok(tools)) => {
-                        stdio_ok = Some(true);
                         stdio_tool_count = Some(tools.tools.len());
+                        // Cursor needs per-tool JSON Schema (`inputSchema`) to render structured calls.
+                        // rmcp provides JSON Schema objects; an *empty* schema is the real failure mode.
+                        let mut missing_schema: Vec<String> = Vec::new();
+                        for t in tools.tools.iter() {
+                            let schema = t.input_schema.as_ref();
+                            let looks_missing = schema.is_empty();
+                            if looks_missing {
+                                missing_schema.push(t.name.to_string());
+                            }
+                        }
+                        if missing_schema.is_empty() {
+                            stdio_ok = Some(true);
+                        } else {
+                            stdio_ok = Some(false);
+                            let sample = tools.tools.first().map(|t| {
+                                let keys: Vec<String> =
+                                    t.input_schema.keys().take(30).cloned().collect();
+                                serde_json::json!({
+                                    "name": t.name,
+                                    "input_schema_keys": keys
+                                })
+                            });
+                            stdio_error = Some(serde_json::json!({
+                                "code": "tools_missing_input_schema",
+                                "message": format!("{} tools missing inputSchema", missing_schema.len()),
+                                "hint": "Cursor uses tool inputSchema for structured calls. Ensure the MCP server tool list includes JSON Schema inputSchema for each tool.",
+                                "tools": missing_schema,
+                                "sample": sample
+                            }));
+                        }
                     }
                     Ok(Err(e)) => {
                         stdio_ok = Some(false);
@@ -22430,7 +24926,7 @@ Rules:
 
             let ok = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
             let payload = serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "doctor",
                 "ok": ok,
                 "name": "webpipe",
@@ -24166,7 +26662,7 @@ Rules:
         }
         Commands::Version(args) => {
             let v = serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "version",
                 "ok": true,
                 "name": "webpipe",

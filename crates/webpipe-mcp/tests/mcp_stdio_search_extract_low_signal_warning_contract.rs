@@ -132,7 +132,7 @@ It includes a timeline, affected package names, and mitigation steps.
 
         // For web_search_extract, low-signal detection is surfaced via a stable `quality` scorecard
         // (rather than a separate warnings array).
-        let portal_issues: Vec<&str> = p0["quality"]["issues"]
+        let portal_issues: Vec<&str> = p0["extract"]["quality"]["issues"]
             .as_array()
             .into_iter()
             .flatten()
@@ -143,17 +143,17 @@ It includes a timeline, affected package names, and mitigation steps.
             "expected portal quality to include 'gunk'; got issues={portal_issues:?}"
         );
         assert_eq!(
-            p0["quality"]["signals"]["bundle_gunk"].as_bool(),
+            p0["extract"]["quality"]["signals"]["bundle_gunk"].as_bool(),
             Some(true),
             "expected portal bundle_gunk=true"
         );
         assert_eq!(
-            p0["quality"]["signals"]["has_low_signal"].as_bool(),
+            p0["extract"]["quality"]["signals"]["has_low_signal"].as_bool(),
             Some(true),
             "expected portal has_low_signal=true"
         );
 
-        let article_issues: Vec<&str> = p1["quality"]["issues"]
+        let article_issues: Vec<&str> = p1["extract"]["quality"]["issues"]
             .as_array()
             .into_iter()
             .flatten()
@@ -165,13 +165,13 @@ It includes a timeline, affected package names, and mitigation steps.
             s
         );
         assert_eq!(
-            p1["quality"]["signals"]["bundle_gunk"].as_bool(),
+            p1["extract"]["quality"]["signals"]["bundle_gunk"].as_bool(),
             Some(false),
             "expected article bundle_gunk=false; full={}",
             s
         );
         assert_eq!(
-            p1["quality"]["signals"]["has_low_signal"].as_bool(),
+            p1["extract"]["quality"]["signals"]["has_low_signal"].as_bool(),
             Some(false),
             "expected article has_low_signal=false; full={}",
             s

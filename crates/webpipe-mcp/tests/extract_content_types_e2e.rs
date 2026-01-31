@@ -166,11 +166,10 @@ async fn web_extract_handles_multiple_content_types() {
     let v_html = call_extract(&service, &format!("{base}/html"), None).await;
     assert_eq!(v_html["ok"].as_bool(), Some(true));
     assert_eq!(v_html["content_type"].as_str(), Some("text/html"));
-    assert_eq!(v_html["extraction"]["engine"].as_str(), Some("html2text"));
     assert_eq!(v_html["extract"]["engine"].as_str(), Some("html2text"));
-    assert!(v_html.get("structure").is_some());
+    assert!(v_html["extract"].get("structure").is_some());
     assert_eq!(
-        v_html["quality"]["kind"].as_str(),
+        v_html["extract"]["quality"]["kind"].as_str(),
         Some("webpipe_extract_quality")
     );
     assert!(v_html["extract"].get("quality").is_some());
@@ -179,10 +178,6 @@ async fn web_extract_handles_multiple_content_types() {
     let v_article = call_extract(&service, &format!("{base}/article"), None).await;
     assert_eq!(v_article["ok"].as_bool(), Some(true));
     assert_eq!(v_article["content_type"].as_str(), Some("text/html"));
-    assert_eq!(
-        v_article["extraction"]["engine"].as_str(),
-        Some("html_main")
-    );
     assert_eq!(v_article["extract"]["engine"].as_str(), Some("html_main"));
     let warnings = v_article["warnings"]
         .as_array()
@@ -191,10 +186,10 @@ async fn web_extract_handles_multiple_content_types() {
     assert!(warnings
         .iter()
         .any(|w| w.as_str() == Some("boilerplate_reduced")));
-    assert!(v_article["quality"]["signals"]["nonempty"]
+    assert!(v_article["extract"]["quality"]["signals"]["nonempty"]
         .as_bool()
         .unwrap_or(false));
-    assert!(v_article["structure"]["outline"]
+    assert!(v_article["extract"]["structure"]["outline"]
         .as_array()
         .unwrap_or(&vec![])
         .iter()
@@ -207,7 +202,7 @@ async fn web_extract_handles_multiple_content_types() {
         Some("transformers attention"),
     )
     .await;
-    let c0 = v_article_q["chunks"]
+    let c0 = v_article_q["extract"]["chunks"]
         .as_array()
         .and_then(|xs| xs.first())
         .and_then(|x| x.get("text"))
@@ -216,7 +211,7 @@ async fn web_extract_handles_multiple_content_types() {
     assert!(c0.to_lowercase().contains("article"));
     assert!(c0.to_lowercase().contains("attention"));
     assert!(
-        v_article_q["quality"]["signals"]["query_overlap"]
+        v_article_q["extract"]["quality"]["signals"]["query_overlap"]
             .as_u64()
             .unwrap_or(0)
             >= 1
@@ -226,13 +221,12 @@ async fn web_extract_handles_multiple_content_types() {
     let v_json = call_extract(&service, &format!("{base}/json"), None).await;
     assert_eq!(v_json["ok"].as_bool(), Some(true));
     assert_eq!(v_json["content_type"].as_str(), Some("application/json"));
-    assert_eq!(v_json["extraction"]["engine"].as_str(), Some("json"));
     assert_eq!(v_json["extract"]["engine"].as_str(), Some("json"));
     assert_eq!(
-        v_json["quality"]["kind"].as_str(),
+        v_json["extract"]["quality"]["kind"].as_str(),
         Some("webpipe_extract_quality")
     );
-    assert!(v_json["structure"]["outline"]
+    assert!(v_json["extract"]["structure"]["outline"]
         .as_array()
         .map(|a| !a.is_empty())
         .unwrap_or(false));
@@ -241,24 +235,22 @@ async fn web_extract_handles_multiple_content_types() {
     let v_md = call_extract(&service, &format!("{base}/md"), None).await;
     assert_eq!(v_md["ok"].as_bool(), Some(true));
     assert_eq!(v_md["content_type"].as_str(), Some("text/markdown"));
-    assert_eq!(v_md["extraction"]["engine"].as_str(), Some("markdown"));
     assert_eq!(v_md["extract"]["engine"].as_str(), Some("markdown"));
     assert_eq!(
-        v_md["quality"]["kind"].as_str(),
+        v_md["extract"]["quality"]["kind"].as_str(),
         Some("webpipe_extract_quality")
     );
 
     // JS shell HTML should fall back to hint text.
     let v_shell = call_extract(&service, &format!("{base}/shell"), None).await;
     assert_eq!(v_shell["ok"].as_bool(), Some(true));
-    assert_eq!(v_shell["extraction"]["engine"].as_str(), Some("html_hint"));
     assert_eq!(v_shell["extract"]["engine"].as_str(), Some("html_hint"));
     let warnings = v_shell["warnings"].as_array().cloned().unwrap_or_default();
     assert!(warnings
         .iter()
         .any(|w| w.as_str() == Some("hint_text_fallback")));
     assert_eq!(
-        v_shell["quality"]["kind"].as_str(),
+        v_shell["extract"]["quality"]["kind"].as_str(),
         Some("webpipe_extract_quality")
     );
 
@@ -266,14 +258,13 @@ async fn web_extract_handles_multiple_content_types() {
     let v_pdf = call_extract(&service, &format!("{base}/pdf_bad"), None).await;
     assert_eq!(v_pdf["ok"].as_bool(), Some(true));
     assert_eq!(v_pdf["content_type"].as_str(), Some("application/pdf"));
-    assert_eq!(v_pdf["extraction"]["engine"].as_str(), Some("pdf-extract"));
     assert_eq!(v_pdf["extract"]["engine"].as_str(), Some("pdf-extract"));
     let warnings = v_pdf["warnings"].as_array().cloned().unwrap_or_default();
     assert!(warnings
         .iter()
         .any(|w| w.as_str() == Some("pdf_extract_failed")));
     assert_eq!(
-        v_pdf["quality"]["kind"].as_str(),
+        v_pdf["extract"]["quality"]["kind"].as_str(),
         Some("webpipe_extract_quality")
     );
 }

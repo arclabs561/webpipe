@@ -104,7 +104,6 @@ async fn web_search_extract_compact_urls_mode_drops_agentic_trace_and_keeps_extr
     let rs = v["results"].as_array().cloned().unwrap_or_default();
     assert_eq!(rs.len(), 1);
     assert!(rs[0].get("extract").is_some());
-    assert!(rs[0].get("quality").is_some());
     assert_eq!(
         rs[0]["extract"]["quality"]["kind"].as_str(),
         Some("webpipe_extract_quality")

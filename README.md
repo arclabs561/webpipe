@@ -7,6 +7,54 @@ Local “search → fetch → extract” plumbing, exposed as an **MCP stdio** s
 - explicit limits on bytes/chars/results
 - stable, schema-versioned JSON outputs
 
+## Cursor MCP setup
+
+Add this to your `~/.cursor/mcp.json` (adjust path to your repo):
+
+```json
+{
+  "mcpServers": {
+    "webpipe": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--release",
+        "--bin",
+        "webpipe",
+        "--features",
+        "stdio",
+        "--",
+        "mcp-stdio"
+      ],
+      "cwd": "/path/to/webpipe"
+    }
+  }
+}
+```
+
+Optional: to enable Brave-backed search, set `WEBPIPE_BRAVE_API_KEY` in your environment (or in `mcp.json`), but **don’t commit keys**.
+
+## Sanity Check
+
+Run this to verify the server is working (returns JSON):
+
+```bash
+echo '{"jsonrpc": "2.0", "method": "tools/list", "id": 1}' | cargo run -q --bin webpipe --features stdio -- mcp-stdio
+```
+
+## Safety defaults
+
+`webpipe` drops request-secret headers by default:
+- `Authorization`
+- `Cookie`
+- `Proxy-Authorization`
+
+If a caller supplies them, responses include a warning:
+- `warning_codes` contains `unsafe_request_headers_dropped`
+- `request.dropped_request_headers` lists header *names only*
+
+To opt in (only for trusted endpoints), set `WEBPIPE_ALLOW_UNSAFE_HEADERS=true`.
+
 ## Avoid Cargo build locks (dev ergonomics)
 
 If you run multiple `cargo` commands concurrently, you can hit:
@@ -34,13 +82,6 @@ cargo install --path crates/webpipe-mcp --bin webpipe --features stdio --force
 # Run as an MCP stdio server:
 webpipe mcp-stdio
 ```
-
-## Cursor MCP setup
-
-Use `mcp.example.json` as a starting point (it intentionally contains **no API keys**).
-
-Keyless workflow tip:
-- Use the MCP tool `web_seed_urls` to get curated “awesome list” seed URLs, then call `web_search_extract` with `urls=[...]` and `url_selection_mode=query_rank`.
 
 ## Two audiences (how to think about the tools)
 
@@ -235,4 +276,3 @@ To opt in (only for trusted endpoints), set `WEBPIPE_ALLOW_UNSAFE_HEADERS=true`.
 ```bash
 cargo test -p webpipe-mcp --features stdio
 ```
-

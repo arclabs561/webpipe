@@ -25,63 +25,79 @@ fn webpipe_live_firecrawl_eval_fetch_smoke_opt_in() {
         }
     };
 
-    // Keep Tavily/Brave irrelevant here; this is fetch-only.
-    let bin = assert_cmd::cargo::cargo_bin!("webpipe");
-    let out = tempfile::NamedTempFile::new().expect("tmp out");
-    let out_path = out.path().to_path_buf();
-
     // Use a stable URL with predictable content. (Still a live network call.)
     let url = "https://example.com/";
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        use rmcp::{
+            model::CallToolRequestParam,
+            service::ServiceExt,
+            transport::{ConfigureCommandExt, TokioChildProcess},
+        };
 
-    let mut cmd = assert_cmd::Command::new(bin);
-    cmd.env("WEBPIPE_FIRECRAWL_API_KEY", firecrawl_key);
-    // Keep artifacts bounded and exercise truncation + extraction paths.
-    cmd.args([
-        "eval-fetch",
-        "--fetchers",
-        "local,firecrawl",
-        "--url",
-        url,
-        "--timeout-ms",
-        "30000",
-        "--max-bytes",
-        "500000",
-        "--max-text-chars",
-        "200",
-        "--extract",
-        "--extract-width",
-        "80",
-        "--out",
-    ]);
-    cmd.arg(&out_path);
+        fn payload_from_result(result: &rmcp::model::CallToolResult) -> Option<serde_json::Value> {
+            result.structured_content.clone().or_else(|| {
+                result
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
+            })
+        }
 
-    cmd.assert().success();
+        let bin = assert_cmd::cargo::cargo_bin!("webpipe");
+        let service = ()
+            .serve(TokioChildProcess::new(
+                tokio::process::Command::new(bin).configure(|cmd| {
+                    cmd.args(["mcp-stdio"]);
+                    cmd.env(
+                        "WEBPIPE_CACHE_DIR",
+                        std::env::temp_dir().join("webpipe-live-cache"),
+                    );
+                    cmd.env("WEBPIPE_FIRECRAWL_API_KEY", &firecrawl_key);
+                }),
+            )?)
+            .await?;
 
-    let s = std::fs::read_to_string(&out_path).expect("read output artifact");
-    let v: serde_json::Value = serde_json::from_str(&s).expect("parse output json");
+        // Firecrawl fetch+extract (bounded).
+        let resp = service
+            .call_tool(CallToolRequestParam {
+                name: "web_extract".into(),
+                arguments: Some(
+                    serde_json::json!({
+                        "url": url,
+                        "fetch_backend": "firecrawl",
+                        "timeout_ms": 30_000,
+                        "max_bytes": 500_000,
+                        "max_chars": 200,
+                        "query": "example domain",
+                        "top_chunks": 3,
+                        "max_chunk_chars": 200,
+                        "include_text": true,
+                        "include_links": false
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ),
+            })
+            .await?;
 
-    assert_eq!(v["schema_version"].as_u64(), Some(1));
-    assert_eq!(v["kind"].as_str(), Some("eval_fetch"));
-    assert!(v["inputs"]["fetchers"].is_array());
-    assert_eq!(v["inputs"]["extract"].as_bool(), Some(true));
-    assert_eq!(v["inputs"]["max_text_chars"].as_u64(), Some(200));
+        let v = payload_from_result(&resp).ok_or("missing structured_content")?;
+        assert_eq!(v["schema_version"].as_u64(), Some(2));
+        assert_eq!(v["kind"].as_str(), Some("web_extract"));
+        assert_eq!(v["ok"].as_bool(), Some(true));
+        assert_eq!(v["url"].as_str(), Some(url));
+        assert_eq!(v["fetch_backend"].as_str(), Some("firecrawl"));
+        let engine = v["extract"]["engine"].as_str().unwrap_or("");
+        assert_eq!(engine, "firecrawl");
+        // Since we forced max_chars=200, any returned text should be <= 200 chars.
+        if let Some(text) = v["extract"]["text"].as_str() {
+            assert!(text.chars().count() <= 200);
+        }
 
-    let runs = v["runs"].as_array().expect("runs array");
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["url"].as_str(), Some(url));
-
-    let fetchers = runs[0]["fetchers"].as_array().expect("fetchers array");
-    assert!(fetchers.iter().any(|f| f["name"].as_str() == Some("local")));
-    assert!(fetchers
-        .iter()
-        .any(|f| f["name"].as_str() == Some("firecrawl")));
-
-    // At least one should succeed; ideally both.
-    assert!(fetchers.iter().any(|f| f["ok"].as_bool() == Some(true)));
-
-    // Since we forced max_text_chars=200, any successful entry should be <= 200 chars.
-    for f in fetchers.iter().filter(|f| f["ok"].as_bool() == Some(true)) {
-        let text = f["text"].as_str().unwrap_or("");
-        assert!(text.chars().count() <= 200);
-    }
+        service.cancel().await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+    .expect("live firecrawl web_extract smoke");
 }

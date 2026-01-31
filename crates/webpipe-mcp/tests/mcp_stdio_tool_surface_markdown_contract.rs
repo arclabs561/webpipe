@@ -308,4 +308,3 @@ fn webpipe_mcp_stdio_tool_surface_markdown_contract_offlineish() {
     })
     .expect("mcp stdio tool surface markdown contract");
 }
-

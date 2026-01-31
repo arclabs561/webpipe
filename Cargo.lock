@@ -3077,6 +3077,7 @@ dependencies = [
  "blake3",
  "clap",
  "dirs",
+ "flate2",
  "predicates",
  "proptest",
  "reqwest",

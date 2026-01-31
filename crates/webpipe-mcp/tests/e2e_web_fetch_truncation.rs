@@ -81,7 +81,7 @@ async fn webpipe_web_fetch_sets_truncated_and_warning_codes_when_body_is_cut() {
         }),
     )
     .await;
-    assert_eq!(v["schema_version"].as_u64(), Some(1));
+    assert_eq!(v["schema_version"].as_u64(), Some(2));
     assert_eq!(v["kind"].as_str(), Some("web_fetch"));
     assert_eq!(v["ok"].as_bool(), Some(true));
     assert_eq!(v["truncated"].as_bool(), Some(true));
@@ -93,4 +93,3 @@ async fn webpipe_web_fetch_sets_truncated_and_warning_codes_when_body_is_cut() {
 
     service.cancel().await.expect("cancel");
 }
-

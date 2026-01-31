@@ -59,15 +59,12 @@ fn webpipe_live_meta_reports_brave_configured_opt_in() {
             })
             .await?;
 
-        let s = resp
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .unwrap_or_default();
-        let v: serde_json::Value = serde_json::from_str(&s)?;
+        let v = resp
+            .structured_content
+            .clone()
+            .ok_or("missing structured_content")?;
 
-        assert_eq!(v["schema_version"].as_u64(), Some(1));
+        assert_eq!(v["schema_version"].as_u64(), Some(2));
         assert_eq!(v["kind"].as_str(), Some("webpipe_meta"));
         assert_eq!(v["ok"].as_bool(), Some(true));
         assert_eq!(v["configured"]["providers"]["brave"].as_bool(), Some(true));

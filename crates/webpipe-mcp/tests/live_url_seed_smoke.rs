@@ -85,7 +85,7 @@ fn webpipe_live_url_seed_smoke_opt_in() {
                 .map(|t| t.text.clone())
                 .unwrap_or_default();
             let v: serde_json::Value = serde_json::from_str(&text)?;
-            assert_eq!(v["schema_version"].as_u64(), Some(1));
+            assert_eq!(v["schema_version"].as_u64(), Some(2));
             assert_eq!(v["kind"].as_str(), Some("web_fetch"));
             assert_eq!(v["request"]["fetch_backend"].as_str(), Some("local"));
 
@@ -115,7 +115,7 @@ fn webpipe_live_url_seed_smoke_opt_in() {
                 .map(|t| t.text.clone())
                 .unwrap_or_default();
             let v: serde_json::Value = serde_json::from_str(&text)?;
-            assert_eq!(v["schema_version"].as_u64(), Some(1));
+            assert_eq!(v["schema_version"].as_u64(), Some(2));
             assert_eq!(v["kind"].as_str(), Some("web_extract"));
             assert_eq!(v["request"]["fetch_backend"].as_str(), Some("local"));
         }

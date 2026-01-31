@@ -61,6 +61,29 @@ fn has_any_text(s: &str) -> bool {
     s.chars().any(|c| !c.is_whitespace())
 }
 
+fn truncate_len_utf8_boundary(bytes: &[u8], max_len: usize) -> usize {
+    // Choose a byte length <= max_len that is safe to decode as UTF-8.
+    //
+    // This is a best-effort quality improvement: truncating HTML mid-codepoint can introduce
+    // replacement chars and can confuse HTML parsing (especially near tag boundaries).
+    //
+    // Bound work: we only backtrack a few bytes (UTF-8 codepoints are at most 4 bytes).
+    let n = max_len.min(bytes.len());
+    if n == bytes.len() {
+        return n;
+    }
+    if std::str::from_utf8(&bytes[..n]).is_ok() {
+        return n;
+    }
+    for back in 1..=4 {
+        if n >= back && std::str::from_utf8(&bytes[..(n - back)]).is_ok() {
+            return n - back;
+        }
+    }
+    // Worst case: give up and return 0 to avoid panics / invalid slicing.
+    0
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StructuredBlock {
     pub kind: &'static str, // "heading" | "paragraph" | "list_item" | "code" | "other"
@@ -211,22 +234,72 @@ pub fn bytes_look_like_pdf(bytes: &[u8]) -> bool {
 
 /// Best-effort guess for whether bytes are HTML-ish.
 pub fn bytes_look_like_html(bytes: &[u8]) -> bool {
-    // Skip leading whitespace.
+    // Best-effort sniff for HTML bytes.
+    //
+    // Goal: avoid “HTML treated as plain text” (bad downstream chunking), while staying
+    // deterministic and cheap.
+    //
+    // Strategy:
+    // - skip whitespace and BOM
+    // - skip a small number of leading HTML comments (`<!-- ... -->`)
+    // - then check for common tag/doctype prefixes
     let mut i = 0usize;
+
+    // Skip BOM (UTF-8) if present.
+    if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        i = 3;
+    }
+
+    // Skip leading whitespace.
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
     if i >= bytes.len() {
         return false;
     }
+
+    // Skip up to N leading HTML comments.
+    // This is common for some CDNs/templates: `<!-- ... -->\n<!doctype html>...`
+    let mut comments_skipped = 0usize;
+    while comments_skipped < 8 && i + 4 <= bytes.len() && &bytes[i..i + 4] == b"<!--" {
+        // Find the end marker `-->` (bounded search window).
+        // If unterminated, stop trying to be clever and fall back to false.
+        let mut j = i + 4;
+        let mut found = None;
+        // Limit scanning to avoid worst-case quadratic behavior on huge bodies.
+        let max_scan = (i + 200_000).min(bytes.len());
+        while j + 3 <= max_scan {
+            if &bytes[j..j + 3] == b"-->" {
+                found = Some(j + 3);
+                break;
+            }
+            j += 1;
+        }
+        let Some(next_i) = found else {
+            break;
+        };
+        i = next_i;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        comments_skipped += 1;
+        if i >= bytes.len() {
+            return false;
+        }
+    }
+
     let rest = &bytes[i..];
-    // Common prefixes; keep it conservative.
+    // Common prefixes; keep it conservative but practical.
     rest.starts_with(b"<!doctype")
         || rest.starts_with(b"<!DOCTYPE")
         || rest.starts_with(b"<html")
         || rest.starts_with(b"<HTML")
         || rest.starts_with(b"<head")
         || rest.starts_with(b"<body")
+        || rest.starts_with(b"<meta")
+        || rest.starts_with(b"<META")
+        || rest.starts_with(b"<title")
+        || rest.starts_with(b"<TITLE")
 }
 
 /// Best-effort sniff for common image formats.
@@ -299,14 +372,16 @@ fn element_link_text_chars(el: &html_scraper::ElementRef) -> usize {
         .sum()
 }
 
-fn pick_main_text(html: &str, max_elems: usize) -> Option<String> {
+fn pick_main_text(html: &str, max_elems: usize, width: usize) -> Option<String> {
     let max_elems = max_elems.clamp(50, 50_000);
     let doc = html_scraper::Html::parse_document(html);
 
     let sel = html_scraper::Selector::parse("article, main, section, div").ok()?;
+    let sel_p = html_scraper::Selector::parse("p").ok();
+    let sel_li = html_scraper::Selector::parse("li").ok();
     let mut seen = 0usize;
     let mut best_score: i64 = 0;
-    let mut best_text: Option<String> = None;
+    let mut best_html: Option<String> = None;
 
     for el in doc.select(&sel) {
         seen += 1;
@@ -327,30 +402,107 @@ fn pick_main_text(html: &str, max_elems: usize) -> Option<String> {
         }
         let link_txt = element_link_text_chars(&el);
         // Prefer dense non-link text. Link text is usually navigation / TOCs / tag clouds.
-        let mut score = txt as i64 - 2 * (link_txt as i64);
+        let non_link = txt.saturating_sub(link_txt);
+        let mut score = (non_link as i64) - 3 * (link_txt as i64);
         let tag = el.value().name();
         if tag == "article" {
             score += 500;
         } else if tag == "main" {
             score += 300;
         }
-        // Penalize suspiciously link-heavy blocks.
-        if link_txt > txt / 2 {
-            score -= 500;
+        // Penalize suspiciously link-heavy blocks with a smooth-ish curve.
+        if txt > 0 {
+            // density in [0,1]
+            let density = (link_txt as f64) / (txt as f64);
+            if density >= 0.66 {
+                score -= 900;
+            } else if density >= 0.50 {
+                score -= 500;
+            } else if density >= 0.33 {
+                score -= 250;
+            }
+        }
+        // Prefer blocks with multiple paragraphs/list items (more “article-like” structure).
+        if let Some(sel) = sel_p.as_ref() {
+            let pc = el.select(sel).take(50).count() as i64;
+            score += 20 * pc.min(10);
+        }
+        if let Some(sel) = sel_li.as_ref() {
+            let lc = el.select(sel).take(100).count() as i64;
+            // Lists can be good (docs) or bad (nav). Keep the bonus small.
+            score += 3 * lc.min(20);
+        }
+        // Avoid tiny blocks even if they have tag bonuses.
+        if non_link < 80 {
+            score -= 200;
         }
         if score > best_score {
             best_score = score;
-            let t = el.text().collect::<Vec<_>>().join(" ");
-            best_text = Some(norm_ws(&t));
+            // Preserve paragraph-ish structure by re-running html2text on the chosen subtree,
+            // rather than flattening it to a single whitespace-normalized line.
+            best_html = Some(el.html());
         }
     }
 
-    best_text
+    let frag = best_html?;
+    let txt = html_to_text(&frag, width);
+    has_any_text(&txt).then_some(txt)
 }
 
 pub fn html_main_to_text(html: &str, width: usize) -> Option<String> {
-    let _ = width; // kept for API compatibility with callsites
-    let out = pick_main_text(html, 20_000)?;
+    let out = pick_main_text(html, 20_000, width)?;
+    has_any_text(&out).then_some(out)
+}
+
+fn pick_readability_text(html: &str, max_elems: usize, width: usize) -> Option<String> {
+    // Readability-lite: only consider article/main containers (avoid div/section explosion).
+    let max_elems = max_elems.clamp(50, 50_000);
+    let doc = html_scraper::Html::parse_document(html);
+    let sel = html_scraper::Selector::parse("article, main").ok()?;
+    let sel_p = html_scraper::Selector::parse("p").ok();
+    let mut seen = 0usize;
+    let mut best_score: i64 = 0;
+    let mut best_html: Option<String> = None;
+    for el in doc.select(&sel) {
+        seen += 1;
+        if seen > max_elems {
+            break;
+        }
+        if is_generic_boilerplate_container(&el) {
+            continue;
+        }
+        let txt = element_text_chars(&el);
+        if txt < 50 {
+            continue;
+        }
+        let link_txt = element_link_text_chars(&el);
+        let non_link = txt.saturating_sub(link_txt);
+        let mut score = (non_link as i64) - 4 * (link_txt as i64);
+        let tag = el.value().name();
+        if tag == "article" {
+            score += 700;
+        } else if tag == "main" {
+            score += 400;
+        }
+        if let Some(sel) = sel_p.as_ref() {
+            let pc = el.select(sel).take(80).count() as i64;
+            score += 30 * pc.min(12);
+        }
+        if non_link < 150 {
+            score -= 300;
+        }
+        if score > best_score {
+            best_score = score;
+            best_html = Some(el.html());
+        }
+    }
+    let frag = best_html?;
+    let txt = html_to_text(&frag, width);
+    has_any_text(&txt).then_some(txt)
+}
+
+pub fn html_readability_to_text(html: &str, width: usize) -> Option<String> {
+    let out = pick_readability_text(html, 20_000, width)?;
     has_any_text(&out).then_some(out)
 }
 
@@ -467,9 +619,23 @@ pub fn extract_pipeline_from_extracted(
     let chunks = if query.is_empty() {
         best_chunks_default(&extracted.text, cfg.top_chunks, cfg.max_chunk_chars)
     } else if let Some(s) = structure.as_ref() {
-        best_chunks_for_query_in_structure(s, query, cfg.top_chunks, cfg.max_chunk_chars)
+        // “Amazing by default”: if query matching yields no chunks (e.g. misspellings,
+        // synonyms, or short pages), fall back to a reasonable default chunk selection
+        // rather than returning an empty chunk list.
+        let out = best_chunks_for_query_in_structure(s, query, cfg.top_chunks, cfg.max_chunk_chars);
+        if out.is_empty() && has_any_text(&s.structure_text) {
+            best_chunks_default(&s.structure_text, cfg.top_chunks, cfg.max_chunk_chars)
+        } else {
+            out
+        }
     } else {
-        best_chunks_for_query(&extracted.text, query, cfg.top_chunks, cfg.max_chunk_chars)
+        let out =
+            best_chunks_for_query(&extracted.text, query, cfg.top_chunks, cfg.max_chunk_chars);
+        if out.is_empty() && has_any_text(&extracted.text) {
+            best_chunks_default(&extracted.text, cfg.top_chunks, cfg.max_chunk_chars)
+        } else {
+            out
+        }
     };
 
     ExtractPipelineResult {
@@ -600,8 +766,17 @@ fn extract_structure_from_html(
                 break;
             }
             let tag = el.value().name();
-            let raw = el.text().collect::<Vec<_>>().join(" ");
-            let text = norm_ws(&raw);
+            let raw = if tag == "pre" {
+                // Preserve line breaks for code blocks (bounded later).
+                el.text().collect::<Vec<_>>().join("\n")
+            } else {
+                el.text().collect::<Vec<_>>().join(" ")
+            };
+            let text = if tag == "pre" {
+                raw.trim().to_string()
+            } else {
+                norm_ws(&raw)
+            };
             if text.is_empty() {
                 continue;
             }
@@ -637,7 +812,7 @@ fn extract_structure_from_html(
                     );
                 }
                 "pre" => {
-                    // Treat as code; keep whitespace-normalized for stability.
+                    // Treat as code; preserve newlines for readability.
                     push_block(
                         &mut blocks,
                         &mut structure_text,
@@ -881,11 +1056,37 @@ pub fn best_effort_text_from_bytes(
     let is_pdf = ct0 == "application/pdf" || bytes_look_like_pdf(bytes);
     if is_pdf {
         return match pdf_to_text(bytes) {
-            Ok(t) => ExtractedText {
-                engine: "pdf-extract",
-                text: clean_extracted_text(t),
-                warnings,
-            },
+            Ok(t) => {
+                if has_any_text(&t) {
+                    ExtractedText {
+                        engine: "pdf-extract",
+                        text: clean_extracted_text(t),
+                        warnings,
+                    }
+                } else {
+                    // Some PDFs have no extractable text in the Rust-native backend (scanned / weird encodings).
+                    // Opportunistically try shellout tools if available.
+                    warnings.push("pdf_extract_failed");
+                    match pdf_to_text_shellout(bytes) {
+                        Ok((engine, text)) => {
+                            warnings.push("pdf_shellout_used");
+                            ExtractedText {
+                                engine,
+                                text: clean_extracted_text(text),
+                                warnings,
+                            }
+                        }
+                        Err(_) => {
+                            warnings.push("pdf_shellout_unavailable");
+                            ExtractedText {
+                                engine: "pdf-extract",
+                                text: String::new(),
+                                warnings,
+                            }
+                        }
+                    }
+                }
+            }
             Err(_) => {
                 warnings.push("pdf_extract_failed");
                 match pdf_to_text_shellout(bytes) {
@@ -1029,8 +1230,9 @@ pub fn best_effort_text_from_bytes(
     let is_markdown = ct0 == "text/markdown" || ct0 == "text/x-markdown";
     let is_json = ct0 == "application/json" || ct0.ends_with("+json");
     let is_xml = ct0 == "application/xml" || ct0 == "text/xml" || ct0.ends_with("+xml");
+    let is_html_ct = ct0.starts_with("text/html") || ct0 == "application/xhtml+xml";
     let is_text = ct0.starts_with("text/") || is_markdown || is_json || is_xml;
-    if is_text && !bytes_look_like_html(bytes) {
+    if is_text && !is_html_ct && !bytes_look_like_html(bytes) {
         let text = clean_extracted_text(String::from_utf8_lossy(bytes).to_string());
         let engine = if is_markdown {
             "markdown"
@@ -1055,7 +1257,8 @@ pub fn best_effort_text_from_bytes(
         env_usize("WEBPIPE_EXTRACT_MAX_BYTES", 2_000_000).clamp(50_000, 20_000_000);
     let html_bytes = if bytes.len() > max_html_bytes {
         warnings.push("extract_input_truncated");
-        &bytes[..max_html_bytes]
+        let n = truncate_len_utf8_boundary(bytes, max_html_bytes);
+        &bytes[..n]
     } else {
         bytes
     };
@@ -1067,6 +1270,7 @@ pub fn best_effort_text_from_bytes(
     let html = strip_tag_blocks(&html2, "noscript");
     let full = html_to_text(&html, width);
     let main = html_main_to_text(&html, width);
+    let readability = html_readability_to_text(&html, width);
 
     fn quality_score(s: &str) -> i64 {
         let non_ws = s.chars().filter(|c| !c.is_whitespace()).count() as i64;
@@ -1098,17 +1302,39 @@ pub fn best_effort_text_from_bytes(
 
     let full_ok = has_any_text(&full);
     let main_ok = main.as_ref().map(|t| has_any_text(t)).unwrap_or(false);
-    if main_ok {
-        let s_main = quality_score(main.as_ref().unwrap());
+    let read_ok = readability
+        .as_ref()
+        .map(|t| has_any_text(t))
+        .unwrap_or(false);
+
+    // Prefer the best “main-like” output when it meaningfully improves over whole-page text.
+    if full_ok || main_ok || read_ok {
         let s_full = if full_ok { quality_score(&full) } else { 0 };
-        // Prefer main-content when it’s meaningfully better than whole-page text.
-        if !full_ok || s_main >= s_full + 300 {
-            warnings.push("boilerplate_reduced");
-            return ExtractedText {
-                engine: "html_main",
-                text: clean_extracted_text(main.unwrap()),
-                warnings,
-            };
+        let s_main = if main_ok {
+            quality_score(main.as_ref().unwrap())
+        } else {
+            i64::MIN / 4
+        };
+        let s_read = if read_ok {
+            quality_score(readability.as_ref().unwrap())
+        } else {
+            i64::MIN / 4
+        };
+        let (best_engine, best_text, best_score) = if s_read > s_main {
+            ("readability", readability, s_read)
+        } else {
+            ("html_main", main, s_main)
+        };
+        if (best_engine != "html_main" && read_ok) || main_ok {
+            // Require a gap vs full (unless full is empty).
+            if !full_ok || best_score >= s_full + 300 {
+                warnings.push("boilerplate_reduced");
+                return ExtractedText {
+                    engine: best_engine,
+                    text: clean_extracted_text(best_text.unwrap()),
+                    warnings,
+                };
+            }
         }
     }
 
@@ -1177,6 +1403,10 @@ pub fn html_hint_text(html: &str, max_chars: usize) -> String {
     if let Some(d) = first_attr(&doc, "meta[name=\"description\"]", "content") {
         parts.push(d);
     }
+    // Twitter cards are common on docs/blogs; keep it as a best-effort hint source.
+    if let Some(d) = first_attr(&doc, "meta[name=\"twitter:description\"]", "content") {
+        parts.push(d);
+    }
     if let Some(d) = first_attr(&doc, "meta[property=\"og:description\"]", "content") {
         parts.push(d);
     }
@@ -1184,6 +1414,9 @@ pub fn html_hint_text(html: &str, max_chars: usize) -> String {
         parts.push(t);
     }
     if let Some(t) = first_text(&doc, "h2") {
+        parts.push(t);
+    }
+    if let Some(t) = first_text(&doc, "h3") {
         parts.push(t);
     }
 
@@ -1457,6 +1690,9 @@ mod tests {
     fn bytes_look_like_html_sniffs_common_prefixes() {
         assert!(bytes_look_like_html(b"<!doctype html><html>"));
         assert!(bytes_look_like_html(b"   <html><body>x</body></html>"));
+        assert!(bytes_look_like_html(
+            b"<!-- comment -->\n<!doctype html><html>"
+        ));
         assert!(!bytes_look_like_html(br#"{"a":1}"#));
         assert!(!bytes_look_like_html(b""));
     }
@@ -1539,5 +1775,35 @@ mod tests {
         assert!(!chunks.is_empty());
         assert!(chunks[0].text.contains("Heading"));
         assert!(chunks[0].text.to_lowercase().contains("attention"));
+    }
+
+    #[test]
+    fn extract_pipeline_falls_back_when_query_has_no_overlap() {
+        let text = r#"
+Intro paragraph with enough length to pass the chunk minimum.
+
+Second paragraph also long enough to be a usable chunk for humans.
+"#;
+        let extracted0 = ExtractedText {
+            engine: "text",
+            text: text.to_string(),
+            warnings: vec![],
+        };
+        let cfg = ExtractPipelineCfg {
+            query: Some("definitely-not-present"),
+            width: 80,
+            max_chars: 10_000,
+            top_chunks: 3,
+            max_chunk_chars: 200,
+            include_structure: false,
+            max_outline_items: 0,
+            max_blocks: 0,
+            max_block_chars: 0,
+        };
+        let r = extract_pipeline_from_extracted(b"", None, "https://example.com/", extracted0, cfg);
+        assert!(
+            !r.chunks.is_empty(),
+            "expected fallback chunks when query matching yields none"
+        );
     }
 }

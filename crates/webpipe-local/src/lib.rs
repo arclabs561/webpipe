@@ -15,6 +15,7 @@ pub mod ollama;
 pub mod openai_compat;
 pub mod papers;
 pub mod perplexity;
+pub mod rewrite;
 pub mod search;
 pub mod semantic;
 pub mod shellout;
@@ -306,6 +307,55 @@ impl LocalFetcher {
         )
     }
 
+    fn host_matches_allowlist(host: &str, allow: &[String]) -> bool {
+        if host.is_empty() {
+            return false;
+        }
+        let hl = host.trim().to_ascii_lowercase();
+        allow
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .any(|a| !a.is_empty() && a == hl)
+    }
+
+    fn github_allow_sensitive_hosts_from_env() -> Vec<String> {
+        // Secrets should only flow to a very small allowlist, even when the caller supplies them.
+        // We include the configured GitHub API base/raw host to support private repos + local testing.
+        let mut out: Vec<String> = vec![
+            "github.com".to_string(),
+            "api.github.com".to_string(),
+            "raw.githubusercontent.com".to_string(),
+        ];
+
+        if let Ok(api_base) = std::env::var("WEBPIPE_GITHUB_API_BASE") {
+            if let Ok(u) = url::Url::parse(api_base.trim()) {
+                if let Some(h) = u.host_str() {
+                    out.push(h.to_string());
+                }
+            }
+        }
+        if let Ok(raw_host) = std::env::var("WEBPIPE_GITHUB_RAW_HOST") {
+            let h = raw_host.trim();
+            if !h.is_empty() {
+                // Strip optional port.
+                let h2 = h.split(':').next().unwrap_or(h).trim();
+                if !h2.is_empty() {
+                    out.push(h2.to_string());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn allow_sensitive_header_for_url(url: &url::Url) -> bool {
+        // Default: never forward secrets. Exception: known GitHub hosts (and configured base/raw).
+        let host = url.host_str().unwrap_or("");
+        let allow = Self::github_allow_sensitive_hosts_from_env();
+        Self::host_matches_allowlist(host, &allow)
+    }
+
     fn default_cache_dir() -> PathBuf {
         // Keep it local + user-owned; caller can override.
         std::env::temp_dir().join("webpipe-cache")
@@ -331,6 +381,7 @@ impl LocalFetcher {
         &self,
         mut rb: reqwest::RequestBuilder,
         headers: &BTreeMap<String, String>,
+        url: &url::Url,
     ) -> reqwest::RequestBuilder {
         let allow_unsafe = Self::allow_unsafe_request_headers();
         for (k, v) in headers {
@@ -339,7 +390,9 @@ impl LocalFetcher {
                 reqwest::header::HeaderValue::from_str(v),
             ) {
                 if !allow_unsafe && Self::is_sensitive_request_header(&name) {
-                    continue;
+                    if !Self::allow_sensitive_header_for_url(url) {
+                        continue;
+                    }
                 }
                 rb = rb.header(name, value);
             }
@@ -426,11 +479,11 @@ impl FetchBackend for LocalFetcher {
             }
         }
 
-        let mut rb = self.client.get(url);
+        let mut rb = self.client.get(url.clone());
         if let Some(to) = req.timeout() {
             rb = rb.timeout(to);
         }
-        rb = self.apply_headers(rb, &req.headers);
+        rb = self.apply_headers(rb, &req.headers, &url);
         let resp = rb.send().await.map_err(|e| Error::Fetch(e.to_string()))?;
         let final_url = resp.url().to_string();
         let status = resp.status().as_u16();

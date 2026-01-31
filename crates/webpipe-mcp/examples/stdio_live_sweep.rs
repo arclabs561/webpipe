@@ -22,21 +22,22 @@ use serde_json as _;
 use tokio::process::Command;
 
 #[cfg(feature = "stdio")]
-fn first_text(result: &rmcp::model::CallToolResult) -> Option<&str> {
-    result
-        .content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.as_str())
-}
-
-#[cfg(feature = "stdio")]
 fn first_text_owned(result: &rmcp::model::CallToolResult) -> Option<String> {
     result
         .content
         .first()
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
+}
+
+#[cfg(feature = "stdio")]
+fn payload_from_result(result: &rmcp::model::CallToolResult) -> Option<serde_json::Value> {
+    // Prefer structured_content (canonical). Fall back to parsing content[0].text if present.
+    if let Some(v) = result.structured_content.clone() {
+        return Some(v);
+    }
+    let s = first_text_owned(result)?;
+    serde_json::from_str(&s).ok()
 }
 
 #[cfg(feature = "stdio")]
@@ -140,15 +141,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await;
 
-        let Some(s) = r
+        let Some(v) = r
             .ok()
             .and_then(|r| r.ok())
-            .and_then(|r| first_text_owned(&r))
+            .and_then(|r| payload_from_result(&r))
         else {
             println!("{name}: web_extract: timeout_or_transport_error url={url}");
             continue;
         };
-        let v: serde_json::Value = serde_json::from_str(&s)?;
 
         let ok = v["ok"].as_bool().unwrap_or(false);
         let status = v["status"].as_u64().unwrap_or(0);
@@ -186,8 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     )
     .await??;
-    let s2 = first_text(&r2).unwrap_or("");
-    let v2: serde_json::Value = serde_json::from_str(s2)?;
+    let v2 = payload_from_result(&r2).ok_or("missing structured_content")?;
     if let Some(t) = v2["text"].as_str() {
         println!(
             "web_fetch(clean_text): has_control_chars={} text_chars={}",

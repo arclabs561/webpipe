@@ -132,7 +132,7 @@ async fn webpipe_web_fetch_handles_variety_of_urls_and_content_types() {
             }),
         )
         .await;
-        assert_eq!(v["schema_version"].as_u64(), Some(1));
+        assert_eq!(v["schema_version"].as_u64(), Some(2));
         assert_eq!(v["kind"].as_str(), Some("web_fetch"));
         assert_eq!(v["ok"].as_bool(), Some(true), "fetch failed for {url}");
         assert!(v["final_url"].as_str().unwrap_or("").starts_with(&base));
@@ -161,7 +161,7 @@ async fn webpipe_web_fetch_handles_variety_of_urls_and_content_types() {
         "expected redirect final_url to include /html"
     );
     assert!(
-        v_redir["text"]
+        v_redir["body_text"]
             .as_str()
             .unwrap_or("")
             .to_lowercase()

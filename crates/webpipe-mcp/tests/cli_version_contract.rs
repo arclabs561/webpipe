@@ -12,7 +12,7 @@ fn webpipe_version_contract() {
     let s = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(&s).expect("parse version json");
 
-    assert_eq!(v["schema_version"].as_u64(), Some(1));
+    assert_eq!(v["schema_version"].as_u64(), Some(2));
     assert_eq!(v["name"].as_str(), Some("webpipe"));
     assert!(!v["version"].as_str().unwrap_or("").is_empty());
 }

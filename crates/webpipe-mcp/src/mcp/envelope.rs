@@ -36,8 +36,17 @@ pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
         "chunks_filtered_low_signal" => Some(
             "Some extracted chunks looked like JS/app-shell gunk and were filtered. If you need raw output, try include_text=true or fetch_backend=\"firecrawl\".",
         ),
+        "all_chunks_low_signal" => Some(
+            "All extracted chunks appear low-signal (likely app-shell/JS bundle/auth wall). Try fetch_backend=\"firecrawl\" (if configured), choose a different URL, or pass urls=[...] that point to a specific article/docs page.",
+        ),
         "extract_input_truncated" => Some(
             "The fetched body was large; extraction only used the first WEBPIPE_EXTRACT_MAX_BYTES bytes. To change this, lower max_bytes or increase WEBPIPE_EXTRACT_MAX_BYTES (server env).",
+        ),
+        "truncation_retry_used" => Some(
+            "The initial fetch was truncated by max_bytes, so we retried once with a larger max_bytes (bounded) to recover tail content.",
+        ),
+        "truncation_retry_failed" => Some(
+            "The initial fetch was truncated by max_bytes, and the bounded truncation retry failed. Consider increasing max_bytes or trying a different URL.",
         ),
         "firecrawl_fallback_on_low_signal" => Some(
             "Local extraction looked like low-signal app-shell/JS gunk, so we retried this URL via Firecrawl (bounded).",
@@ -50,6 +59,39 @@ pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
         ),
         "unsafe_request_headers_dropped" => Some(
             "Some request headers were dropped by default for safety (Authorization/Cookie/Proxy-Authorization). To allow forwarding them, set WEBPIPE_ALLOW_UNSAFE_HEADERS=true (only for trusted endpoints).",
+        ),
+        "github_repo_rewritten_to_raw_readme" => Some(
+            "This looks like a GitHub repo root page (often low-signal). We rewrote to fetch the repo README from raw.githubusercontent.com. If you need richer docs, pass a docs URL (or set urls=[...] to specific pages).",
+        ),
+        "github_blob_rewritten_to_raw" => Some(
+            "This looks like a GitHub file view URL (/blob/...). We rewrote to fetch the raw file from raw.githubusercontent.com.",
+        ),
+        "github_pr_rewritten_to_patch" => Some(
+            "This looks like a GitHub PR page (/pull/...). We rewrote to fetch the .patch artifact for higher-signal text.",
+        ),
+        "github_commit_rewritten_to_patch" => Some(
+            "This looks like a GitHub commit page (/commit/...). We rewrote to fetch the .patch artifact for higher-signal text.",
+        ),
+        "gist_rewritten_to_raw" => Some(
+            "This looks like a GitHub Gist page. We rewrote to fetch the raw gist content (…/raw) for higher-signal text.",
+        ),
+        "github_issue_rewritten_to_api" => Some(
+            "This looks like a GitHub issue page. We rewrote to fetch issue JSON from the GitHub API for higher-signal text.",
+        ),
+        "github_release_rewritten_to_api" => Some(
+            "This looks like a GitHub release page. We rewrote to fetch release JSON from the GitHub API for higher-signal text.",
+        ),
+        "semantic_auto_fallback_used" => Some(
+            "Semantic rerank ran automatically because lexical chunk scoring looked ineffective for this query. To avoid embeddings latency/cost, set semantic_auto_fallback=false (or leave semantic_rerank=false).",
+        ),
+        "pdf_extract_failed" => Some(
+            "PDF text extraction failed. The PDF may be scanned/image-only or the environment may lack shellout tools. Try enabling/installing PDF tools (pdftotext/mutool) or use an OCR backend for scanned PDFs.",
+        ),
+        "pdf_shellout_unavailable" => Some(
+            "PDF shellout tools are unavailable here. Install `pdftotext` (poppler) or `mutool` (MuPDF), and set WEBPIPE_PDF_SHELLOUT=auto (or a specific tool) to enable higher-robustness PDF extraction.",
+        ),
+        "arxiv_abs_rewritten_to_pdf" => Some(
+            "This looks like an arXiv abstract page (/abs/...). We rewrote to fetch the corresponding PDF (/pdf/...pdf) for better full-text extraction.",
         ),
         _ => None,
     }
@@ -111,6 +153,15 @@ pub(crate) fn add_envelope_fields(payload: &mut serde_json::Value, kind: &str, e
     payload["schema_version"] = serde_json::json!(super::SCHEMA_VERSION);
     payload["kind"] = serde_json::json!(kind);
     payload["elapsed_ms"] = serde_json::json!(elapsed_ms);
+    // API-surface refinement: keep a small set of ubiquitous envelope keys stable.
+    // - attempts: null or object (helps clients avoid "missing vs present" branching)
+    // - request: null or object (many tools fill this in; for others we keep it explicit)
+    if payload.get("attempts").is_none() {
+        payload["attempts"] = serde_json::Value::Null;
+    }
+    if payload.get("request").is_none() {
+        payload["request"] = serde_json::Value::Null;
+    }
 }
 
 pub(crate) fn error_obj(

@@ -85,7 +85,7 @@ fn webpipe_live_search_caps_smoke_opt_in() {
             .map(|t| t.text.clone())
             .unwrap_or_default();
         let brave: serde_json::Value = serde_json::from_str(&brave_s)?;
-        assert_eq!(brave["schema_version"].as_u64(), Some(1));
+        assert_eq!(brave["schema_version"].as_u64(), Some(2));
         assert_eq!(brave["ok"].as_bool(), Some(true));
         assert_eq!(brave["provider"].as_str(), Some("brave"));
         assert_eq!(brave["max_results"].as_u64(), Some(20));
@@ -117,7 +117,7 @@ fn webpipe_live_search_caps_smoke_opt_in() {
             .map(|t| t.text.clone())
             .unwrap_or_default();
         let tavily: serde_json::Value = serde_json::from_str(&tavily_s)?;
-        assert_eq!(tavily["schema_version"].as_u64(), Some(1));
+        assert_eq!(tavily["schema_version"].as_u64(), Some(2));
         assert_eq!(tavily["ok"].as_bool(), Some(true));
         assert_eq!(tavily["provider"].as_str(), Some("tavily"));
         assert_eq!(tavily["max_results"].as_u64(), Some(20));

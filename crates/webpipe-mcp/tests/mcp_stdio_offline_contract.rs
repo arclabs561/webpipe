@@ -251,7 +251,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             .structured_content
             .clone()
             .ok_or("expected structured_content")?;
-        assert_eq!(meta_v["schema_version"].as_u64(), Some(1));
+        assert_eq!(meta_v["schema_version"].as_u64(), Some(2));
         assert_eq!(meta_v["kind"].as_str(), Some("webpipe_meta"));
         assert_eq!(meta_v["ok"].as_bool(), Some(true));
         assert!(meta_v["configured"]["providers"]["brave"].is_boolean());
@@ -283,7 +283,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             .structured_content
             .clone()
             .ok_or("expected structured_content")?;
-        assert_eq!(search_v["schema_version"].as_u64(), Some(1));
+        assert_eq!(search_v["schema_version"].as_u64(), Some(2));
         assert_eq!(search_v["kind"].as_str(), Some("web_search"));
         assert_eq!(search_v["ok"].as_bool(), Some(false));
         assert_eq!(search_v["provider"].as_str(), Some("auto"));
@@ -382,12 +382,12 @@ fn webpipe_mcp_stdio_offline_contract() {
             .clone()
             .ok_or("expected structured_content")?;
         assert_eq!(fetch2_v["ok"].as_bool(), Some(true));
-        assert!(fetch2_v["text"]
+        assert!(fetch2_v["body_text"]
             .as_str()
             .unwrap_or("")
             .contains("accept-language=en-US"));
         // Text should be cleaned for JSON/client display (no CR/NUL/formfeed).
-        let t2 = fetch2_v["text"].as_str().unwrap_or("");
+        let t2 = fetch2_v["body_text"].as_str().unwrap_or("");
         assert!(!t2.contains('\r'), "web_fetch text contains CR");
         assert!(
             !t2.chars().any(|c| c == '\u{0000}'),
@@ -434,11 +434,13 @@ fn webpipe_mcp_stdio_offline_contract() {
             .ok_or("expected structured_content")?;
         assert_eq!(extract_v["ok"].as_bool(), Some(true));
         assert!(extract_v.get("text").is_none());
-        assert!(extract_v.get("chunks").is_some());
-        assert!(extract_v.get("links").is_some());
-        assert!(extract_v["extraction"]["engine"].is_string());
+        assert!(extract_v.get("chunks").is_none());
+        assert!(extract_v.get("links").is_none());
+        assert!(extract_v["extract"]["chunks"].is_array());
+        assert!(extract_v["extract"]["links"].is_array());
+        assert!(extract_v["extract"]["engine"].is_string());
         assert_eq!(
-            extract_v["quality"]["kind"].as_str(),
+            extract_v["extract"]["quality"]["kind"].as_str(),
             Some("webpipe_extract_quality")
         );
         assert!(extract_v["extract"].get("quality").is_some());

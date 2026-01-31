@@ -29,56 +29,82 @@ fn webpipe_live_arxiv_pdf_smoke_opt_in() {
         eprintln!("note: search keys are set, but this test only uses local fetch");
     }
 
-    let bin = assert_cmd::cargo::cargo_bin!("webpipe");
-    let out = tempfile::NamedTempFile::new().expect("tmp out");
-    let out_path = out.path().to_path_buf();
-
     // A stable, well-known paper PDF.
     let url = "https://arxiv.org/pdf/1706.03762.pdf";
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        use rmcp::{
+            model::CallToolRequestParam,
+            service::ServiceExt,
+            transport::{ConfigureCommandExt, TokioChildProcess},
+        };
 
-    let mut cmd = assert_cmd::Command::new(bin);
-    cmd.args([
-        "eval-fetch",
-        "--fetchers",
-        "local",
-        "--url",
-        url,
-        "--timeout-ms",
-        "30000",
-        "--max-bytes",
-        "10000000",
-        "--max-text-chars",
-        "4000",
-        "--extract",
-        "--extract-width",
-        "80",
-        "--out",
-    ]);
-    cmd.arg(&out_path);
+        fn payload_from_result(result: &rmcp::model::CallToolResult) -> Option<serde_json::Value> {
+            result.structured_content.clone().or_else(|| {
+                result
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
+            })
+        }
 
-    cmd.assert().success();
+        let bin = assert_cmd::cargo::cargo_bin!("webpipe");
+        let service = ()
+            .serve(TokioChildProcess::new(
+                tokio::process::Command::new(bin).configure(|cmd| {
+                    cmd.args(["mcp-stdio"]);
+                    cmd.env(
+                        "WEBPIPE_CACHE_DIR",
+                        std::env::temp_dir().join("webpipe-live-cache"),
+                    );
+                }),
+            )?)
+            .await?;
 
-    let s = std::fs::read_to_string(&out_path).expect("read output artifact");
-    let v: serde_json::Value = serde_json::from_str(&s).expect("parse output json");
+        // Bounded fetch+extract. Don't assert exact content (it can drift), only shape/signal.
+        let resp = service
+            .call_tool(CallToolRequestParam {
+                name: "web_extract".into(),
+                arguments: Some(
+                    serde_json::json!({
+                        "url": url,
+                        "fetch_backend": "local",
+                        "timeout_ms": 30_000,
+                        "max_bytes": 10_000_000,
+                        "max_chars": 20_000,
+                        // Force chunks and keep them bounded.
+                        "query": "attention",
+                        "top_chunks": 3,
+                        "max_chunk_chars": 500,
+                        "include_text": false,
+                        "include_links": false
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ),
+            })
+            .await?;
 
-    assert_eq!(v["schema_version"].as_u64(), Some(1));
-    assert_eq!(v["kind"].as_str(), Some("eval_fetch"));
+        let v = payload_from_result(&resp).ok_or("missing structured_content")?;
+        assert_eq!(v["schema_version"].as_u64(), Some(2));
+        assert_eq!(v["kind"].as_str(), Some("web_extract"));
+        assert_eq!(v["ok"].as_bool(), Some(true));
+        assert_eq!(v["url"].as_str(), Some(url));
+        let engine = v["extract"]["engine"].as_str().unwrap_or("");
+        assert!(
+            engine.starts_with("pdf-"),
+            "expected pdf engine, got {engine}"
+        );
+        assert!(v["chunks"].is_array(), "expected chunks array");
+        assert!(
+            v["chunks"].as_array().unwrap().len() > 0,
+            "expected at least one chunk"
+        );
 
-    let runs = v["runs"].as_array().expect("runs array");
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["url"].as_str(), Some(url));
-
-    let fetchers = runs[0]["fetchers"].as_array().expect("fetchers array");
-    assert_eq!(fetchers.len(), 1);
-    let f = &fetchers[0];
-    assert_eq!(f["name"].as_str(), Some("local"));
-    assert_eq!(f["ok"].as_bool(), Some(true));
-
-    let extracted = f["extracted"].as_object().expect("extracted obj");
-    assert_eq!(
-        extracted.get("engine").and_then(|v| v.as_str()),
-        Some("pdf-extract")
-    );
-    let text = extracted.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    assert!(text.chars().count() >= 500);
+        service.cancel().await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+    .expect("live arxiv pdf smoke");
 }
