@@ -1616,17 +1616,17 @@ mod mcp {
         handler::server::wrapper::Parameters,
         model::{
             Annotated, CallToolResult, Content, GetPromptRequestParam, GetPromptResult,
-            ListPromptsResult, ListResourcesResult, PaginatedRequestParam, PromptMessage,
-            PromptMessageRole, RawResource, ReadResourceRequestParam, ReadResourceResult, Resource,
-            ResourceContents, ServerCapabilities, ServerInfo,
+            ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParam,
+            PromptMessage, PromptMessageRole, RawResource, ReadResourceRequestParam,
+            ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo,
         },
-        prompt, prompt_handler, prompt_router,
+        prompt, prompt_router,
         service::RequestContext,
-        tool, tool_handler, tool_router,
-        transport::stdio,
+        tool, tool_router,
         ErrorData as McpError, RoleServer, ServiceExt,
     };
-    use schemars::JsonSchema;
+    use schemars::generate::SchemaSettings;
+    use schemars::{JsonSchema, SchemaGenerator};
     use serde::Deserialize;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -1642,6 +1642,75 @@ mod mcp {
 
     fn p<T>(v: T) -> Parameters<Option<T>> {
         Parameters(Some(v))
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum McpToolset {
+        /// Minimal, Cursor-first surface (“excellent”).
+        Normal,
+        /// Full surface for debugging and niche workflows.
+        Debug,
+    }
+
+    fn mcp_toolset_from_env() -> McpToolset {
+        match std::env::var("WEBPIPE_MCP_TOOLSET")
+            .unwrap_or_else(|_| "normal".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            // Canonical modes:
+            "normal" => McpToolset::Normal,
+            "debug" => McpToolset::Debug,
+            // Back-compat aliases:
+            "slim" | "offline" | "research" => McpToolset::Normal,
+            "full" => McpToolset::Debug,
+            _ => McpToolset::Normal,
+        }
+    }
+
+    fn mcp_toolset_name(t: McpToolset) -> &'static str {
+        match t {
+            McpToolset::Normal => "normal",
+            McpToolset::Debug => "debug",
+        }
+    }
+
+    fn mcp_tool_allowed(tool_name: &str, toolset: McpToolset) -> bool {
+        // Small, opinionated surfaces: the point is to reduce choice overload in Cursor.
+        match toolset {
+            McpToolset::Debug => true,
+            McpToolset::Normal => matches!(
+                tool_name,
+                "webpipe_meta"
+                    | "webpipe_usage"
+                    | "web_fetch"
+                    | "web_extract"
+                    | "search_evidence"
+                    | "arxiv_search"
+                    | "arxiv_enrich"
+                    | "paper_search"
+            ),
+        }
+    }
+
+    /// Build a tool `inputSchema` that is compatible with stricter MCP clients.
+    ///
+    /// `rmcp` derives schemas from handler param types, and `Parameters<Option<T>>` tends to
+    /// produce a nullable-root schema (e.g. `anyOf: [T, null]`). Some clients appear to require
+    /// the tool `inputSchema` to be an object schema (not a union), and will ignore tools if the
+    /// schema is not recognized.
+    ///
+    /// We keep `Option<T>` in the handler (so callers may omit args), but we *publish* the schema
+    /// for `T` directly (non-null), using Draft-07 for broad compatibility.
+    fn tool_input_schema_draft07<T: JsonSchema>() -> serde_json::Map<String, serde_json::Value> {
+        let settings = SchemaSettings::draft07();
+        let gen = SchemaGenerator::new(settings);
+        let schema = gen.into_root_schema_for::<T>();
+        match serde_json::to_value(&schema) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        }
     }
 
     #[path = "envelope.rs"]
@@ -2038,6 +2107,80 @@ mod mcp {
         std::env::var("WEBPIPE_CACHE_DIR").ok().map(PathBuf::from)
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PrivacyMode {
+        Normal,
+        Offline,
+        Anonymous,
+    }
+
+    fn privacy_mode_from_env() -> PrivacyMode {
+        // Public-ish contract:
+        // - WEBPIPE_PRIVACY_MODE=offline|anonymous|normal
+        // - WEBPIPE_OFFLINE_ONLY keeps working as a legacy switch for offline mode.
+        let v = std::env::var("WEBPIPE_PRIVACY_MODE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        match v.as_str() {
+            "offline" => PrivacyMode::Offline,
+            "anonymous" => PrivacyMode::Anonymous,
+            "normal" | "" => {
+                if offline_only_enabled() {
+                    PrivacyMode::Offline
+                } else {
+                    PrivacyMode::Normal
+                }
+            }
+            _ => {
+                // Unknown values should not silently weaken privacy; fall back to Offline when
+                // the legacy switch is set, else Normal.
+                if offline_only_enabled() {
+                    PrivacyMode::Offline
+                } else {
+                    PrivacyMode::Normal
+                }
+            }
+        }
+    }
+
+    fn anon_proxy_from_env() -> Option<String> {
+        // Prefer an explicit knob; fall back to standard proxy envs.
+        for k in ["WEBPIPE_ANON_PROXY", "WEBPIPE_PROXY", "ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"] {
+            if let Ok(v) = std::env::var(k) {
+                let s = v.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn offline_only_enabled() -> bool {
+        // Full-privacy / offline-only mode: forbid non-localhost networking regardless of tool args.
+        // Accept a few common truthy values.
+        match std::env::var("WEBPIPE_OFFLINE_ONLY") {
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            Err(_) => false,
+        }
+    }
+
+    fn is_localhost_url(url: &str) -> bool {
+        // Best-effort: enough to keep tests hermetic and avoid accidental outbound fetches.
+        // (We treat parse failures as non-localhost.)
+        let Ok(u) = reqwest::Url::parse(url.trim()) else {
+            return false;
+        };
+        match u.host_str() {
+            Some("localhost") => true,
+            Some("127.0.0.1") => true,
+            Some("::1") => true,
+            Some(h) => h.ends_with(".localhost"),
+            None => false,
+        }
+    }
+
     pub(crate) fn default_cache_dir() -> PathBuf {
         // Prefer a persistent per-user cache directory (so warm-cache + no_network works across
         // restarts), with a temp-dir fallback.
@@ -2050,7 +2193,7 @@ mod mcp {
         std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty())
     }
 
-    fn normalize_warning_code(w: &'static str) -> &'static str {
+    fn normalize_warning_code(w: &str) -> &str {
         match w {
             // Canonicalize historical drift.
             "text_truncated_by_max_text_chars" => "text_truncated_by_max_chars",
@@ -2088,8 +2231,22 @@ mod mcp {
                 return true;
             }
         }
+        // Wiki / CMS patterns that often route to auth walls (but don't include "/login" etc).
+        // Example observed in live use: Wikipedia `Special:CreateAccount` redirects.
+        for needle in ["special:createaccount", "special:userlogin", "special:login"] {
+            if u.contains(needle) {
+                return true;
+            }
+        }
         // Query-ish signals.
-        for needle in ["returnurl=", "redirect=", "continue=", "next=", "callback="] {
+        for needle in [
+            "returnurl=",
+            "returnto=",
+            "redirect=",
+            "continue=",
+            "next=",
+            "callback=",
+        ] {
             if u.contains(needle) {
                 return true;
             }
@@ -2103,26 +2260,162 @@ mod mcp {
         false
     }
 
+    fn url_looks_like_promo_or_tracking(url: &str) -> bool {
+        // Heuristics for "marketing/promo" URLs that frequently show up in search results and
+        // waste extraction budget (e.g. banners, home pages with UTM tags).
+        //
+        // We treat these as *soft junk*: skip when we have enough alternatives, but allow as
+        // a fallback rather than returning an empty set.
+        let u = url.to_ascii_lowercase();
+
+        // Tracking params (very common across vendors).
+        for needle in ["utm_", "gclid=", "fbclid=", "yclid=", "mc_cid=", "mc_eid="] {
+            if u.contains(needle) {
+                return true;
+            }
+        }
+
+        // Common promo-ish paths. Keep this conservative.
+        for needle in [
+            "/pricing",
+            "/enterprise",
+            "/customers",
+            "/case-studies",
+            "/solutions",
+            "/contact",
+            "/newsletter",
+            "/home",
+            "/showcase",
+            "/events",
+        ] {
+            if u.contains(needle) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn url_looks_like_low_value_homepage(url: &str) -> bool {
+        // Soft-junk heuristic: bare homepages are rarely the best answer for a specific query,
+        // and they frequently waste extraction budget (especially for sites like ResearchGate,
+        // generic portals, etc.). We treat these as "soft junk": skip when we have enough
+        // alternatives, but allow as a fallback rather than returning nothing.
+        let Ok(u) = reqwest::Url::parse(url.trim()) else {
+            return false;
+        };
+        let p = u.path().trim();
+        let is_home = p.is_empty() || p == "/" || p == "index.html" || p.ends_with("/index.html");
+        if !is_home {
+            return false;
+        }
+        // Homepages with tracking/query params are already handled elsewhere, but keep this
+        // conservative and require the querystring to be empty here.
+        u.query().unwrap_or("").trim().is_empty()
+    }
+
     fn looks_like_js_challenge(status: u16, extracted_text: &str, title: Option<&str>) -> bool {
         // Generic “JS required / challenge page” detector, used for warnings + agentic bailout.
         if status == 403 || status == 429 {
             // Many challenge pages show up as 403/429.
             return true;
         }
+        // For 200-ish pages, avoid false positives where a real docs page *mentions* a challenge
+        // string (e.g., “challenge-error-text”) as part of troubleshooting content.
+        //
+        // Use a small weighted signal score. Only return true when the page looks like an actual
+        // interstitial, not when it merely mentions the terms.
         let t = extracted_text.to_ascii_lowercase();
-        if t.contains("enable javascript")
-            || t.contains("challenge-error-text")
-            || t.contains("just a moment")
-        {
-            return true;
+        let mut score: i32 = 0;
+
+        // Strong “interstitial” signals.
+        if t.contains("just a moment") {
+            score += 3;
+        }
+        if t.contains("checking your browser") {
+            score += 3;
+        }
+        if t.contains("verify you are human") {
+            score += 4;
+        }
+        if t.contains("attention required") {
+            score += 3;
+        }
+
+        // Common challenge boilerplate.
+        if t.contains("enable javascript") {
+            score += 2;
+        }
+        if t.contains("enable cookies") || t.contains("cookies are required") {
+            score += 2;
+        }
+        if t.contains("cloudflare ray id") || t.contains("cf-ray") {
+            score += 2;
+        }
+        if t.contains("ddos protection") {
+            score += 2;
+        }
+        if t.contains("access denied") && t.contains("cloudflare") {
+            score += 2;
+        }
+
+        // Weak / ambiguous signals: count, but don’t trigger alone.
+        if t.contains("challenge-error-text") {
+            score += 1;
+        }
+
+        if let Some(tt) = title {
+            let tl = tt.to_ascii_lowercase();
+            if tl.contains("just a moment") {
+                score += 3;
+            }
+            if tl.contains("attention required") {
+                score += 3;
+            }
+            if tl.contains("verify you are human") {
+                score += 4;
+            }
+        }
+
+        score >= 4
+    }
+
+    fn looks_like_silent_throttle(status: u16, extracted_text: &str, title: Option<&str>) -> bool {
+        // “Silent throttling” / interstitial detectors: some sites return HTTP 200 but show
+        // a rate-limit / bot-check / “unusual traffic” page.
+        //
+        // Keep this conservative: we already have `blocked_by_js_challenge` for hard cases.
+        if status >= 400 {
+            return false;
+        }
+        let t = extracted_text.to_ascii_lowercase();
+        let mut score: i32 = 0;
+        for needle in [
+            "unusual traffic",
+            "automated queries",
+            "we have detected unusual",
+            "please verify you are a human",
+            "verify you are human",
+            "are you a robot",
+            "captcha",
+            "temporarily blocked",
+            "access to this page has been denied",
+            "request blocked",
+            "too many requests",
+            "rate limit",
+            "try again later",
+        ] {
+            if t.contains(needle) {
+                score += 2;
+            }
         }
         if let Some(tt) = title {
             let tl = tt.to_ascii_lowercase();
-            if tl.contains("just a moment") || tl.contains("enable javascript") {
-                return true;
+            if tl.contains("access denied") || tl.contains("too many requests") {
+                score += 2;
             }
         }
-        false
+        score >= 4
     }
 
     fn structure_looks_like_ui_shell(
@@ -2619,6 +2912,11 @@ mod mcp {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
+        let mode = payload
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let provider = payload
             .get("provider")
             .and_then(|v| v.as_str())
@@ -2629,22 +2927,23 @@ mod mcp {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
-        let fetch_backend = payload
+        let req = payload.get("request").unwrap_or(&serde_json::Value::Null);
+        let fetch_backend = req
             .get("fetch_backend")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
-        let auto_mode = payload
+        let auto_mode = req
             .get("auto_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
-        let selection_mode = payload
+        let selection_mode = req
             .get("selection_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
-        let url_selection_mode = payload
+        let url_selection_mode = req
             .get("url_selection_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -2678,7 +2977,13 @@ mod mcp {
 
         // Request knobs (bounded + stable ordering).
         md.push_str("## Request\n\n");
-        if !provider.is_empty() {
+        if !mode.is_empty() {
+            md.push_str("- **mode**: `");
+            md.push_str(mode);
+            md.push_str("`\n");
+        }
+        // In urls-mode, showing a “provider” is confusing (no search provider is used).
+        if !provider.is_empty() && mode != "urls" {
             md.push_str("- **provider**: `");
             md.push_str(provider);
             md.push_str("`\n");
@@ -2703,7 +3008,7 @@ mod mcp {
             md.push_str(fetch_backend);
             md.push_str("`\n");
         }
-        if let Some(nn) = payload.get("no_network").and_then(|v| v.as_bool()) {
+        if let Some(nn) = req.get("no_network").and_then(|v| v.as_bool()) {
             md.push_str("- **no_network**: ");
             md.push_str(if nn { "true" } else { "false" });
             md.push('\n');
@@ -2715,7 +3020,7 @@ mod mcp {
             ("top_chunks", "top_chunks"),
             ("max_chunk_chars", "max_chunk_chars"),
         ] {
-            if let Some(n) = payload.get(k).and_then(|v| v.as_u64()) {
+            if let Some(n) = req.get(k).and_then(|v| v.as_u64()) {
                 md.push_str("- **");
                 md.push_str(label);
                 md.push_str("**: ");
@@ -2730,7 +3035,12 @@ mod mcp {
         md.push_str("- **ok**: ");
         md.push_str(if ok { "true" } else { "false" });
         md.push('\n');
-        if !provider.is_empty() {
+        if !mode.is_empty() {
+            md.push_str("- **mode**: `");
+            md.push_str(mode);
+            md.push_str("`\n");
+        }
+        if !provider.is_empty() && mode != "urls" {
             md.push_str("- **provider**: `");
             md.push_str(provider);
             md.push_str("`\n");
@@ -2757,6 +3067,33 @@ mod mcp {
         md.push_str("- **top_chunks**: ");
         md.push_str(&top_chunks_count.to_string());
         md.push('\n');
+        // Make warnings visible in the primary summary (Cursor users rarely scroll).
+        if let Some(codes) = payload.get("warning_codes").and_then(|v| v.as_array()) {
+            let codes_s: Vec<&str> = codes.iter().filter_map(|v| v.as_str()).collect();
+            if !codes_s.is_empty() {
+                md.push_str("- **warning_codes**: ");
+                for (i, c) in codes_s.iter().take(3).enumerate() {
+                    if i > 0 {
+                        md.push_str(", ");
+                    }
+                    md.push('`');
+                    md.push_str(c);
+                    md.push('`');
+                }
+                if codes_s.len() > 3 {
+                    md.push_str(", ...");
+                }
+                md.push('\n');
+            }
+        }
+        if let Some(hints) = payload.get("warning_hints").and_then(|v| v.as_array()) {
+            let hs: Vec<&str> = hints.iter().filter_map(|v| v.as_str()).collect();
+            if !hs.is_empty() {
+                md.push_str("- **warning_hint**: ");
+                md.push_str(hs[0]);
+                md.push('\n');
+            }
+        }
         md.push('\n');
 
         if !ok {
@@ -2839,60 +3176,292 @@ mod mcp {
             }
         }
 
-        // URLs (bounded).
+        // Sources (bounded, Cursor-friendly).
+        // Use stable indices so a client can cite sources as [1], [2], ...
+        let mut source_urls: Vec<String> = Vec::new();
         if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
             if !arr.is_empty() {
-                md.push_str("## URLs\n\n");
-                for r in arr.iter().take(10) {
+                md.push_str("## Sources\n\n");
+                for (i, r) in arr.iter().take(10).enumerate() {
                     let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
                     if url.is_empty() {
                         continue;
                     }
-                    md.push_str("- ");
-                    md.push_str(url);
-                    md.push('\n');
+                    source_urls.push(url.to_string());
+
+                    // Prefer a human title when available (only present when include_structure=true).
+                    let title = r
+                        .pointer("/extract/structure/title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let status = r.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let fb = r
+                        .get("fetch_backend")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let warn_codes: Vec<&str> = r
+                        .get("warning_codes")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).take(3).collect())
+                        .unwrap_or_default();
+
+                    md.push_str(&format!("{}. ", i + 1));
+                    if !title.is_empty() {
+                        md.push_str("**");
+                        md.push_str(title);
+                        md.push_str("**\n");
+                        md.push_str("   - url: ");
+                        md.push_str(url);
+                        md.push('\n');
+                    } else {
+                        md.push_str(url);
+                        md.push('\n');
+                    }
+                    if status != 0 {
+                        md.push_str("   - status: ");
+                        md.push_str(&status.to_string());
+                        md.push('\n');
+                    }
+                    if !fb.is_empty() {
+                        md.push_str("   - fetch_backend: `");
+                        md.push_str(fb);
+                        md.push_str("`\n");
+                    }
+                    if !warn_codes.is_empty() {
+                        md.push_str("   - warnings: ");
+                        for (j, c) in warn_codes.iter().enumerate() {
+                            if j > 0 {
+                                md.push_str(", ");
+                            }
+                            md.push('`');
+                            md.push_str(c);
+                            md.push('`');
+                        }
+                        md.push('\n');
+                    }
+
+                    // Show a short “actual content” excerpt by default.
+                    let preview0 = r
+                        .pointer("/extract/text_preview")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if !preview0.is_empty() {
+                        let mut preview = String::new();
+                        for ch in preview0.chars().take(240) {
+                            preview.push(ch);
+                        }
+                        md.push_str("   - excerpt: ");
+                        md.push_str(&preview);
+                        if preview0.chars().count() > 240 {
+                            md.push_str("…");
+                        }
+                        md.push('\n');
+                    }
                 }
                 md.push('\n');
             }
         }
 
-        // Optional chunk excerpts (bounded).
-        let include_excerpts = std::env::var("WEBPIPE_MCP_MARKDOWN_CHUNK_EXCERPTS")
-            .ok()
-            .is_some_and(|v| {
-                let s = v.trim();
-                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
-            });
-        if include_excerpts {
-            if let Some(arr) = payload.get("top_chunks").and_then(|v| v.as_array()) {
-                if !arr.is_empty() {
-                    md.push_str("## Top chunks (excerpts)\n\n");
-                    for c in arr.iter().take(5) {
+        // Top chunks (short excerpts by default; bounded).
+        if let Some(arr) = payload.get("top_chunks").and_then(|v| v.as_array()) {
+            if !arr.is_empty() {
+                md.push_str("## Top chunks\n\n");
+                let mut seen_excerpt = std::collections::BTreeSet::<String>::new();
+                let mut used_sources = std::collections::BTreeSet::<usize>::new();
+                let mut emitted = 0usize;
+                // Prefer diversity: emit at most one chunk per source first.
+                for pass in 0..2 {
+                    for c in arr.iter() {
+                        if emitted >= 6 {
+                            break;
+                        }
                         let url = c.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                        let score = c.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
                         let text0 = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
+
                         let mut excerpt = String::new();
-                        for ch in text0.chars().take(300) {
+                        for ch in text0.chars().take(220) {
                             excerpt.push(ch);
                         }
-                        if excerpt.trim().is_empty() {
+                        let ex0 = excerpt
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .trim()
+                            .to_string();
+                        if ex0.is_empty() {
                             continue;
                         }
-                        md.push_str("- ");
+                        if !seen_excerpt.insert(ex0.clone()) {
+                            continue;
+                        }
+
+                        // Map chunk URL -> source index (if present).
+                        let mut src_i: Option<usize> = None;
                         if !url.is_empty() {
+                            for (i, u) in source_urls.iter().enumerate() {
+                                if u == url {
+                                    src_i = Some(i + 1);
+                                    break;
+                                }
+                            }
+                        }
+                        if pass == 0 {
+                            if let Some(si) = src_i {
+                                if used_sources.contains(&si) {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        md.push_str("- ");
+                        if let Some(si) = src_i {
+                            md.push_str(&format!("[{si}] "));
+                            used_sources.insert(si);
+                        } else if !url.is_empty() {
                             md.push_str("**");
                             md.push_str(url);
-                            md.push_str("**: ");
+                            md.push_str("** ");
+                        }
+                        if score != 0 {
+                            md.push_str(&format!("(score {score}) "));
                         }
                         md.push_str(&excerpt);
-                        if text0.chars().count() > 300 {
+                        if text0.chars().count() > 220 {
                             md.push_str("…");
                         }
                         md.push('\n');
+                        emitted += 1;
                     }
-                    md.push('\n');
+                    if emitted >= 6 {
+                        break;
+                    }
+                }
+                md.push('\n');
+            }
+        }
+
+        // Next steps (actionable, bounded).
+        let mut all_codes = std::collections::BTreeSet::<String>::new();
+        if let Some(codes) = payload.get("warning_codes").and_then(|v| v.as_array()) {
+            for c in codes.iter().filter_map(|v| v.as_str()) {
+                let cc = normalize_warning_code(c).to_string();
+                if !cc.is_empty() {
+                    all_codes.insert(cc);
                 }
             }
         }
+        if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
+            for r in arr {
+                if let Some(codes) = r.get("warning_codes").and_then(|v| v.as_array()) {
+                    for c in codes.iter().filter_map(|v| v.as_str()) {
+                        let cc = normalize_warning_code(c).to_string();
+                        if !cc.is_empty() {
+                            all_codes.insert(cc);
+                        }
+                    }
+                }
+                if let Some(ws) = r.get("warnings").and_then(|v| v.as_array()) {
+                    for w in ws.iter().filter_map(|v| v.as_str()) {
+                        let cc = normalize_warning_code(w).to_string();
+                        if !cc.is_empty() {
+                            all_codes.insert(cc);
+                        }
+                    }
+                }
+            }
+        }
+
+        let fetch_backend = payload
+            .pointer("/request/fetch_backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("local")
+            .trim()
+            .to_ascii_lowercase();
+
+        #[derive(Clone)]
+        struct NextStep {
+            id: &'static str,
+            text: String,
+        }
+        let mut next: Vec<NextStep> = Vec::new();
+
+        let has_js_challenge = all_codes.contains("blocked_by_js_challenge");
+        let has_low_signal = all_codes.contains("main_content_low_signal")
+            || all_codes.contains("chunks_filtered_low_signal")
+            || all_codes.contains("empty_extraction");
+        let has_trunc = all_codes.contains("body_truncated_by_max_bytes");
+
+        // Priority 1: challenge gating.
+        if has_js_challenge {
+            if fetch_backend == "render" {
+                next.push(NextStep {
+                    id: "challenge_rendered",
+                    text: "This source looks challenge-gated even after rendering. Prefer a different URL/source (or complete the challenge in a real browser and use a non-gated mirror).".to_string(),
+                });
+            } else {
+                next.push(NextStep {
+                    id: "challenge_try_render",
+                    text: "Try `fetch_backend=\"render\"` (or set `render_fallback_on_low_signal=true`) to get past JS-only shells/challenges; if it still looks gated, pick a different source URL.".to_string(),
+                });
+            }
+        }
+
+        // Priority 2: low-signal extraction (avoid repeating render advice if we already suggested it).
+        if has_low_signal {
+            if fetch_backend != "render" {
+                if !has_js_challenge {
+                    next.push(NextStep {
+                        id: "low_signal_try_render",
+                        text: "If excerpts are mostly navigation/UI, enable render fallback: `render_fallback_on_low_signal=true` (or force `fetch_backend=\"render\"` for these URLs).".to_string(),
+                    });
+                }
+                next.push(NextStep {
+                    id: "low_signal_deeplink",
+                    text: "If results are nav-heavy, pass `urls=[...]` with a deep link (and optionally set `agentic=false`) to force extraction from the intended page.".to_string(),
+                });
+            } else {
+                next.push(NextStep {
+                    id: "low_signal_deeplink_render",
+                    text: "If the page renders but still extracts poorly, pass a more specific `urls=[...]` (deep link) or try a different domain/source for the same topic.".to_string(),
+                });
+            }
+        }
+
+        // Priority 3: fetch truncation.
+        if has_trunc {
+            next.push(NextStep {
+                id: "trunc_increase_max_bytes",
+                text: "Increase `max_bytes` (or set `include_text=false`) to avoid truncating the fetched HTML before extraction.".to_string(),
+            });
+        }
+
+        // Keep this short; only emit when it adds value.
+        if !next.is_empty() {
+            md.push_str("## Next\n\n");
+            let mut seen = std::collections::BTreeSet::<&'static str>::new();
+            let mut emitted = 0usize;
+            for s in next {
+                if emitted >= 3 {
+                    break;
+                }
+                if !seen.insert(s.id) {
+                    continue;
+                }
+                md.push_str("- ");
+                md.push_str(&s.text);
+                md.push('\n');
+                emitted += 1;
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## Notes\n\n");
+        md.push_str("- The Markdown above is a summary view. The canonical JSON payload is always in `structured_content`.\n");
+        md.push_str("- To include full extracted page text per URL, set `include_text=true` (bounded by `max_chars`).\n\n");
 
         md
     }
@@ -3166,6 +3735,10 @@ mod mcp {
             md.push('\n');
         }
         md.push('\n');
+
+        md.push_str("## Notes\n\n");
+        md.push_str("- The Markdown below is a summary view. The canonical JSON payload is always in `structured_content`.\n");
+        md.push_str("- If you want full extracted page text, set `include_text=true` (bounded by `max_chars`).\n\n");
 
         if !ok {
             md.push_str("## Error\n\n");
@@ -3686,6 +4259,11 @@ mod mcp {
         let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
         let configured = payload.get("configured");
         let supported = payload.get("supported");
+        let mcp_toolset = payload
+            .get("mcp_toolset")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
 
         let mut md = String::new();
         md.push_str("## Summary\n\n");
@@ -3696,6 +4274,11 @@ mod mcp {
             md.push_str("- **elapsed_ms**: ");
             md.push_str(&ms.to_string());
             md.push('\n');
+        }
+        if !mcp_toolset.is_empty() {
+            md.push_str("- **mcp_toolset**: `");
+            md.push_str(mcp_toolset);
+            md.push_str("`\n");
         }
         md.push('\n');
 
@@ -3748,6 +4331,11 @@ mod mcp {
                 md.push_str(&tools.len().to_string());
                 md.push('\n');
             }
+            if let Some(vis) = sup.get("mcp_tools_visible").and_then(|v| v.as_array()) {
+                md.push_str("- **mcp_tools_visible**: ");
+                md.push_str(&vis.len().to_string());
+                md.push('\n');
+            }
             if let Some(groups) = sup.get("mcp_tool_groups").and_then(|v| v.as_object()) {
                 md.push_str("- **groups**:\n");
                 for (k, v) in groups.iter() {
@@ -3765,6 +4353,7 @@ mod mcp {
         md.push_str("## Next\n\n");
         md.push_str("- Use `web_search_extract` for retrieval (search + bounded extract).\n");
         md.push_str("- Use `web_extract` for readability-focused extraction.\n");
+        md.push_str("- If the tools list feels too wide in Cursor, set `WEBPIPE_MCP_TOOLSET=normal` (Cursor-first). For debugging, set `WEBPIPE_MCP_TOOLSET=debug`.\n");
         md
     }
 
@@ -4175,6 +4764,14 @@ mod mcp {
             md.push_str("- **docs_returned**: ");
             md.push_str(&n.to_string());
             md.push('\n');
+        }
+        if let Some(d) = payload.get("dedup").and_then(|v| v.as_object()) {
+            let dropped = d.get("dropped").and_then(|v| v.as_u64()).unwrap_or(0);
+            if dropped > 0 {
+                md.push_str("- **dedup_dropped**: ");
+                md.push_str(&dropped.to_string());
+                md.push('\n');
+            }
         }
         if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
             md.push_str("- **elapsed_ms**: ");
@@ -4715,6 +5312,8 @@ mod mcp {
     /// - Query mode (online): set `query`, omit `urls`.
     /// - URLs mode (offline-friendly): set `urls`, optionally set `query` for chunk ranking.
     /// - Offline mode: set `no_network=true` and pass `urls` (cache-only fetch).
+    /// - Cache-corpus mode (offline inspiration): set `no_network=true` and omit `urls`
+    ///   to search over `WEBPIPE_CACHE_DIR` contents.
     ///
     /// Output is JSON (as text + structured_content) with:
     /// - `results[]` (per-URL) and `top_chunks[]` (merged, bounded)
@@ -4746,7 +5345,11 @@ mod mcp {
         /// - "pareto": non-dominated selection across score/cost/warnings (bounded)
         #[serde(default)]
         pub(crate) selection_mode: Option<String>,
-        /// Which fetch backend to use (default: local). Allowed: local, firecrawl
+        /// Which fetch backend to use (default: local). Allowed: local, firecrawl, render
+        ///
+        /// - local: reqwest + cache (best default; supports Tor SOCKS via WEBPIPE_ANON_PROXY in anonymous mode)
+        /// - firecrawl: remote fetch (disabled in anonymous mode)
+        /// - render: Playwright/Chromium render-to-HTML, then normal extraction (JS-heavy pages)
         #[serde(default)]
         pub(crate) fetch_backend: Option<String>,
         /// If true, do not perform any network calls:
@@ -4768,6 +5371,19 @@ mod mcp {
         /// Firecrawl is configured.
         #[serde(default)]
         pub(crate) firecrawl_fallback_on_low_signal: Option<bool>,
+        /// If true, and fetch_backend="local", retry a single URL with Playwright render when local extraction yields empty text.
+        ///
+        /// This is bounded and per-URL (like Firecrawl fallback). It requires Playwright to be installed, and is disabled
+        /// in privacy_mode=offline and in no_network=true.
+        #[serde(default)]
+        pub(crate) render_fallback_on_empty_extraction: Option<bool>,
+        /// If true, and fetch_backend="local", retry a single URL with Playwright render when local extraction
+        /// yields non-empty but clearly low-signal output (e.g. JS bundle/app-shell gunk).
+        ///
+        /// This is bounded and per-URL, and requires Playwright to be installed. It is disabled
+        /// in privacy_mode=offline and in no_network=true.
+        #[serde(default)]
+        pub(crate) render_fallback_on_low_signal: Option<bool>,
         /// Max search results to request (default: 5; max: 20).
         #[serde(default)]
         pub(crate) max_results: Option<usize>,
@@ -4795,19 +5411,19 @@ mod mcp {
         /// Width used for HTML->text extraction (default: 100).
         #[serde(default)]
         pub(crate) width: Option<usize>,
-        /// Max chars of extracted text per URL (default: 20_000; max: 200_000).
+        /// Max chars of extracted text per URL (default: 30_000; max: 200_000).
         #[serde(default)]
         pub(crate) max_chars: Option<usize>,
-        /// Max chunks per URL (default: 5; max: 50).
+        /// Max chunks per URL (default: 8; max: 50).
         #[serde(default)]
         pub(crate) top_chunks: Option<usize>,
-        /// Max chars per chunk (default: 500; max: 5_000).
+        /// Max chars per chunk (default: 800; max: 5_000).
         #[serde(default)]
         pub(crate) max_chunk_chars: Option<usize>,
         /// Include extracted links (default: false).
         #[serde(default)]
         pub(crate) include_links: Option<bool>,
-        /// Include structured extraction (outline + blocks) per URL (default: false).
+        /// Include structured extraction (outline + blocks) per URL (default: true).
         #[serde(default)]
         pub(crate) include_structure: Option<bool>,
         /// Max outline items returned in structure (default: 25; max: 200).
@@ -5336,12 +5952,24 @@ mod mcp {
             let cache_dir = cache_dir_from_env().or_else(|| Some(default_cache_dir()));
             let fetcher = LocalFetcher::new(cache_dir)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let privacy = privacy_mode_from_env();
+            let mut httpb = reqwest::Client::builder().user_agent("webpipe-mcp/0.1");
+            if privacy == PrivacyMode::Anonymous {
+                if let Some(p) = anon_proxy_from_env() {
+                    httpb = httpb
+                        .proxy(reqwest::Proxy::all(p).map_err(|e| {
+                            McpError::invalid_params(
+                                format!("invalid proxy url: {e}"),
+                                Some(serde_json::json!({"code":"invalid_proxy"})),
+                            )
+                        })?);
+                }
+            }
             Ok(Self {
                 prompt_router: Self::prompt_router(),
                 tool_router: Self::tool_router(),
                 fetcher: Arc::new(fetcher),
-                http: reqwest::Client::builder()
-                    .user_agent("webpipe-mcp/0.1")
+                http: httpb
                     .build()
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?,
                 stats: Arc::new(std::sync::Mutex::new(UsageStats::new(now_epoch_s()))),
@@ -6671,11 +7299,47 @@ mod mcp {
                 }
             });
 
+            let ts = mcp_toolset_from_env();
+            let visible_tools: Vec<&'static str> = [
+                "webpipe_meta",
+                "webpipe_usage",
+                "webpipe_usage_reset",
+                "web_seed_urls",
+                "web_seed_search_extract",
+                "web_fetch",
+                "http_fetch",
+                "web_extract",
+                "page_extract",
+                "page_extract_text",
+                "web_explore_extract",
+                "web_sitemap_extract",
+                "repo_ingest",
+                "web_search",
+                "web_search_extract",
+                "search_evidence",
+                "web_cache_search_extract",
+                "web_deep_research",
+                "paper_search",
+                "arxiv_search",
+                "arxiv_enrich",
+            ]
+            .into_iter()
+            .filter(|name| mcp_tool_allowed(name, ts))
+            .collect();
+
             let mut payload = serde_json::json!({
                 "ok": true,
                 "name": "webpipe",
                 "version": env!("CARGO_PKG_VERSION"),
                 "cache_dir": cache_dir_from_env().map(|p| p.to_string_lossy().to_string()),
+                "offline_only": offline_only_enabled(),
+                "privacy_mode": match privacy_mode_from_env() {
+                    PrivacyMode::Normal => "normal",
+                    PrivacyMode::Offline => "offline",
+                    PrivacyMode::Anonymous => "anonymous",
+                },
+                "anon_proxy_configured": anon_proxy_from_env().is_some(),
+                "mcp_toolset": mcp_toolset_name(ts),
                 "binary": {
                     "exe": exe,
                 },
@@ -6698,26 +7362,31 @@ mod mcp {
                         "web_seed_urls",
                         "web_seed_search_extract",
                         "web_fetch",
+                        "http_fetch",
                         "web_extract",
+                        "page_extract",
+                        "page_extract_text",
                         "web_explore_extract",
                         "web_sitemap_extract",
                         "repo_ingest",
                         "web_search",
                         "web_search_extract",
+                        "search_evidence",
                         "web_cache_search_extract",
                         "web_deep_research",
                         "paper_search",
                         "arxiv_search",
                         "arxiv_enrich"
                     ],
+                    "mcp_tools_visible": visible_tools,
                     "mcp_tool_groups": {
                         "meta": ["webpipe_meta", "webpipe_usage", "webpipe_usage_reset"],
                         "seeds": ["web_seed_urls", "web_seed_search_extract"],
-                        "fetch_extract": ["web_fetch", "web_extract"],
+                        "fetch_extract": ["web_fetch", "http_fetch", "web_extract", "page_extract", "page_extract_text"],
                         "explore": ["web_explore_extract"],
                         "sitemap": ["web_sitemap_extract"],
                         "ingest": ["repo_ingest"],
-                        "search": ["web_search", "web_search_extract", "web_cache_search_extract"],
+                        "search": ["web_search", "web_search_extract", "search_evidence", "web_cache_search_extract"],
                         "research": ["web_deep_research", "paper_search", "arxiv_search", "arxiv_enrich"]
                     },
                     // Values for web_search.provider
@@ -6758,6 +7427,12 @@ mod mcp {
                         "WEBPIPE_MEDIA_SUBTITLES",
                         "WEBPIPE_MEDIA_SUBS_TIMEOUT_MS",
                         "WEBPIPE_MEDIA_SUBS_MAX_CHARS",
+                        "WEBPIPE_NODE",
+                        "WEBPIPE_RENDER_DISABLE",
+                        "WEBPIPE_RENDER_CDP_ENDPOINT",
+                        "WEBPIPE_RENDER_USER_DATA_DIR",
+                        "WEBPIPE_RENDER_MAX_HTML_CHARS",
+                        "WEBPIPE_RENDER_HARD_TIMEOUT_MS",
                         "WEBPIPE_VISION",
                         "WEBPIPE_GEMINI_API_KEY",
                         "GEMINI_API_KEY",
@@ -6778,9 +7453,16 @@ mod mcp {
                     // Values for web_search_extract.exploration
                     "explorations": ["balanced", "wide", "deep"],
                     // Values for web_* fetch_backend
-                    "fetch_backends": ["local", "firecrawl"],
+                    "fetch_backends": ["local", "firecrawl", "render"],
                     // Note: firecrawl is a remote fetch backend (used by CLI eval harness and optionally by MCP tools when requested).
                     "remote_fetch": ["firecrawl"],
+                    // Privacy contract (fail closed): which egress policy is intended.
+                    "privacy_modes": ["normal", "offline", "anonymous"],
+                    // Proxy schemes by backend:
+                    // - local: supports socks5h:// (Tor-friendly; DNS via proxy)
+                    // - render: requires an HTTP proxy endpoint (Playwright proxy settings do not support socks5h://)
+                    "anon_proxy_schemes_local": ["socks5h", "socks5", "http", "https"],
+                    "anon_proxy_schemes_render": ["http", "https"],
                     "llm_models": ["sonar-deep-research"],
                     "llm_planner_providers": ["openrouter", "openai", "groq"]
                 },
@@ -6983,9 +7665,13 @@ mod mcp {
                 },
                 "tool_output_summary": {
                     "web_fetch": "Fetch a URL (cache-aware). Returns status/content_type/bytes_len and optional bounded text/headers.",
+                    "http_fetch": "Alias for web_fetch (same args; clearer name in some UIs).",
                     "web_extract": "Fetch+extract readable text/chunks (bounded). Returns extract.engine, text_chars, top_chunks, warnings/hints.",
+                    "page_extract": "Alias for web_extract (same args; clearer name in some UIs).",
+                    "page_extract_text": "Alias for web_extract that forces include_text=true (bounded by max_chars).",
                     "web_search": "Search only (bounded). Returns results[] with url/title/content and provider selection when provider=auto.",
                     "web_search_extract": "Main tool: optional search -> fetch -> extract -> rank top_chunks across URLs (bounded).",
+                    "search_evidence": "Evidence pack (primary): optional search -> fetch -> extract -> rank top_chunks across URLs (bounded).",
                     "web_cache_search_extract": "Cache-only search: scan WEBPIPE_CACHE_DIR -> extract -> top_chunks (no network).",
                     "web_deep_research": "Evidence gatherer + optional synthesis. Prefer include_evidence for auditability.",
                     "arxiv_search": "ArXiv Atom search (bounded). Returns papers[] (and optional semantic rerank metadata).",
@@ -7041,6 +7727,7 @@ mod mcp {
 
         #[tool(
             description = "Curated seed URL registry for keyless/offline-ish workflows (bounded; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebSeedUrlsArgs>()),
             annotations(title = "Seed URLs", read_only_hint = true, open_world_hint = false)
         )]
         async fn web_seed_urls(
@@ -7103,6 +7790,7 @@ mod mcp {
 
         #[tool(
             description = "Fetch+extract a bounded set of seed URLs (or urls=...) and return merged top chunks for a query (cache-aware; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebSeedSearchExtractArgs>()),
             annotations(
                 title = "Seed search+extract",
                 read_only_hint = true,
@@ -7169,6 +7857,35 @@ mod mcp {
                         "Call web_seed_urls to see valid ids, or pass urls=[...] explicitly."
                     ),
                     "unknown_seed_ids": unknown_seed_ids,
+                });
+                add_envelope_fields(
+                    &mut payload,
+                    "web_seed_search_extract",
+                    t0.elapsed().as_millis(),
+                );
+                let md = web_seed_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
+            }
+
+            // Anonymous mode: if we are going to fetch non-localhost URLs, require a proxy unless
+            // the caller explicitly asked for cache-only.
+            if privacy_mode_from_env() == PrivacyMode::Anonymous
+                && !no_network
+                && anon_proxy_from_env().is_none()
+                && urls.iter().any(|(_id, u)| !is_localhost_url(u))
+            {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(
+                        ErrorCode::NotConfigured,
+                        "anonymous mode requires a proxy",
+                        "Set WEBPIPE_ANON_PROXY (recommended for Tor: socks5h://127.0.0.1:9050), or set no_network=true for cache-only runs."
+                    ),
+                    "request": {
+                        "privacy_mode": "anonymous",
+                        "anon_proxy_configured": false,
+                        "no_network": no_network
+                    }
                 });
                 add_envelope_fields(
                     &mut payload,
@@ -7356,6 +8073,7 @@ mod mcp {
 
         #[tool(
             description = "Usage stats since server start: tool calls, warnings, and provider cost units (no secrets; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebpipeUsageArgs>()),
             annotations(
                 title = "Webpipe usage",
                 read_only_hint = true,
@@ -7507,6 +8225,7 @@ mod mcp {
 
         #[tool(
             description = "Search arXiv metadata (Atom API; bounded; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<ArxivSearchArgs>()),
             annotations(title = "arXiv search", read_only_hint = true, open_world_hint = true)
         )]
         async fn arxiv_search(
@@ -7629,6 +8348,7 @@ mod mcp {
 
         #[tool(
             description = "Search academic paper metadata via Semantic Scholar / OpenAlex (and optional Google Scholar via SerpAPI) (bounded; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<PaperSearchArgs>()),
             annotations(title = "Paper search", read_only_hint = true, open_world_hint = true)
         )]
         async fn paper_search(
@@ -7691,6 +8411,7 @@ mod mcp {
 
         #[tool(
             description = "Fetch arXiv paper metadata and optionally find discussion links (bounded; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<ArxivEnrichArgs>()),
             annotations(title = "arXiv enrich", read_only_hint = true, open_world_hint = true)
         )]
         async fn arxiv_enrich(
@@ -7766,6 +8487,7 @@ mod mcp {
 
         #[tool(
             description = "Local crawl: fetch+extract starting from start_url, follow on-page links (bounded), and return merged top chunks (cache-aware; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebExploreExtractArgs>()),
             annotations(
                 title = "Explore+extract",
                 read_only_hint = true,
@@ -7834,6 +8556,33 @@ mod mcp {
             let cache_write = args.cache_write.unwrap_or(true);
             let cache_ttl_s = args.cache_ttl_s;
             let include_links = args.include_links.unwrap_or(false);
+
+            // Anonymous mode: require proxy for non-localhost crawl unless cache-only.
+            if privacy_mode_from_env() == PrivacyMode::Anonymous
+                && !no_network
+                && anon_proxy_from_env().is_none()
+                && !is_localhost_url(&start_url)
+            {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(
+                        ErrorCode::NotConfigured,
+                        "anonymous mode requires a proxy",
+                        "Set WEBPIPE_ANON_PROXY (recommended for Tor: socks5h://127.0.0.1:9050), or set no_network=true for cache-only runs."
+                    ),
+                    "request": {
+                        "privacy_mode": "anonymous",
+                        "anon_proxy_configured": false,
+                        "no_network": no_network
+                    }
+                });
+                add_envelope_fields(
+                    &mut payload,
+                    "web_explore_extract",
+                    t0.elapsed().as_millis(),
+                );
+                return Ok(tool_result(payload));
+            }
 
             fn score_for_query(q_toks: &[&str], url: &str, label: &str) -> u64 {
                 if q_toks.is_empty() {
@@ -8233,6 +8982,7 @@ mod mcp {
 
         #[tool(
             description = "Repo ingest (gitingest-like): list a GitHub repo tree and fetch a bounded set of files as a combined text corpus (bounded; cache-aware; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<RepoIngestArgs>()),
             annotations(title = "Repo ingest", read_only_hint = true, open_world_hint = true)
         )]
         async fn repo_ingest(
@@ -8322,6 +9072,30 @@ mod mcp {
                 .trim()
                 .to_string();
             let github_token = Self::github_token_from_env();
+
+            // Anonymous mode: repo_ingest uses the GitHub API + raw fetches; require proxy unless cache-only.
+            if privacy_mode_from_env() == PrivacyMode::Anonymous
+                && !no_network
+                && anon_proxy_from_env().is_none()
+                && !is_localhost_url(&repo_url)
+            {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(
+                        ErrorCode::NotConfigured,
+                        "anonymous mode requires a proxy",
+                        "Set WEBPIPE_ANON_PROXY (recommended for Tor: socks5h://127.0.0.1:9050), or set no_network=true for cache-only runs (note: repo listing still requires network)."
+                    ),
+                    "request": {
+                        "repo_url": repo_url,
+                        "privacy_mode": "anonymous",
+                        "anon_proxy_configured": false,
+                        "no_network": no_network
+                    }
+                });
+                add_envelope_fields(&mut payload, "repo_ingest", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
 
             if no_network {
                 let mut payload = serde_json::json!({
@@ -8902,6 +9676,7 @@ mod mcp {
 
         #[tool(
             description = "Sitemap discovery: fetch robots.txt/sitemaps (bounded), extract URL list, and optionally extract+rank content for a query (bounded; cache-aware; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebSitemapExtractArgs>()),
             annotations(
                 title = "Sitemap+extract",
                 read_only_hint = true,
@@ -8957,6 +9732,34 @@ mod mcp {
 
             let query = args.query.unwrap_or_default();
             let do_extract = args.extract.unwrap_or_else(|| !query.trim().is_empty());
+
+            // Anonymous mode: require proxy for non-localhost sitemap discovery unless cache-only.
+            if privacy_mode_from_env() == PrivacyMode::Anonymous
+                && !no_network
+                && anon_proxy_from_env().is_none()
+                && !is_localhost_url(&site_url)
+            {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(
+                        ErrorCode::NotConfigured,
+                        "anonymous mode requires a proxy",
+                        "Set WEBPIPE_ANON_PROXY (recommended for Tor: socks5h://127.0.0.1:9050), or set no_network=true for cache-only runs."
+                    ),
+                    "request": {
+                        "site_url": site_url,
+                        "privacy_mode": "anonymous",
+                        "anon_proxy_configured": false,
+                        "no_network": no_network
+                    }
+                });
+                add_envelope_fields(
+                    &mut payload,
+                    "web_sitemap_extract",
+                    t0.elapsed().as_millis(),
+                );
+                return Ok(tool_result(payload));
+            }
 
             fn parse_sitemaps_from_robots(txt: &str) -> Vec<String> {
                 let mut out = Vec::new();
@@ -9232,6 +10035,8 @@ mod mcp {
                         no_network: Some(no_network),
                         firecrawl_fallback_on_empty_extraction: Some(false),
                         firecrawl_fallback_on_low_signal: Some(false),
+                        render_fallback_on_empty_extraction: Some(false),
+                        render_fallback_on_low_signal: Some(false),
                         max_results: if max_results == 0 {
                             None
                         } else {
@@ -9279,9 +10084,22 @@ mod mcp {
         }
 
         #[tool(
-            description = "Search (or use urls) → fetch → extract → rank chunks (bounded; cache-aware; Markdown + structured JSON output)",
+            description = "Primary Cursor workflow: search (optional) → fetch → extract → rank top chunks into an evidence pack.\n\nModes:\n- urls-mode: pass urls=[...] (no web search; best for curated sources)\n- search-mode: pass query=... (uses provider/auto_mode if configured)\n- cache-corpus: pass query=... + no_network=true and omit urls (search over WEBPIPE_CACHE_DIR)\n\nWhat you get (by default):\n- Markdown: Sources + short excerpts + top chunks + “Next” suggestions when blocked/low-signal\n- structured JSON: `results[*].extract.text_preview` (always) + `top_chunks` (always)\n\nFor full page text per URL, set include_text=true (bounded by max_chars).",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebSearchExtractArgs>()),
+            annotations(title = "Evidence pack", read_only_hint = true, open_world_hint = true)
+        )]
+        async fn search_evidence(
+            &self,
+            params: Parameters<Option<WebSearchExtractArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            self.web_search_extract(params).await
+        }
+
+        #[tool(
+            description = "LEGACY NAME (debug mode). Prefer `search_evidence`.\n\nSearch (or use urls) → fetch → extract → rank chunks (bounded; cache-aware; Markdown + structured JSON output). Supports fetch_backend=render for JS-heavy pages (requires Playwright).",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebSearchExtractArgs>()),
             annotations(
-                title = "Search+extract",
+                title = "Search+extract (legacy)",
                 read_only_hint = true,
                 open_world_hint = true
             )
@@ -9293,6 +10111,26 @@ mod mcp {
             let args = params.0.unwrap_or_default();
             self.stats_inc_tool("web_search_extract");
             let t0 = std::time::Instant::now();
+
+            // Cursor UX guardrail: when the user provides `urls=[...]`, agentic discovery should not
+            // silently wander to unrelated hosts (e.g. Wikipedia language variants) and replace the
+            // user's intended sources. We allow discovery *within* the provided hosts.
+            let url_scope_hosts: Option<std::collections::BTreeSet<String>> = args.urls.as_ref().map(|us| {
+                let mut hs = std::collections::BTreeSet::<String>::new();
+                for u in us {
+                    if let Ok(p) = reqwest::Url::parse(u.trim()) {
+                        if let Some(h) = p.host_str() {
+                            let h = h.trim().to_ascii_lowercase();
+                            if !h.is_empty() {
+                                hs.insert(h);
+                            }
+                        }
+                    }
+                }
+                hs
+            }).and_then(|hs| if hs.is_empty() { None } else { Some(hs) });
+            let user_urls_provided = args.urls.is_some();
+            let user_urls_len = args.urls.as_ref().map(|u| u.len()).unwrap_or(0);
 
             // Track which knobs were explicitly provided so presets can fill only defaults.
             let max_results_user = args.max_results.is_some();
@@ -9306,9 +10144,10 @@ mod mcp {
             let timeout_ms = args.timeout_ms.unwrap_or(20_000);
             let max_bytes = args.max_bytes.unwrap_or(5_000_000);
             let width = args.width.unwrap_or(100).clamp(20, 240);
-            let mut max_chars = args.max_chars.unwrap_or(20_000).min(200_000);
-            let mut top_chunks = args.top_chunks.unwrap_or(5).min(50);
-            let mut max_chunk_chars = args.max_chunk_chars.unwrap_or(500).min(5_000);
+            // Defaults tuned for research use cases (more content, more chunks).
+            let mut max_chars = args.max_chars.unwrap_or(30_000).min(200_000);
+            let mut top_chunks = args.top_chunks.unwrap_or(8).min(50);
+            let mut max_chunk_chars = args.max_chunk_chars.unwrap_or(800).min(5_000);
             let include_links = args.include_links.unwrap_or(false);
             let max_links = args.max_links.unwrap_or(25).min(500);
             let include_text = args.include_text.unwrap_or(false);
@@ -9340,6 +10179,172 @@ mod mcp {
             let no_network = args.no_network.unwrap_or(false);
             let cache_read_effective = cache_read || no_network;
             let cache_write_effective = if no_network { false } else { cache_write };
+
+            // Deterministic fail-fast: allow disabling the render backend without relying on runtime
+            // Node/Playwright detection (useful for tests and environments where Node isn't installed).
+            if fetch_backend == "render" {
+                if matches!(
+                    std::env::var("WEBPIPE_RENDER_DISABLE")
+                        .unwrap_or_default()
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "1" | "true" | "yes" | "on"
+                ) {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": error_obj(
+                            ErrorCode::NotConfigured,
+                            "render backend disabled (WEBPIPE_RENDER_DISABLE)",
+                            "Unset WEBPIPE_RENDER_DISABLE to use fetch_backend=\"render\"."
+                        ),
+                        "request": { "fetch_backend": fetch_backend, "no_network": no_network }
+                    });
+                    add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                    let md = web_search_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
+            }
+
+            // Privacy guardrails (fail closed for anonymous mode).
+            let privacy = privacy_mode_from_env();
+            if privacy == PrivacyMode::Offline {
+                // Offline privacy mode: no network egress (except localhost). This is stronger than
+                // the tool-level `no_network` knob; privacy_mode overrides it.
+                if fetch_backend == "firecrawl" || fetch_backend == "render" {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": error_obj(
+                            ErrorCode::NotSupported,
+                            format!("privacy_mode=offline disables fetch_backend=\"{fetch_backend}\""),
+                            "Use fetch_backend=\"local\" with urls pointing to localhost, or set WEBPIPE_PRIVACY_MODE=normal/anonymous."
+                        ),
+                        "request": {
+                            "privacy_mode": "offline",
+                            "fetch_backend": fetch_backend,
+                            "no_network": no_network
+                        }
+                    });
+                    add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                    let md = web_search_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
+                if let Some(urls) = args.urls.as_ref() {
+                    let needs_outbound = urls.iter().any(|u| !is_localhost_url(u));
+                    if needs_outbound {
+                        // Cache-only runs are allowed even for non-localhost URLs.
+                        if no_network {
+                            // ok: cache-only
+                        } else {
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "error": error_obj(
+                                ErrorCode::NotSupported,
+                                "privacy_mode=offline blocks network fetches to non-localhost URLs",
+                                "Use localhost URLs, or warm the cache in normal mode and then use no_network=true with fetch_backend=\"local\"."
+                            ),
+                            "request": { "privacy_mode": "offline", "no_network": no_network }
+                        });
+                        add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                        let md = web_search_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
+                        }
+                    }
+                } else {
+                    // urls omitted:
+                    // - if no_network=true, we can still run cache-corpus mode (handled later).
+                    // - otherwise query mode would require web_search (network-only), which is disabled.
+                    if !no_network {
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "error": error_obj(
+                                ErrorCode::NotSupported,
+                                "privacy_mode=offline disables web_search-based discovery",
+                                "Provide urls=[...] pointing to localhost, or set WEBPIPE_PRIVACY_MODE=normal/anonymous."
+                            ),
+                            "request": { "privacy_mode": "offline", "no_network": no_network }
+                        });
+                        add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                        let md = web_search_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
+                    }
+                }
+            }
+            if privacy == PrivacyMode::Anonymous {
+                if fetch_backend == "firecrawl" {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": error_obj(
+                            ErrorCode::NotSupported,
+                            "anonymous mode disables fetch_backend=\"firecrawl\"",
+                            "Use fetch_backend=\"local\" (routed via WEBPIPE_ANON_PROXY) or set WEBPIPE_PRIVACY_MODE=normal."
+                        ),
+                        "request": {
+                            "privacy_mode": "anonymous",
+                            "fetch_backend": fetch_backend,
+                            "no_network": no_network
+                        }
+                    });
+                    add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                    let md = web_search_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
+                if !no_network && anon_proxy_from_env().is_none() {
+                    // If urls are provided, we will fetch them; require a proxy for any non-localhost URL.
+                    if let Some(urls) = args.urls.as_ref() {
+                        let needs_outbound = urls
+                            .iter()
+                            .any(|u| !is_localhost_url(u));
+                        if needs_outbound {
+                            let mut payload = serde_json::json!({
+                                "ok": false,
+                                "error": error_obj(
+                                    ErrorCode::NotConfigured,
+                                    "anonymous mode requires a proxy",
+                                    if fetch_backend == "render" {
+                                        "Set WEBPIPE_ANON_PROXY to an HTTP proxy (Tor users often run Privoxy), or set WEBPIPE_PRIVACY_MODE=normal."
+                                    } else {
+                                        "Set WEBPIPE_ANON_PROXY (recommended for Tor: socks5h://127.0.0.1:9050) or set WEBPIPE_PRIVACY_MODE=normal."
+                                    }
+                                ),
+                                "request": {
+                                    "privacy_mode": "anonymous",
+                                    "anon_proxy_configured": false,
+                                    "no_network": no_network
+                                }
+                            });
+                            add_envelope_fields(
+                                &mut payload,
+                                "web_search_extract",
+                                t0.elapsed().as_millis(),
+                            );
+                            let md = web_search_extract_markdown(&payload);
+                            return Ok(tool_result_markdown_with_json(payload, md));
+                        }
+                    } else {
+                        // No urls => would require web_search; disallow in anonymous mode.
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "error": error_obj(
+                                ErrorCode::NotSupported,
+                                "anonymous mode disables web_search-based discovery",
+                                "Provide urls=[...] (fetched via WEBPIPE_ANON_PROXY) or use cached/offline workflows, or set WEBPIPE_PRIVACY_MODE=normal."
+                            ),
+                            "request": {
+                                "privacy_mode": "anonymous",
+                                "no_network": no_network
+                            }
+                        });
+                        add_envelope_fields(
+                            &mut payload,
+                            "web_search_extract",
+                            t0.elapsed().as_millis(),
+                        );
+                        let md = web_search_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
+                    }
+                }
+            }
             // Prefer auto_plus by default when we have a query: bounded hint prepass to avoid portals.
             let url_selection_mode = args
                 .url_selection_mode
@@ -9359,6 +10364,19 @@ mod mcp {
                     has_env("WEBPIPE_FIRECRAWL_API_KEY") || has_env("FIRECRAWL_API_KEY");
                 args.firecrawl_fallback_on_low_signal
                     .unwrap_or(configured && fetch_backend == "local")
+            };
+            // Render fallback is always opt-in (never default-on); it can be expensive.
+            let render_fallback_on_empty_extraction = if no_network {
+                false
+            } else {
+                args.render_fallback_on_empty_extraction.unwrap_or(false)
+                    && fetch_backend == "local"
+            };
+            // Default render_fallback_on_low_signal to true for better JS-heavy page handling.
+            let render_fallback_on_low_signal = if no_network {
+                false
+            } else {
+                args.render_fallback_on_low_signal.unwrap_or(true) && fetch_backend == "local"
             };
 
             // Width vs depth preset: only fills in defaults when those fields were not explicitly set.
@@ -9463,7 +10481,10 @@ mod mcp {
                 let md = web_search_extract_markdown(&payload);
                 return Ok(tool_result_markdown_with_json(payload, md));
             }
-            if fetch_backend.as_str() != "local" && fetch_backend.as_str() != "firecrawl" {
+            if fetch_backend.as_str() != "local"
+                && fetch_backend.as_str() != "firecrawl"
+                && fetch_backend.as_str() != "render"
+            {
                 let mut payload = serde_json::json!({
                     "ok": false,
                     "provider": requested_provider,
@@ -9472,8 +10493,25 @@ mod mcp {
                     "error": error_obj(
                         ErrorCode::InvalidParams,
                         "unknown fetch_backend",
-                        "Allowed fetch_backends: local, firecrawl"
+                        "Allowed fetch_backends: local, firecrawl, render"
                     ),
+                });
+                add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                let md = web_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
+            }
+            if no_network && fetch_backend == "render" {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "provider": requested_provider,
+                    "fetch_backend": fetch_backend,
+                    "no_network": true,
+                    "query": args.query.clone().unwrap_or_default(),
+                    "error": error_obj(
+                        ErrorCode::NotSupported,
+                        "no_network=true cannot be used with fetch_backend=\"render\"",
+                        "Render mode uses a headless browser and performs network requests. Use fetch_backend=\"local\" with a warmed WEBPIPE_CACHE_DIR, or set no_network=false."
+                    )
                 });
                 add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
                 let md = web_search_extract_markdown(&payload);
@@ -9544,26 +10582,210 @@ mod mcp {
                 (q, urls)
             } else {
                 if no_network {
+                    let q = args.query.unwrap_or_default().trim().to_string();
+                    if q.is_empty() {
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "mode": "cache",
+                            "provider": "cache",
+                            "query": "",
+                            "error": error_obj(
+                                ErrorCode::InvalidParams,
+                                "no_network=true requires either urls=[...] or a non-empty query",
+                                "Provide urls=[...] for cache-only hydration, or provide query=\"...\" to search the cache corpus."
+                            ),
+                            "request": { "no_network": true }
+                        });
+                        add_envelope_fields(
+                            &mut payload,
+                            "web_search_extract",
+                            t0.elapsed().as_millis(),
+                        );
+                        let md = web_search_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
+                    }
+
+                    let Some(cache_dir) = cache_dir_from_env() else {
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "mode": "cache",
+                            "provider": "cache",
+                            "query": q,
+                            "error": error_obj(
+                                ErrorCode::NotConfigured,
+                                "WEBPIPE_CACHE_DIR is not set",
+                                "Set WEBPIPE_CACHE_DIR (and warm it using web_fetch/web_extract), then retry with no_network=true."
+                            ),
+                            "request": { "no_network": true }
+                        });
+                        add_envelope_fields(
+                            &mut payload,
+                            "web_search_extract",
+                            t0.elapsed().as_millis(),
+                        );
+                        let md = web_search_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
+                    };
+
+                    // Cache-corpus search: bounded, deterministic, offline.
+                    let cache_dir2 = cache_dir.clone();
+                    let q2 = q.clone();
+                    let max_docs = 50usize;
+                    let max_scan_entries = 2000usize;
+                    let max_chars2 = max_chars;
+                    let max_bytes2 = max_bytes;
+                    let width2 = width;
+                    let top_chunks2 = top_chunks;
+                    let max_chunk_chars2 = max_chunk_chars;
+                    let include_structure2 = include_structure;
+                    let max_outline_items2 = max_outline_items;
+                    let max_blocks2 = max_blocks;
+                    let max_block_chars2 = max_block_chars;
+
+                    let r = tokio::task::spawn_blocking(move || {
+                        webpipe_local::cache_search::cache_search_extract(
+                            &cache_dir2,
+                            &q2,
+                            max_docs,
+                            max_chars2,
+                            max_bytes2,
+                            width2,
+                            top_chunks2,
+                            max_chunk_chars2,
+                            include_structure2,
+                            max_outline_items2,
+                            max_blocks2,
+                            max_block_chars2,
+                            include_text,
+                            max_scan_entries,
+                        )
+                    })
+                    .await
+                    .ok()
+                    .unwrap_or_else(|| webpipe_local::cache_search::CacheSearchResult {
+                        ok: false,
+                        scanned_entries: 0,
+                        selected_docs: 0,
+                        results: vec![],
+                        warnings: vec!["cache_search_task_failed"],
+                    });
+
+                    if !r.ok {
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "mode": "cache",
+                            "provider": "cache",
+                            "query": q,
+                            "error": error_obj(
+                                ErrorCode::CacheError,
+                                "cache corpus search failed",
+                                "Ensure WEBPIPE_CACHE_DIR points to a valid webpipe cache dir."
+                            ),
+                            "request": { "no_network": true }
+                        });
+                        add_envelope_fields(
+                            &mut payload,
+                            "web_search_extract",
+                            t0.elapsed().as_millis(),
+                        );
+                        let md = web_search_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
+                    }
+
+                    let mut per_url: Vec<serde_json::Value> = Vec::new();
+                    let mut all_chunks: Vec<ChunkCandidate> = Vec::new();
+
+                    for hit in r.results {
+                        let warns = hit.warnings.clone();
+                        let codes = warning_codes_from(&warns);
+                        let warn_pen = Self::warning_penalty(&warns);
+
+                        // Add chunks into the global pool.
+                        for c in &hit.chunks {
+                            all_chunks.push(ChunkCandidate {
+                                url: hit.final_url.clone(),
+                                score: c.score,
+                                start_char: c.start_char,
+                                end_char: c.end_char,
+                                text: c.text.clone(),
+                                warning_penalty: warn_pen,
+                                cache_hit: true,
+                            });
+                        }
+
+                        per_url.push(serde_json::json!({
+                            "ok": true,
+                            "url": hit.url,
+                            "final_url": hit.final_url,
+                            "status": hit.status,
+                            "content_type": hit.content_type,
+                            "bytes": hit.bytes,
+                            "fetch_backend": "cache",
+                            "attempts": serde_json::Value::Null,
+                            "extract": {
+                                "engine": hit.extraction_engine,
+                                "text_chars": hit.text_chars,
+                                "text_truncated": hit.text_truncated,
+                                "quality": serde_json::Value::Null
+                            },
+                            "warnings": warns,
+                            "warning_codes": codes.clone(),
+                            "warning_hints": warning_hints_from(&codes),
+                            "elapsed_ms": 0
+                        }));
+                    }
+
+                    let selected =
+                        Self::select_top_chunks(all_chunks, top_chunks, selection_mode.as_str());
+                    let top_chunks_out: Vec<serde_json::Value> = selected
+                        .into_iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "url": c.url,
+                                "score": c.score,
+                                "start_char": c.start_char,
+                                "end_char": c.end_char,
+                                "text": c.text
+                            })
+                        })
+                        .collect();
+
                     let mut payload = serde_json::json!({
-                        "ok": false,
-                        "provider": requested_provider,
-                        "auto_mode": requested_auto_mode,
-                        "fetch_backend": fetch_backend,
-                        "no_network": true,
-                        "query": args.query.unwrap_or_default(),
-                        "error": error_obj(
-                            ErrorCode::NotSupported,
-                            "no_network=true requires urls=[...] (search is network-only)",
-                            "Pass urls=[...] to run offline, or set no_network=false."
-                        ),
-                        "request": { "provider": requested_provider, "auto_mode": requested_auto_mode, "max_results": max_results, "max_urls": max_urls }
+                        "ok": true,
+                        "mode": "cache",
+                        "provider": "cache",
+                        "backend_provider": serde_json::Value::Null,
+                        "query": q,
+                        "query_key": Self::query_key(&q),
+                        "request": {
+                            "mode": "cache",
+                            "no_network": true,
+                            "fetch_backend": "local",
+                            "selection_mode": selection_mode,
+                            "max_chars": max_chars,
+                            "top_chunks": top_chunks,
+                            "max_chunk_chars": max_chunk_chars,
+                            "include_text": include_text,
+                            "include_links": include_links,
+                            "include_structure": include_structure,
+                            "max_outline_items": max_outline_items2,
+                            "max_blocks": max_blocks2,
+                            "max_block_chars": max_block_chars2,
+                            "cache": { "read": true, "write": false, "ttl_s": cache_ttl_s },
+                            "compact": compact
+                        },
+                        "url_count_in": 0,
+                        "url_count_used": per_url.len(),
+                        "results": per_url,
+                        "top_chunks": top_chunks_out
                     });
                     add_envelope_fields(
                         &mut payload,
                         "web_search_extract",
                         t0.elapsed().as_millis(),
                     );
-                    return Ok(tool_result(payload));
+                    let md = web_search_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
                 let q = match args.query {
                     Some(q) if !q.trim().is_empty() => q,
@@ -9622,7 +10844,8 @@ mod mcp {
                         "web_search_extract",
                         t0.elapsed().as_millis(),
                     );
-                    return Ok(tool_result(payload));
+                    let md = web_search_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
 
                 search_backend_provider = sv
@@ -9646,18 +10869,77 @@ mod mcp {
                         }
                     }
                 }
-                let cap = if agentic { max_results } else { max_urls };
+                // Search is only for *seed URLs*; the actual exploration happens via bounded
+                // fetch/extract/link expansion. Keep the seed set small and high-signal.
+                let cap = max_urls;
                 let mut out: Vec<String> = Vec::new();
                 let mut dropped_auth = 0usize;
+                let mut dropped_promo = 0usize;
+                let mut dropped_home = 0usize;
                 // Prefer non-auth-wall URLs when we have enough candidates.
                 for u in &out_all {
                     if out.len() >= cap {
                         break;
                     }
-                    if !url_looks_like_auth_or_challenge(u) {
+                    if !url_looks_like_auth_or_challenge(u)
+                        && !url_looks_like_promo_or_tracking(u)
+                        && !url_looks_like_low_value_homepage(u)
+                    {
                         out.push(u.clone());
                     } else {
-                        dropped_auth += 1;
+                        if url_looks_like_auth_or_challenge(u) {
+                            dropped_auth += 1;
+                        } else if url_looks_like_promo_or_tracking(u) {
+                            dropped_promo += 1;
+                        } else if url_looks_like_low_value_homepage(u) {
+                            dropped_home += 1;
+                        }
+                    }
+                }
+                // If we still need URLs, allow promo/tracking/homepage URLs (but still avoid auth walls if possible).
+                if out.len() < cap {
+                    for u in &out_all {
+                        if out.len() >= cap {
+                            break;
+                        }
+                        if out.iter().any(|x| x == u) {
+                            continue;
+                        }
+                        if url_looks_like_auth_or_challenge(u) {
+                            continue;
+                        }
+                        // Prefer returning fewer seeds over adding obvious soft-junk.
+                        // Agentic exploration can expand from good seeds; promo/homepage URLs tend to waste budget.
+                        if out.len() >= 1
+                            && (url_looks_like_promo_or_tracking(u) || url_looks_like_low_value_homepage(u))
+                        {
+                            continue;
+                        }
+                        // Avoid adding a low-value homepage when we already have a non-homepage URL
+                        // from the same host.
+                        if url_looks_like_low_value_homepage(u) {
+                            let Ok(pu) = reqwest::Url::parse(u.trim()) else {
+                                continue;
+                            };
+                            let Some(h) = pu.host_str().map(|s| s.to_ascii_lowercase()) else {
+                                continue;
+                            };
+                            let mut already_have_same_host = false;
+                            for e in &out {
+                                if let Ok(pe) = reqwest::Url::parse(e.trim()) {
+                                    if pe.host_str().map(|s| s.to_ascii_lowercase()) == Some(h.clone())
+                                        && !url_looks_like_low_value_homepage(e)
+                                    {
+                                        already_have_same_host = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if already_have_same_host {
+                                continue;
+                            }
+                        }
+                        out.push(u.clone());
                     }
                 }
                 // If we still need URLs, allow auth-wall URLs as a fallback (better than returning nothing).
@@ -9686,6 +10968,8 @@ mod mcp {
                     "providers": sv.get("providers").cloned().unwrap_or(serde_json::Value::Null),
                     "selection": sv.get("selection").cloned().unwrap_or(serde_json::Value::Null),
                     "auth_wall_urls_skipped": dropped_auth,
+                    "promo_or_tracking_urls_skipped": dropped_promo,
+                    "homepage_urls_skipped": dropped_home,
                 }));
                 search_rounds = 1;
 
@@ -10391,6 +11675,7 @@ Rules:
                     bytes_len,
                     truncated,
                     fetch_source,
+                    used_render_fallback,
                     used_firecrawl_fallback,
                     extracted_obj,
                 ) = if let Some(fc) = if use_firecrawl_agentic {
@@ -10448,6 +11733,7 @@ Rules:
                         false,
                         "network",
                         false,
+                        false,
                         webpipe_local::extract::ExtractedText {
                             engine: "firecrawl",
                             text: md,
@@ -10490,7 +11776,145 @@ Rules:
                     let arxiv_attempts0 = arxiv_attempts;
                     let fetch_url0 = fetch_url.clone();
 
-                    let mut fetched = if no_network {
+                    let mut fetched = if fetch_backend == "render" {
+                        // Render mode: Playwright/Chromium render-to-HTML, then treat as text/html.
+                        //
+                        // In anonymous mode, require a configured proxy for non-localhost URLs.
+                        // Playwright's proxy settings do not support socks5h://; require an HTTP proxy.
+                        let pm = privacy_mode_from_env();
+                        let anon_proxy = anon_proxy_from_env();
+                        let proxy_for_render = if matches!(pm, PrivacyMode::Anonymous)
+                            && !is_localhost_url(fetch_url0.as_str())
+                        {
+                            let Some(p) = anon_proxy.as_deref() else {
+                                self.stats_record_fetch_backend(
+                                    "render",
+                                    false,
+                                    per_t0.elapsed().as_millis() as u64,
+                                    Some("missing_anon_proxy"),
+                                );
+                                per_url.push(serde_json::json!({
+                                    "url": url,
+                                    "ok": false,
+                                    "stage": "fetch",
+                                    "fetch_backend": "render",
+                                    "error": error_obj(
+                                        ErrorCode::NotConfigured,
+                                        "anonymous mode requires a proxy for fetch_backend=\"render\"",
+                                        "Set WEBPIPE_ANON_PROXY to an HTTP proxy endpoint (Tor users often run Privoxy)."
+                                    ),
+                                    "elapsed_ms": per_t0.elapsed().as_millis()
+                                }));
+                                continue;
+                            };
+                            let pl = p.trim().to_ascii_lowercase();
+                            if pl.starts_with("socks5h://") {
+                                self.stats_record_fetch_backend(
+                                    "render",
+                                    false,
+                                    per_t0.elapsed().as_millis() as u64,
+                                    Some("socks5h_not_supported_by_playwright"),
+                                );
+                                per_url.push(serde_json::json!({
+                                    "url": url,
+                                    "ok": false,
+                                    "stage": "fetch",
+                                    "fetch_backend": "render",
+                                    "error": error_obj(
+                                        ErrorCode::NotSupported,
+                                        "socks5h:// proxies are not supported by Playwright proxy settings",
+                                        "Use an HTTP proxy endpoint, or convert Tor SOCKS to HTTP (e.g. via Privoxy), then set WEBPIPE_ANON_PROXY to that HTTP proxy URL."
+                                    ),
+                                    "elapsed_ms": per_t0.elapsed().as_millis()
+                                }));
+                                continue;
+                            }
+                            Some(p)
+                        } else {
+                            None
+                        };
+
+                        let pr = match webpipe_local::render_playwright::render_html_playwright(
+                            fetch_url0.as_str(),
+                            timeout_ms,
+                            proxy_for_render,
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let msg = e.to_string();
+                                self.stats_record_fetch_backend(
+                                    "render",
+                                    false,
+                                    per_t0.elapsed().as_millis() as u64,
+                                    Some(msg.as_str()),
+                                );
+                                let (code, hint) = match &e {
+                                    WebpipeError::NotConfigured(_) => (
+                                        ErrorCode::NotConfigured,
+                                        "Install Playwright (Node) + browsers, or set fetch_backend=\"local\" for non-JS pages.",
+                                    ),
+                                    WebpipeError::InvalidUrl(_) => (
+                                        ErrorCode::InvalidUrl,
+                                        "Check that the URL is absolute (includes http/https) and is well-formed.",
+                                    ),
+                                    WebpipeError::NotSupported(_) => (
+                                        ErrorCode::NotSupported,
+                                        "This render operation is not supported by the current privacy/proxy configuration.",
+                                    ),
+                                    _ => (
+                                        ErrorCode::FetchFailed,
+                                        "Playwright render failed for this URL. Try a longer timeout_ms or set fetch_backend=\"local\".",
+                                    ),
+                                };
+                                per_url.push(serde_json::json!({
+                                    "url": url,
+                                    "ok": false,
+                                    "stage": "fetch",
+                                    "fetch_backend": "render",
+                                    "error": error_obj(
+                                        code,
+                                        msg,
+                                        hint
+                                    ),
+                                    "elapsed_ms": per_t0.elapsed().as_millis()
+                                }));
+                                continue;
+                            }
+                        };
+
+                        self.stats_record_fetch_backend(
+                            "render",
+                            true,
+                            per_t0.elapsed().as_millis() as u64,
+                            None,
+                        );
+                        attempts = serde_json::json!({
+                            "render": {
+                                "ok": true,
+                                "backend": "playwright",
+                                "mode": pr.mode,
+                                "elapsed_ms": pr.elapsed_ms,
+                                "console_error_count": pr.console_error_count
+                            }
+                        });
+                        webpipe_core::FetchResponse {
+                            url: fetch_url0.clone(),
+                            final_url: pr.final_url,
+                            status: pr.status.unwrap_or(200),
+                            content_type: Some("text/html".to_string()),
+                            headers: BTreeMap::new(),
+                            bytes: pr.html.into_bytes(),
+                            truncated: false,
+                            source: webpipe_core::FetchSource::Network,
+                            timings_ms: {
+                                let mut m = BTreeMap::new();
+                                m.insert("playwright_render".to_string(), pr.elapsed_ms as u128);
+                                m
+                            },
+                        }
+                    } else if no_network {
                         match self.fetcher.cache_get(&req) {
                             Ok(Some(r)) => r,
                             Ok(None) => {
@@ -10574,7 +11998,12 @@ Rules:
                     // intentionally to limit bandwidth/latency.
                     let mut local_attempt_obj: Option<serde_json::Value> = None;
                     let mut local_retry_obj: Option<serde_json::Value> = None;
-                    if !no_network && retry_on_truncation && fetched.truncated && max_bytes > 0 {
+                    if fetch_backend == "local"
+                        && !no_network
+                        && retry_on_truncation
+                        && fetched.truncated
+                        && max_bytes > 0
+                    {
                         let retry_cap_default = max_bytes.saturating_mul(2);
                         let retry_cap = truncation_retry_max_bytes
                             .unwrap_or(retry_cap_default)
@@ -10698,7 +12127,7 @@ Rules:
                     } else {
                         fetched.text_lossy()
                     };
-                    let local_extracted_obj = webpipe_local::extract::best_effort_text_from_bytes(
+                    let mut local_extracted_obj = webpipe_local::extract::best_effort_text_from_bytes(
                         &fetched.bytes,
                         local_content_type.as_deref(),
                         &local_final_url,
@@ -10712,7 +12141,135 @@ Rules:
                         && local_text_chars > 0
                         && Self::looks_like_bundle_gunk(&local_extracted_obj.text);
 
-                    if (local_empty_extraction && firecrawl_fallback_on_empty_extraction)
+                    if let Some(render_tuple) = {
+                        let wants_render = (local_empty_extraction && render_fallback_on_empty_extraction)
+                            || (local_low_signal && render_fallback_on_low_signal);
+                        if !wants_render {
+                            None
+                        } else if matches!(privacy_mode_from_env(), PrivacyMode::Offline) {
+                            local_extracted_obj.warnings.push("render_fallback_not_supported");
+                            None
+                        } else if matches!(
+                            std::env::var("WEBPIPE_RENDER_DISABLE")
+                                .unwrap_or_default()
+                                .trim()
+                                .to_ascii_lowercase()
+                                .as_str(),
+                            "1" | "true" | "yes" | "on"
+                        ) {
+                            local_extracted_obj.warnings.push("render_fallback_disabled");
+                            None
+                        } else {
+                            let pm = privacy_mode_from_env();
+                            let anon_proxy = anon_proxy_from_env();
+                            let requires_proxy = matches!(pm, PrivacyMode::Anonymous)
+                                && !is_localhost_url(fetch_url0.as_str());
+                            let proxy_for_render: Option<&str> = if requires_proxy {
+                                match anon_proxy.as_deref() {
+                                    Some(p) => {
+                                        let pl = p.trim().to_ascii_lowercase();
+                                        if pl.starts_with("socks5h://") {
+                                            local_extracted_obj
+                                                .warnings
+                                                .push("render_fallback_not_supported");
+                                            None
+                                        } else {
+                                            Some(p)
+                                        }
+                                    }
+                                    None => {
+                                        local_extracted_obj
+                                            .warnings
+                                            .push("render_fallback_not_configured");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            if requires_proxy && proxy_for_render.is_none() {
+                                None
+                            } else {
+                                match webpipe_local::render_playwright::render_html_playwright(
+                                    fetch_url0.as_str(),
+                                    timeout_ms,
+                                    proxy_for_render,
+                                )
+                                .await
+                                {
+                                Ok(pr) => {
+                                    let html = pr.html;
+                                    let bytes = html.as_bytes().to_vec();
+                                    let bytes_len = bytes.len();
+                                    let mut a = serde_json::Map::new();
+                                    a.insert(
+                                        "local".to_string(),
+                                        serde_json::json!({
+                                            "ok": true,
+                                            "final_url": local_final_url,
+                                            "status": local_status,
+                                            "content_type": local_content_type,
+                                            "bytes": local_bytes_len,
+                                            "truncated": local_truncated,
+                                            "source": local_source,
+                                            "empty_extraction": local_empty_extraction,
+                                            "low_signal": local_low_signal
+                                        }),
+                                    );
+                                    if let Some(obj) = local_retry_obj.take() {
+                                        a.insert("local_retry".to_string(), obj);
+                                    }
+                                    a.insert(
+                                        "render_fallback".to_string(),
+                                        serde_json::json!({
+                                            "ok": true,
+                                            "backend": "playwright",
+                                            "mode": pr.mode,
+                                            "elapsed_ms": pr.elapsed_ms,
+                                            "console_error_count": pr.console_error_count,
+                                            "bytes": bytes_len
+                                        }),
+                                    );
+                                    attempts = serde_json::Value::Object(a);
+
+                                    let mut extracted0 =
+                                        webpipe_local::extract::best_effort_text_from_bytes(
+                                            bytes.as_ref(),
+                                            Some("text/html"),
+                                            pr.final_url.as_str(),
+                                            width,
+                                            500,
+                                        );
+                                    extracted0.warnings.push(if local_empty_extraction {
+                                        "render_fallback_on_empty_extraction"
+                                    } else {
+                                        "render_fallback_on_low_signal"
+                                    });
+                                    Some((
+                                        html,
+                                        bytes,
+                                        pr.final_url,
+                                        pr.status.unwrap_or(200),
+                                        Some("text/html".to_string()),
+                                        bytes_len,
+                                        false,
+                                        "network",
+                                        true,
+                                        false,
+                                        extracted0,
+                                    ))
+                                }
+                                    Err(_) => {
+                                        local_extracted_obj.warnings.push("render_fallback_failed");
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                    } {
+                        render_tuple
+                    } else if (local_empty_extraction && firecrawl_fallback_on_empty_extraction)
                         || (local_low_signal && firecrawl_fallback_on_low_signal)
                     {
                         if let Some(fc) = firecrawl_fallback.as_ref() {
@@ -10762,6 +12319,7 @@ Rules:
                                         fc_bytes,
                                         false,
                                         "network",
+                                        false,
                                         true,
                                         webpipe_local::extract::ExtractedText {
                                             engine: "firecrawl",
@@ -10816,6 +12374,7 @@ Rules:
                                         local_truncated,
                                         local_source,
                                         false,
+                                        false,
                                         local_extracted_obj,
                                     )
                                 }
@@ -10862,6 +12421,7 @@ Rules:
                                 local_truncated,
                                 local_source,
                                 false,
+                                false,
                                 local_extracted_obj,
                             )
                         }
@@ -10894,6 +12454,7 @@ Rules:
                             local_bytes_len,
                             local_truncated,
                             local_source,
+                            false,
                             false,
                             local_extracted_obj,
                         )
@@ -11110,6 +12671,8 @@ Rules:
                     .map(|s| s.as_str());
                 if looks_like_js_challenge(status, &extracted_obj.text, title_opt) {
                     warnings.push("blocked_by_js_challenge");
+                } else if looks_like_silent_throttle(status, &extracted_obj.text, title_opt) {
+                    warnings.push("silently_throttled");
                 }
                 if extracted_obj.engine == "html_main"
                     && bytes_len >= 50_000
@@ -11143,6 +12706,9 @@ Rules:
                     stuck_streak = 0;
                 }
                 if warnings.contains(&"blocked_by_js_challenge") {
+                    stuck_streak = stuck_streak.saturating_add(1);
+                }
+                if warnings.contains(&"silently_throttled") {
                     stuck_streak = stuck_streak.saturating_add(1);
                 }
 
@@ -11182,10 +12748,25 @@ Rules:
                     });
                 }
 
+                // Always include a small preview so query-mode returns “actual content”
+                // without requiring include_text=true (which can be large).
+                //
+                // Keep this single-line and bounded to stay Cursor-friendly.
+                let cap = 700usize;
+                let mut text_preview: String = text.chars().take(cap).collect();
+                text_preview = text_preview.split_whitespace().collect::<Vec<_>>().join(" ");
+                let text_preview_truncated = text.chars().count() > cap;
+
                 let mut one = serde_json::json!({
                     "url": url,
                     "ok": true,
-                    "fetch_backend": if used_firecrawl_fallback || used_firecrawl_agentic { "firecrawl" } else { fetch_backend.as_str() },
+                    "fetch_backend": if used_firecrawl_fallback || used_firecrawl_agentic {
+                        "firecrawl"
+                    } else if used_render_fallback {
+                        "render"
+                    } else {
+                        fetch_backend.as_str()
+                    },
                     "final_url": final_url,
                     "status": status,
                     "content_type": content_type,
@@ -11200,6 +12781,8 @@ Rules:
                         "max_chars": max_chars,
                         "text_chars": text_chars,
                         "text_truncated": text_clipped,
+                        "text_preview": text_preview,
+                        "text_preview_truncated": text_preview_truncated,
                         "top_chunks": top_chunks,
                         "max_chunk_chars": max_chunk_chars,
                         "chunks": chunks
@@ -11287,7 +12870,14 @@ Rules:
                 // This should work for:
                 // - HTML extraction engines (html2text/html_main/html_hint)
                 // - Firecrawl fallback (markdown) and markdown-ish content
-                if agentic && fetch_backend == "local" && !is_pdf_like {
+                // Cursor-first heuristic:
+                // - When the user provided multiple `urls=[...]`, do NOT expand beyond those URLs;
+                //   the user is already curating sources, and link-walking can drift to login/CTA pages.
+                // - When `urls` were not provided (search-mode), or exactly one URL was provided
+                //   (portal->article), expansion is allowed (bounded by frontier_max).
+                let allow_agentic_expansion =
+                    agentic && fetch_backend == "local" && !is_pdf_like && (!user_urls_provided || user_urls_len <= 1);
+                if allow_agentic_expansion {
                     let base = Some(final_url.as_str());
                     let ct0 = content_type
                         .as_deref()
@@ -11324,6 +12914,25 @@ Rules:
                         let u = cand.url;
                         if frontier.len() >= frontier_max {
                             break;
+                        }
+                        // Drop obvious auth/challenge/tracking/homepage URLs from discovery.
+                        if url_looks_like_auth_or_challenge(&u)
+                            || url_looks_like_promo_or_tracking(&u)
+                            || url_looks_like_low_value_homepage(&u)
+                        {
+                            continue;
+                        }
+                        if let Some(ref hs) = url_scope_hosts {
+                            // Only allow discovery within the user's provided host set.
+                            let Ok(p) = reqwest::Url::parse(u.trim()) else {
+                                continue;
+                            };
+                            let Some(h) = p.host_str() else {
+                                continue;
+                            };
+                            if !hs.contains(&h.to_ascii_lowercase()) {
+                                continue;
+                            }
                         }
                         if let Some(k) = canonicalize_url_no_frag(&u) {
                             if seen_frontier.insert(k.clone()) {
@@ -11418,15 +13027,24 @@ Rules:
                 })
                 .collect();
 
+            let mode = if search_steps.is_empty() { "urls" } else { "search" };
+            let provider_out = if mode == "urls" {
+                "urls".to_string()
+            } else {
+                requested_provider.clone()
+            };
+
             let mut payload = serde_json::json!({
                 "ok": true,
-                "provider": "web_search_extract",
+                "mode": mode,
+                "provider": provider_out,
                 "query": query,
                 "request": {
                     "provider": requested_provider,
                         "auto_mode": requested_auto_mode,
                     "selection_mode": selection_mode,
                     "exploration": exploration,
+                    "fetch_backend": fetch_backend,
                     "max_results": max_results,
                     "max_urls": max_urls,
                     "url_selection_mode": url_selection_mode,
@@ -11448,6 +13066,8 @@ Rules:
                         "no_network": no_network,
                     "firecrawl_fallback_on_empty_extraction": firecrawl_fallback_on_empty_extraction,
                     "firecrawl_fallback_on_low_signal": firecrawl_fallback_on_low_signal,
+                    "render_fallback_on_empty_extraction": render_fallback_on_empty_extraction,
+                    "render_fallback_on_low_signal": render_fallback_on_low_signal,
                     "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": cache_ttl_s },
                     "compact": compact
                 },
@@ -11461,6 +13081,16 @@ Rules:
             }
             if let Some(ref k) = query_key {
                 payload["query_key"] = serde_json::json!(k);
+            }
+            // If fetch_backend="render" is requested but nothing succeeded, fail closed with a
+            // clear top-level error. This avoids confusing "ok=true but empty results" outcomes.
+            if fetch_backend == "render" && per_url.iter().all(|v| v.get("ok").and_then(|b| b.as_bool()) != Some(true)) {
+                payload["ok"] = serde_json::json!(false);
+                payload["error"] = error_obj(
+                    ErrorCode::NotConfigured,
+                    "render backend is not configured (no URLs succeeded)",
+                    "Install Playwright (Node) + browsers, or set fetch_backend=\"local\" for non-JS pages."
+                );
             }
             // E2E/debugging: always surface which provider actually supplied results, even when
             // the requested provider was "auto" or "merge".
@@ -11521,6 +13151,117 @@ Rules:
                     );
                 }
             }
+
+            // Aggregate per-source warning codes to a small top-level summary so agents/UI
+            // don’t need to scan the full results array to notice that something went wrong.
+            //
+            // Keep this bounded and stable: add `warning_codes` + `warning_hints` + `warning_summary`.
+            let mut warn_counts = std::collections::BTreeMap::<String, u64>::new();
+            for r in &per_url {
+                if let Some(codes) = r.get("warning_codes").and_then(|v| v.as_array()) {
+                    for c in codes.iter().filter_map(|v| v.as_str()) {
+                        let cc = normalize_warning_code(c).to_string();
+                        if cc.is_empty() {
+                            continue;
+                        }
+                        *warn_counts.entry(cc).or_insert(0) += 1;
+                    }
+                }
+                if let Some(ws) = r.get("warnings").and_then(|v| v.as_array()) {
+                    for w in ws.iter().filter_map(|v| v.as_str()) {
+                        let cc = normalize_warning_code(w).to_string();
+                        if cc.is_empty() {
+                            continue;
+                        }
+                        *warn_counts.entry(cc).or_insert(0) += 1;
+                    }
+                }
+            }
+            if !warn_counts.is_empty() {
+                fn is_actionable_warning_code(code: &str) -> bool {
+                    match code {
+                        // Very common, usually not worth surfacing as a top-level "warning".
+                        "boilerplate_reduced" => false,
+                        // Informational / workflow notes (still available per-source + in warning_summary).
+                        "cache_doc_reused" => false,
+                        "cache_only" => false,
+                        "tavily_used" => false,
+                        _ => true,
+                    }
+                }
+                fn severity_rank(code: &str) -> u8 {
+                    match code {
+                        "blocked_by_js_challenge" => 0,
+                        "render_fallback_failed" => 1,
+                        "render_fallback_not_supported" => 1,
+                        "render_fallback_not_configured" => 1,
+                        "empty_extraction" => 2,
+                        "all_chunks_low_signal" => 3,
+                        "main_content_low_signal" => 4,
+                        "chunks_filtered_low_signal" => 5,
+                        "body_truncated_by_max_bytes" => 6,
+                        _ => 9,
+                    }
+                }
+
+                let total_events: u64 = warn_counts.values().copied().sum();
+                let mut codes = warn_counts.keys().cloned().collect::<Vec<_>>();
+                codes.sort_by(|a, b| {
+                    let ra = severity_rank(a);
+                    let rb = severity_rank(b);
+                    if ra != rb {
+                        return ra.cmp(&rb);
+                    }
+                    let ca = warn_counts.get(a).copied().unwrap_or(0);
+                    let cb = warn_counts.get(b).copied().unwrap_or(0);
+                    // Higher count first for same severity.
+                    cb.cmp(&ca).then_with(|| a.cmp(b))
+                });
+
+                let actionable_codes = codes
+                    .iter()
+                    .filter(|c| is_actionable_warning_code(c))
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                // Merge into any existing top-level warning_codes (e.g. tool-level warnings).
+                let mut merged = std::collections::BTreeSet::<String>::new();
+                if let Some(arr) = payload.get("warning_codes").and_then(|v| v.as_array()) {
+                    for x in arr.iter().filter_map(|v| v.as_str()) {
+                        let s = normalize_warning_code(x).to_string();
+                        if !s.is_empty() {
+                            merged.insert(s);
+                        }
+                    }
+                }
+                for c in &actionable_codes {
+                    merged.insert(c.clone());
+                }
+
+                let merged_vec = merged.into_iter().collect::<Vec<_>>();
+                payload["warning_codes"] = serde_json::json!(merged_vec);
+
+                let codes_ref = actionable_codes
+                    .iter()
+                    .take(12)
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>();
+                payload["warning_hints"] = warning_hints_from(&codes_ref);
+
+                let actionable_counts = warn_counts
+                    .iter()
+                    .filter(|(k, _)| is_actionable_warning_code(k))
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+
+                payload["warning_summary"] = serde_json::json!({
+                    "total": total_events,
+                    "unique": warn_counts.len(),
+                    "counts": warn_counts,
+                    "actionable_unique": actionable_counts.len(),
+                    "actionable_counts": actionable_counts,
+                });
+            }
             add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
             let md = web_search_extract_markdown(&payload);
             Ok(tool_result_markdown_with_json(payload, md))
@@ -11528,6 +13269,7 @@ Rules:
 
         #[tool(
             description = "Cache-only retrieval: scan WEBPIPE_CACHE_DIR and extract matches for a query (offline; bounded; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebCacheSearchExtractArgs>()),
             annotations(
                 title = "Cache search+extract",
                 read_only_hint = true,
@@ -11622,6 +13364,165 @@ Rules:
 
             let mut results_json =
                 serde_json::to_value(&r.results).unwrap_or_else(|_| serde_json::json!([]));
+
+            // Deduplicate repeated URLs (cache search can emit multiple entries per URL).
+            // This keeps offline workflows from feeling "broken" (same URL repeated many times).
+            let mut dedup_stats: Option<(usize, usize)> = None;
+            if let Some(arr) = results_json.as_array_mut() {
+                let before = arr.len();
+                fn key_for(one: &serde_json::Value) -> Option<String> {
+                    // Prefer the user-facing `url` field for dedup: cache search is a UX tool,
+                    // and repeated visible URLs feel broken even if `final_url` differs.
+                    let u = one
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| one.get("final_url").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .trim();
+                    if u.is_empty() {
+                        return None;
+                    }
+                    // Best-effort canonicalization: drop fragment (and keep the rest).
+                    // We deliberately keep the query string, because it can meaningfully identify
+                    // distinct pages in some doc sites.
+                    let canon = reqwest::Url::parse(u)
+                        .ok()
+                        .map(|mut x| {
+                            x.set_fragment(None);
+                            x.to_string()
+                        })
+                        .unwrap_or_else(|| u.to_string());
+                    Some(canon)
+                }
+
+                fn merge_str_array(dst: &mut serde_json::Value, src: &serde_json::Value) {
+                    let Some(dst_arr) = dst.as_array_mut() else { return };
+                    let Some(src_arr) = src.as_array() else { return };
+                    let mut seen = std::collections::BTreeSet::<String>::new();
+                    for v in dst_arr.iter() {
+                        if let Some(s) = v.as_str() {
+                            seen.insert(s.to_string());
+                        }
+                    }
+                    for v in src_arr {
+                        if let Some(s) = v.as_str() {
+                            if seen.insert(s.to_string()) {
+                                dst_arr.push(serde_json::json!(s));
+                            }
+                        }
+                    }
+                }
+
+                fn chunk_key(c: &serde_json::Value) -> String {
+                    let sc = c.get("start_char").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let ec = c.get("end_char").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let t = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    format!("{sc}:{ec}:{t}")
+                }
+
+                // Merge docs by canonical URL.
+                let mut merged: std::collections::BTreeMap<String, serde_json::Value> =
+                    std::collections::BTreeMap::new();
+                for one in arr.drain(..) {
+                    let Some(k) = key_for(&one) else { continue };
+                    if let Some(prev) = merged.get_mut(&k) {
+                        // Prefer higher score and fresher fetched timestamp.
+                        let prev_score = prev.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let one_score = one.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        if one_score > prev_score {
+                            prev.as_object_mut()
+                                .map(|m| m.insert("score".to_string(), serde_json::json!(one_score)));
+                        }
+                        let prev_ts = prev
+                            .get("fetched_at_epoch_s")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let one_ts = one
+                            .get("fetched_at_epoch_s")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if one_ts > prev_ts {
+                            prev.as_object_mut().map(|m| {
+                                if let Some(v) = one.get("fetched_at_epoch_s") {
+                                    m.insert("fetched_at_epoch_s".to_string(), v.clone());
+                                }
+                            });
+                        }
+
+                        // Merge warnings.
+                        if prev.get("warnings").is_some() || one.get("warnings").is_some() {
+                            let mut dst = prev
+                                .get("warnings")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!([]));
+                            let src = one.get("warnings").cloned().unwrap_or_else(|| serde_json::json!([]));
+                            merge_str_array(&mut dst, &src);
+                            prev.as_object_mut()
+                                .map(|m| m.insert("warnings".to_string(), dst));
+                        }
+
+                        // Merge chunks (dedupe by (start,end,text)).
+                        if prev.get("chunks").is_some() || one.get("chunks").is_some() {
+                            let mut dst = prev
+                                .get("chunks")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!([]));
+                            let src = one.get("chunks").cloned().unwrap_or_else(|| serde_json::json!([]));
+                            if let (Some(dst_arr), Some(src_arr)) = (dst.as_array_mut(), src.as_array())
+                            {
+                                let mut seen = std::collections::BTreeSet::<String>::new();
+                                for c in dst_arr.iter() {
+                                    seen.insert(chunk_key(c));
+                                }
+                                for c in src_arr {
+                                    let ck = chunk_key(c);
+                                    if seen.insert(ck) {
+                                        dst_arr.push(c.clone());
+                                    }
+                                }
+                                // Keep chunks in a stable, score-desc order when available.
+                                dst_arr.sort_by(|a, b| {
+                                    let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                            }
+                            prev.as_object_mut()
+                                .map(|m| m.insert("chunks".to_string(), dst));
+                        }
+                    } else {
+                        merged.insert(k, one);
+                    }
+                }
+
+                let mut out: Vec<serde_json::Value> = merged.into_values().collect();
+                out.sort_by(|a, b| {
+                    let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    sb.partial_cmp(&sa)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            let ua = a
+                                .get("final_url")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| a.get("url").and_then(|v| v.as_str()))
+                                .unwrap_or("");
+                            let ub = b
+                                .get("final_url")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| b.get("url").and_then(|v| v.as_str()))
+                                .unwrap_or("");
+                            ua.cmp(ub)
+                        })
+                });
+                out.truncate(max_docs as usize);
+                *arr = out;
+                let after = arr.len();
+                if after != before {
+                    dedup_stats = Some((before, after));
+                }
+            }
+
             if semantic_rerank {
                 if let Some(arr) = results_json.as_array_mut() {
                     let use_embeddings = Self::openrouter_api_key_from_env().is_some();
@@ -11797,6 +13698,13 @@ Rules:
                     "compact": compact
                 }
             });
+            if let Some((before, after)) = dedup_stats {
+                payload["dedup"] = serde_json::json!({
+                    "before": before,
+                    "after": after,
+                    "dropped": before.saturating_sub(after)
+                });
+            }
             if semantic_rerank {
                 let sem_probe = webpipe_local::semantic::semantic_rerank_chunks(&query, &[], 1);
                 let codes: Vec<&'static str> = sem_probe
@@ -11832,6 +13740,7 @@ Rules:
 
         #[tool(
             description = "Agentic research: gather evidence (search+extract) and optionally synthesize an answer (bounded; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebDeepResearchArgs>()),
             annotations(title = "Deep research", read_only_hint = true, open_world_hint = true)
         )]
         async fn web_deep_research(
@@ -12056,6 +13965,8 @@ Rules:
                         firecrawl_fallback_on_empty_extraction,
                     ),
                     firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
                     max_results: Some(max_results),
                     max_urls: Some(max_urls),
                     timeout_ms: Some(timeout_ms),
@@ -13012,6 +14923,7 @@ Rules:
 
         #[tool(
             description = "Fetch a URL (cache-first; bounded; optional text/headers; safety drops auth/cookie headers; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebFetchArgs>()),
             annotations(title = "Fetch URL", read_only_hint = true, open_world_hint = true)
         )]
         async fn web_fetch(
@@ -13024,6 +14936,80 @@ Rules:
             let include_text = args.include_text.unwrap_or(false);
             let max_text_chars = args.max_text_chars.unwrap_or(20_000).min(200_000);
             let fetch_backend = args.fetch_backend.unwrap_or_else(|| "local".to_string());
+            let url = args.url.clone().unwrap_or_default();
+            let privacy = privacy_mode_from_env();
+
+            // Offline-only mode: never allow non-localhost fetches. (But keep invalid_params
+            // behavior higher priority so empty/invalid URLs remain stable.)
+            let offline_only = privacy == PrivacyMode::Offline;
+            if offline_only && !url.trim().is_empty() && !is_localhost_url(&url) {
+                let t0 = std::time::Instant::now();
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "url": url,
+                    "error": error_obj(
+                        ErrorCode::NotSupported,
+                        "offline-only mode forbids non-localhost fetches",
+                        "Set WEBPIPE_OFFLINE_ONLY=0 (or fetch via localhost fixtures / warmed cache with no_network=true)."
+                    ),
+                    "request": {
+                        "fetch_backend": fetch_backend,
+                        "offline_only": true
+                    }
+                });
+                add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
+                let md = web_fetch_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
+            }
+
+            if privacy == PrivacyMode::Anonymous {
+                // Require proxy for non-localhost outbound fetches.
+                if !url.trim().is_empty()
+                    && !is_localhost_url(&url)
+                    && anon_proxy_from_env().is_none()
+                {
+                    let t0 = std::time::Instant::now();
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "url": url,
+                        "error": error_obj(
+                            ErrorCode::NotConfigured,
+                            "anonymous mode requires a proxy",
+                            "Set WEBPIPE_ANON_PROXY (recommended for Tor: socks5h://127.0.0.1:9050) or set WEBPIPE_PRIVACY_MODE=normal."
+                        ),
+                        "request": {
+                            "privacy_mode": "anonymous",
+                            "anon_proxy_configured": false
+                        }
+                    });
+                    add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
+                    let md = web_fetch_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
+                // Firecrawl is a remote fetch backend (keyed, remote service); do not allow in anonymous mode.
+                if fetch_backend == "firecrawl" {
+                    let t0 = std::time::Instant::now();
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "url": url,
+                        "error": error_obj(
+                            ErrorCode::NotSupported,
+                            "fetch_backend=\"firecrawl\" is disabled in anonymous mode",
+                            "Use fetch_backend=\"local\" (routed via WEBPIPE_ANON_PROXY) or set WEBPIPE_PRIVACY_MODE=normal."
+                        ),
+                        "request": {
+                            "privacy_mode": "anonymous",
+                            "fetch_backend": fetch_backend
+                        }
+                    });
+                    add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
+                    let md = web_fetch_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
+            }
+
+            // Note: offline-only mode forbids *non-localhost* networking, but it does not force
+            // cache-only behavior for localhost fixtures (tests rely on this).
             let no_network = args.no_network.unwrap_or(false);
             let cache_read_effective = args.cache_read.unwrap_or(true) || no_network;
             let cache_write_effective = if no_network {
@@ -13032,7 +15018,6 @@ Rules:
                 args.cache_write.unwrap_or(true)
             };
 
-            let url = args.url.unwrap_or_default();
             let t0 = std::time::Instant::now();
             if url.trim().is_empty() {
                 let mut payload = serde_json::json!({
@@ -13046,6 +15031,7 @@ Rules:
                     "request": {
                         "fetch_backend": fetch_backend,
                         "no_network": no_network,
+                        "offline_only": offline_only_enabled(),
                         "timeout_ms": args.timeout_ms.or(Some(15_000)),
                         "max_bytes": args.max_bytes.or(Some(5_000_000)),
                         "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": args.cache_ttl_s },
@@ -13086,6 +15072,7 @@ Rules:
                     "request": {
                         "fetch_backend": fetch_backend,
                         "no_network": no_network,
+                        "offline_only": offline_only_enabled(),
                         "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": args.cache_ttl_s }
                     }
                 });
@@ -13204,7 +15191,8 @@ Rules:
                     t0.elapsed().as_millis() as u64,
                     None,
                 );
-                return Ok(tool_result(payload));
+                let md = web_fetch_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
             let req = FetchRequest {
                 url: url.clone(),
@@ -13502,7 +15490,20 @@ Rules:
         }
 
         #[tool(
+            description = "Alias for web_fetch (same args; clearer name in some UIs)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebFetchArgs>()),
+            annotations(title = "HTTP fetch (alias)", read_only_hint = true, open_world_hint = true)
+        )]
+        async fn http_fetch(
+            &self,
+            params: Parameters<Option<WebFetchArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            self.web_fetch(params).await
+        }
+
+        #[tool(
             description = "Search the web (provider: brave/tavily/searxng/auto; auto picks configured providers; bounded; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebSearchArgs>()),
             annotations(title = "Web search", read_only_hint = true, open_world_hint = true)
         )]
         async fn web_search(
@@ -13512,17 +15513,65 @@ Rules:
             let args = params.0.unwrap_or_default();
             let max_results = args.max_results.unwrap_or(10).clamp(1, 20);
 
-            let provider_name = args.provider.unwrap_or_else(|| "brave".to_string());
+            let provider_name = args
+                .provider
+                .clone()
+                .unwrap_or_else(|| "brave".to_string());
             let auto_mode = args.auto_mode.unwrap_or_else(|| "fallback".to_string());
             let client = self.http.clone();
 
             // Keep these as plain values so we can reuse them across fallbacks without moving.
-            let query = args.query.unwrap_or_default();
+            let query = args.query.clone().unwrap_or_default();
             let language = args.language;
             let country = args.country;
 
             let t0 = std::time::Instant::now();
             self.stats_inc_tool("web_search");
+            match privacy_mode_from_env() {
+                PrivacyMode::Offline => {
+                let query = query.clone();
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "provider": provider_name,
+                    "query": query,
+                    "query_key": Self::query_key(&query),
+                    "max_results": max_results,
+                    "request": {
+                        "offline_only": true
+                    },
+                    "error": error_obj(
+                        ErrorCode::NotSupported,
+                        "offline-only mode disables web_search",
+                        "Use urls=[...] + no_network=true workflows (web_search_extract with urls, or web_cache_search_extract) or set WEBPIPE_OFFLINE_ONLY=0."
+                    )
+                });
+                add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
+                let md = web_search_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
+                }
+                PrivacyMode::Anonymous => {
+                    let query = query.clone();
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "provider": provider_name,
+                        "query": query,
+                        "query_key": Self::query_key(&query),
+                        "max_results": max_results,
+                        "request": {
+                            "privacy_mode": "anonymous"
+                        },
+                        "error": error_obj(
+                            ErrorCode::NotSupported,
+                            "anonymous mode disables web_search (API providers are deanonymizing)",
+                            "Use web_search_extract with urls=[...] (fetch routed via WEBPIPE_ANON_PROXY), or use web_cache_search_extract, or set WEBPIPE_PRIVACY_MODE=normal."
+                        )
+                    });
+                    add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
+                    let md = web_search_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
+                PrivacyMode::Normal => {}
+            }
             if query.trim().is_empty() {
                 let mut payload = serde_json::json!({
                     "ok": false,
@@ -15229,6 +17278,7 @@ Rules:
 
         #[tool(
             description = "Fetch + extract readable text/chunks (and optional links/structure) from a URL (bounded; cache-aware; JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebExtractArgs>()),
             annotations(title = "Extract URL", read_only_hint = true, open_world_hint = true)
         )]
         async fn web_extract(
@@ -15301,14 +17351,17 @@ Rules:
                 let md = web_extract_markdown(&payload);
                 return Ok(tool_result_markdown_with_json(payload, md));
             }
-            if fetch_backend.as_str() != "local" && fetch_backend.as_str() != "firecrawl" {
+            if fetch_backend.as_str() != "local"
+                && fetch_backend.as_str() != "firecrawl"
+                && fetch_backend.as_str() != "render"
+            {
                 let mut payload = serde_json::json!({
                     "ok": false,
                     "url": url,
                     "error": error_obj(
                         ErrorCode::InvalidParams,
                         "unknown fetch_backend",
-                        "Allowed fetch_backends: local, firecrawl"
+                        "Allowed fetch_backends: local, firecrawl, render"
                     ),
                     "request": { "fetch_backend": fetch_backend }
                 });
@@ -15331,6 +17384,21 @@ Rules:
                         "no_network": no_network,
                         "cache": { "read": cache_read_effective, "write": cache_write_effective, "ttl_s": args.cache_ttl_s }
                     }
+                });
+                add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
+                let md = web_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
+            }
+            if no_network && fetch_backend == "render" {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "url": url,
+                    "error": error_obj(
+                        ErrorCode::NotSupported,
+                        "no_network=true cannot be used with fetch_backend=\"render\"",
+                        "Render mode uses a headless browser and performs network requests. Use fetch_backend=\"local\" with a warmed WEBPIPE_CACHE_DIR, or set no_network=false."
+                    ),
+                    "request": { "fetch_backend": fetch_backend, "no_network": no_network }
                 });
                 add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
                 let md = web_extract_markdown(&payload);
@@ -15628,6 +17696,8 @@ Rules:
                 attempts_map.insert("github_repo_rewrite".to_string(), a);
             }
 
+            let mut render_meta: Option<serde_json::Value> = None;
+
             let req = FetchRequest {
                 url: fetch_url.clone(),
                 timeout_ms: args.timeout_ms.or(Some(20_000)),
@@ -15644,8 +17714,140 @@ Rules:
                 },
             };
 
+            // Render mode (Playwright): execute JS-heavy pages in a headless browser and then run the
+            // normal extraction pipeline on the resulting HTML.
+            //
+            // Safety defaults:
+            // - Explicit opt-in via fetch_backend="render"
+            // - no_network is rejected above
+            // - privacy_mode=offline: only allow localhost URLs
+            // - privacy_mode=anonymous: require a proxy for non-localhost URLs (fail closed)
+            let resp = if fetch_backend == "render" {
+                let pm = privacy_mode_from_env();
+                if matches!(pm, PrivacyMode::Offline) && !is_localhost_url(fetch_url.as_str()) {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "url": url,
+                        "error": error_obj(
+                            ErrorCode::NotSupported,
+                            "privacy_mode=offline blocks render fetches to non-localhost URLs",
+                            "Use a localhost URL, or set WEBPIPE_PRIVACY_MODE=normal/anonymous."
+                        ),
+                        "request": { "fetch_backend": fetch_backend, "no_network": no_network }
+                    });
+                    add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
+                    return Ok(tool_result(payload));
+                }
+
+                let anon_proxy = anon_proxy_from_env();
+                let proxy_for_render = if matches!(pm, PrivacyMode::Anonymous)
+                    && !is_localhost_url(fetch_url.as_str())
+                {
+                    let Some(p) = anon_proxy.as_deref() else {
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "url": url,
+                            "error": error_obj(
+                                ErrorCode::NotConfigured,
+                                "anonymous mode requires a proxy for fetch_backend=\"render\"",
+                                "Set WEBPIPE_ANON_PROXY (e.g. an HTTP proxy, or a Tor->HTTP proxy like Privoxy)."
+                            ),
+                            "request": { "fetch_backend": fetch_backend, "no_network": no_network }
+                        });
+                        add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
+                        return Ok(tool_result(payload));
+                    };
+                    let pl = p.trim().to_ascii_lowercase();
+                    if pl.starts_with("socks5h://") {
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "url": url,
+                            "error": error_obj(
+                                ErrorCode::NotSupported,
+                                "socks5h:// proxies are not supported by Playwright proxy settings",
+                                "Use an HTTP proxy endpoint, or convert Tor SOCKS to HTTP (e.g. via Privoxy), then set WEBPIPE_ANON_PROXY to that HTTP proxy URL."
+                            ),
+                            "request": { "fetch_backend": fetch_backend, "no_network": no_network }
+                        });
+                        add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
+                        return Ok(tool_result(payload));
+                    }
+                    Some(p)
+                } else {
+                    None
+                };
+
+                let timeout_ms = args.timeout_ms.unwrap_or(20_000) as u64;
+                let pr = match webpipe_local::render_playwright::render_html_playwright(
+                    fetch_url.as_str(),
+                    timeout_ms,
+                    proxy_for_render,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        self.stats_record_fetch_backend(
+                            "render",
+                            false,
+                            t0.elapsed().as_millis() as u64,
+                            Some(&msg),
+                        );
+                        let (code, hint) = match &e {
+                            WebpipeError::InvalidUrl(_) => (
+                                ErrorCode::InvalidUrl,
+                                "Check that the URL is absolute (includes http/https) and is well-formed.",
+                            ),
+                            WebpipeError::NotConfigured(_) => (
+                                ErrorCode::NotConfigured,
+                                "Install Playwright for Node (and browsers), or set WEBPIPE_RENDER_DISABLE=1 to force-disable render in this environment.",
+                            ),
+                            WebpipeError::NotSupported(_) => (
+                                ErrorCode::NotSupported,
+                                "This operation is not supported by the current privacy mode/proxy configuration.",
+                            ),
+                            _ => (
+                                ErrorCode::FetchFailed,
+                                "Render fetch failed. Try a longer timeout_ms or use fetch_backend=\"local\" for non-JS pages.",
+                            ),
+                        };
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "url": url,
+                            "error": error_obj(code, msg, hint),
+                            "request": { "fetch_backend": fetch_backend, "no_network": no_network, "timeout_ms": timeout_ms }
+                        });
+                        add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
+                        return Ok(tool_result(payload));
+                    }
+                };
+
+                render_meta = Some(serde_json::json!({
+                    "backend": "playwright",
+                    "mode": pr.mode,
+                    "proxy_configured": anon_proxy.is_some(),
+                    "console_error_count": pr.console_error_count,
+                    "elapsed_ms": pr.elapsed_ms
+                }));
+
+                webpipe_core::FetchResponse {
+                    url: fetch_url.clone(),
+                    final_url: pr.final_url,
+                    status: pr.status.unwrap_or(200),
+                    content_type: Some("text/html".to_string()),
+                    headers: BTreeMap::new(),
+                    bytes: pr.html.into_bytes(),
+                    truncated: false,
+                    source: webpipe_core::FetchSource::Network,
+                    timings_ms: {
+                        let mut m = BTreeMap::new();
+                        m.insert("playwright_render".to_string(), pr.elapsed_ms as u128);
+                        m
+                    },
+                }
+            } else if no_network {
             // Cache-only mode (no network): return ok=false on cache miss.
-            let resp = if no_network {
                 match self.fetcher.cache_get(&req) {
                     Ok(Some(r)) => r,
                     Ok(None) => {
@@ -16007,6 +18209,13 @@ Rules:
             {
                 warnings.push("main_content_low_signal");
             }
+            // Also treat “tiny but JS-shaped” extraction as low-signal, even if structure exists.
+            if (extracted.engine.starts_with("html_") || extracted.engine == "html2text")
+                && n <= 200
+                && Self::looks_like_bundle_gunk(&text)
+            {
+                warnings.push("main_content_low_signal");
+            }
             if arxiv_rewrote {
                 warnings.push("arxiv_abs_rewritten_to_pdf");
             }
@@ -16033,7 +18242,7 @@ Rules:
 
             let mut payload = serde_json::json!({
                 "ok": true,
-                "fetch_backend": "local",
+                "fetch_backend": fetch_backend,
                 "url": url,
                 "fetched_url": resp_url,
                 "final_url": resp_final_url,
@@ -16048,7 +18257,7 @@ Rules:
             add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
 
             payload["request"] = serde_json::json!({
-                "fetch_backend": "local",
+                "fetch_backend": fetch_backend,
                 "no_network": no_network,
                 "timeout_ms": req.timeout_ms,
                 "max_bytes": req.max_bytes,
@@ -16069,6 +18278,9 @@ Rules:
                 "semantic_auto_fallback": semantic_auto_fallback,
                 "semantic_top_k": semantic_top_k
             });
+            if let Some(m) = render_meta {
+                payload["render"] = m;
+            }
 
             if include_links && is_pdf_like {
                 warnings.push("links_unavailable_for_pdf");
@@ -16190,7 +18402,7 @@ Rules:
                 }
             }
 
-            self.stats_record_fetch_backend("local", true, t0.elapsed().as_millis() as u64, None);
+            self.stats_record_fetch_backend(fetch_backend.as_str(), true, t0.elapsed().as_millis() as u64, None);
             payload["attempts"] = if attempts_map.is_empty() {
                 serde_json::Value::Null
             } else {
@@ -16198,6 +18410,32 @@ Rules:
             };
             let md = web_extract_markdown(&payload);
             Ok(tool_result_markdown_with_json(payload, md))
+        }
+
+        #[tool(
+            description = "Alias for web_extract (same args; clearer name in some UIs)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebExtractArgs>()),
+            annotations(title = "Page extract (alias)", read_only_hint = true, open_world_hint = true)
+        )]
+        async fn page_extract(
+            &self,
+            params: Parameters<Option<WebExtractArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            self.web_extract(params).await
+        }
+
+        #[tool(
+            description = "Alias for web_extract but forces include_text=true (bounded by max_chars)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebExtractArgs>()),
+            annotations(title = "Page extract (text)", read_only_hint = true, open_world_hint = true)
+        )]
+        async fn page_extract_text(
+            &self,
+            params: Parameters<Option<WebExtractArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            let mut args = params.0.unwrap_or_default();
+            args.include_text = Some(true);
+            self.web_extract(Parameters(Some(args))).await
         }
     }
 
@@ -16237,22 +18475,22 @@ Rules:
     impl WebpipeMcp {
         #[prompt(
             name = "webpipe_search_extract",
-            description = "Search (or use urls) → fetch → extract → rank chunks, then answer with citations."
+            description = "Evidence-pack workflow: use `search_evidence` (Sources + excerpts + top chunks), then answer with URL citations."
         )]
         async fn prompt_webpipe_search_extract(
             &self,
             Parameters(args): Parameters<PromptSearchExtractArgs>,
         ) -> Result<Vec<PromptMessage>, McpError> {
             let no_network = args.no_network.unwrap_or(false);
-            let sys = "You are a careful assistant. Use webpipe tools to gather evidence, then answer.\n\nRules:\n- Prefer web_search_extract for most questions (it returns URLs + top chunks).\n- Keep bounds small (max_urls/top_chunks/max_chars) unless the user asks for exhaustive coverage.\n- Cite sources by URL from tool outputs.\n- If evidence is insufficient, say so.";
+            let sys = "You are a careful assistant. Use webpipe tools to gather evidence, then answer.\n\nRules:\n- Prefer `search_evidence` for most questions (it returns an evidence pack: Sources + excerpts + top chunks).\n- Keep bounds small (max_urls/top_chunks/max_chars) unless the user asks for exhaustive coverage.\n- Cite sources by URL (or by source index [1], [2] from the Markdown Sources list).\n- If evidence is insufficient, say so and suggest what to fetch/search next.";
             let user = if no_network {
                 format!(
-                    "Question:\n{}\n\nUse offline/cache-only mode:\n- Prefer web_cache_search_extract (WEBPIPE_CACHE_DIR).\n- For any fetch/extract, set no_network=true and keep cache_write=false.\n\nReturn an answer with citations (URLs).",
+                    "Question:\n{}\n\nStay offline/cache-only:\n- Prefer `search_evidence` with no_network=true.\n  - If you know the sources: pass urls=[...]\n  - If you don’t: omit urls to search over WEBPIPE_CACHE_DIR (cache-corpus mode)\n- For any web_fetch/web_extract, set no_network=true (and keep bounds small).\n\nReturn an answer with citations (URLs).",
                     args.query.trim()
                 )
             } else {
                 format!(
-                    "Question:\n{}\n\nUse web_search_extract with bounded defaults (provider=\"auto\", auto_mode=\"fallback\", max_results≈5, max_urls≈3, top_chunks≈5).\n\nReturn an answer with citations (URLs).",
+                    "Question:\n{}\n\nUse `search_evidence` with bounded defaults (provider=\"auto\", auto_mode=\"fallback\", max_results≈5, max_urls≈3, top_chunks≈5).\n\nReturn an answer with citations (URLs).",
                     args.query.trim()
                 )
             };
@@ -16266,13 +18504,13 @@ Rules:
 
         #[prompt(
             name = "webpipe_offline_cache_first",
-            description = "Offline/cache-first workflow: use WEBPIPE_CACHE_DIR and avoid network."
+            description = "Offline/cache-first workflow: use `search_evidence` (cache-corpus) over WEBPIPE_CACHE_DIR; avoid network."
         )]
         async fn prompt_webpipe_offline_cache_first(
             &self,
             Parameters(args): Parameters<PromptOfflineCacheArgs>,
         ) -> Result<Vec<PromptMessage>, McpError> {
-            let sys = "You are a careful assistant. You must stay offline.\n\nRules:\n- Do not use network providers.\n- Prefer web_cache_search_extract (cache-only).\n- If you must use web_fetch/web_extract/web_search_extract, set no_network=true.\n- If the cache is missing, say what needs to be warmed (do not guess).";
+            let sys = "You are a careful assistant. You must stay offline.\n\nRules:\n- Do not use network providers.\n- Prefer `search_evidence` with no_network=true (cache-only).\n- For any web_fetch/web_extract, set no_network=true.\n- If the cache is missing, say what needs to be warmed (do not guess).";
             let user = format!(
                 "Question:\n{}\n\nStay offline: use WEBPIPE_CACHE_DIR (cache-only). Provide an answer with citations if possible.",
                 args.query.trim()
@@ -16285,18 +18523,19 @@ Rules:
 
         #[prompt(
             name = "webpipe_deep_research",
-            description = "Agentic research: gather evidence (search+extract) and optionally synthesize."
+            description = "Agentic research: gather evidence packs with `search_evidence`, then optionally synthesize."
         )]
         async fn prompt_webpipe_deep_research(
             &self,
             Parameters(args): Parameters<PromptDeepResearchArgs>,
         ) -> Result<Vec<PromptMessage>, McpError> {
             let include_evidence = args.include_evidence.unwrap_or(true);
-            let sys = "You are a careful research assistant. Use webpipe tools to gather evidence and then (optionally) synthesize.\n\nRules:\n- Prefer web_deep_research when the question requires synthesis across multiple sources.\n- Keep bounds small unless asked.\n- Cite sources by URL.\n- If evidence is insufficient, say so.";
+            let sys = "You are a careful research assistant. Use webpipe tools to gather evidence and then (optionally) synthesize.\n\nRules:\n- Use `search_evidence` iteratively to gather 2–5 independent sources.\n- Keep bounds small unless asked.\n- Cite sources by URL.\n- If evidence is insufficient, say so and list the missing evidence.";
             let user = format!(
-                "Research question:\n{}\n\nUse web_deep_research with include_evidence={} and bounded defaults (max_results≈5, max_urls≈3, top_chunks≈5). Return a concise answer with citations.",
+                "Research question:\n{}\n\nGather evidence with `search_evidence` (bounded defaults: max_results≈5, max_urls≈3, top_chunks≈5). Then return a concise answer. include_evidence={}: {}",
                 args.query.trim(),
-                include_evidence
+                include_evidence,
+                if include_evidence { "include a short Sources list + the best supporting chunks." } else { "include sources only if essential; do not dump evidence." }
             );
             Ok(vec![PromptMessage::new_text(
                 PromptMessageRole::User,
@@ -16305,13 +18544,11 @@ Rules:
         }
     }
 
-    #[tool_handler]
-    #[prompt_handler]
     impl rmcp::ServerHandler for WebpipeMcp {
         fn get_info(&self) -> ServerInfo {
             ServerInfo {
                 instructions: Some(
-                    "Local fetch/search plumbing. Hard mode (render/unblock) is opt-in; outputs are JSON and schema-versioned."
+                    "Local fetch/search plumbing for Cursor.\n\nUse `search_evidence` for most queries: it returns Sources + short excerpts + top chunks (bounded), plus a structured JSON payload.\n\nHard mode (render/unblock) is opt-in; outputs are schema-versioned."
                         .to_string(),
                 ),
                 capabilities: ServerCapabilities::builder()
@@ -16320,6 +18557,74 @@ Rules:
                     .enable_resources()
                     .build(),
                 ..Default::default()
+            }
+        }
+
+        fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParam>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+            let toolset = mcp_toolset_from_env();
+            let tools = self
+                .tool_router
+                .list_all()
+                .into_iter()
+                .filter(|t| mcp_tool_allowed(t.name.as_ref(), toolset))
+                .collect::<Vec<_>>();
+            std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
+        }
+
+        fn call_tool(
+            &self,
+            request: rmcp::model::CallToolRequestParam,
+            context: RequestContext<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+            use rmcp::handler::server::tool::ToolCallContext;
+            let toolset = mcp_toolset_from_env();
+            let name = request.name.to_string();
+            async move {
+                if !mcp_tool_allowed(name.as_str(), toolset) {
+                    return Err(McpError::invalid_params(
+                        format!("tool is not enabled in WEBPIPE_MCP_TOOLSET={}", mcp_toolset_name(toolset)),
+                        Some(serde_json::json!({
+                            "code":"tool_not_enabled",
+                            "tool": name,
+                            "toolset": mcp_toolset_name(toolset),
+                            "hint": "Set WEBPIPE_MCP_TOOLSET=debug to expose the full tool surface."
+                        })),
+                    ));
+                }
+                let ctx = ToolCallContext::new(self, request, context);
+                self.tool_router.call(ctx).await
+            }
+        }
+
+        fn list_prompts(
+            &self,
+            _request: Option<PaginatedRequestParam>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
+            std::future::ready(Ok(ListPromptsResult::with_all_items(
+                self.prompt_router.list_all(),
+            )))
+        }
+
+        fn get_prompt(
+            &self,
+            request: GetPromptRequestParam,
+            context: RequestContext<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
+            use rmcp::handler::server::prompt::PromptContext;
+            async move {
+                self.prompt_router
+                    .get_prompt(PromptContext::new(
+                        self,
+                        request.name.to_string(),
+                        request.arguments,
+                        context,
+                    ))
+                    .await
             }
         }
 
@@ -16415,10 +18720,130 @@ Rules:
         }
     }
 
+    // `rmcp`'s stdio codec is line-delimited JSON-RPC (one JSON message per line) and it
+    // rejects JSON-RPC *batch arrays* (a single line containing a JSON array), closing the
+    // transport. Cursor may batch `tools/list`, `prompts/list`, and `resources/list`, which
+    // showed up as “0 tools” in Cursor logs.
+    //
+    // This transport preserves the same wire format (newline-delimited JSON objects) but
+    // additionally accepts a JSON array line and expands it into individual messages.
+    #[cfg(feature = "stdio")]
+    struct BatchLineStdioTransport {
+        reader: tokio::io::BufReader<tokio::io::Stdin>,
+        writer: std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::io::Stdout>>>,
+        pending: std::collections::VecDeque<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>>,
+    }
+
+    #[cfg(feature = "stdio")]
+    impl BatchLineStdioTransport {
+        fn new() -> Self {
+            Self {
+                reader: tokio::io::BufReader::new(tokio::io::stdin()),
+                writer: std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufWriter::new(
+                    tokio::io::stdout(),
+                ))),
+                pending: std::collections::VecDeque::new(),
+            }
+        }
+    }
+
+    #[cfg(feature = "stdio")]
+    impl rmcp::transport::Transport<rmcp::RoleServer> for BatchLineStdioTransport {
+        type Error = std::io::Error;
+
+        fn send(
+            &mut self,
+            item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
+        ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+            use tokio::io::AsyncWriteExt;
+            let writer = self.writer.clone();
+            async move {
+                let mut w = writer.lock().await;
+                let s = serde_json::to_string(&item).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, format!("json encode: {e}"))
+                })?;
+                w.write_all(s.as_bytes()).await?;
+                w.write_all(b"\n").await?;
+                w.flush().await?;
+                Ok(())
+            }
+        }
+
+        fn receive(
+            &mut self,
+        ) -> impl std::future::Future<
+            Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>>,
+        > + Send {
+            use tokio::io::AsyncBufReadExt;
+            async move {
+                if let Some(m) = self.pending.pop_front() {
+                    return Some(m);
+                }
+
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = match self.reader.read_line(&mut line).await {
+                        Ok(n) => n,
+                        Err(_) => return None,
+                    };
+                    if n == 0 {
+                        return None;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    // Be forgiving: ignore non-JSON (incl. accidental LSP-style headers).
+                    let val: serde_json::Value = match serde_json::from_str(trimmed) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    match val {
+                        serde_json::Value::Array(items) => {
+                            for v in items.into_iter() {
+                                if let Ok(m) = serde_json::from_value::<
+                                    rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>,
+                                >(v)
+                                {
+                                    self.pending.push_back(m);
+                                }
+                            }
+                            if let Some(m) = self.pending.pop_front() {
+                                return Some(m);
+                            }
+                            continue;
+                        }
+                        other => {
+                            if let Ok(m) = serde_json::from_value::<
+                                rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>,
+                            >(other)
+                            {
+                                return Some(m);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+            use tokio::io::AsyncWriteExt;
+            let writer = self.writer.clone();
+            async move {
+                let mut w = writer.lock().await;
+                w.flush().await
+            }
+        }
+    }
+
     pub(crate) async fn serve_stdio() -> Result<(), McpError> {
         let svc = WebpipeMcp::new()?;
         let running = svc
-            .serve(stdio())
+            .serve(BatchLineStdioTransport::new())
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         // Keep the stdio server alive until the client closes.
@@ -16619,6 +19044,19 @@ Rules:
             ));
             assert!(!url_looks_like_auth_or_challenge(
                 "https://example.com/docs/getting-started"
+            ));
+        }
+
+        #[test]
+        fn url_is_probably_promo_or_tracking_is_reasonable() {
+            assert!(url_looks_like_promo_or_tracking(
+                "https://vercel.com/home?utm_source=next-site&utm_medium=banner&utm_campaign=docs"
+            ));
+            assert!(url_looks_like_promo_or_tracking(
+                "https://example.com/pricing?gclid=abc"
+            ));
+            assert!(!url_looks_like_promo_or_tracking(
+                "https://nextjs.org/docs/app/getting-started/route-handlers"
             ));
         }
 
@@ -18122,6 +20560,8 @@ Rules:
                     no_network: Some(false),
                     firecrawl_fallback_on_empty_extraction: Some(false),
                     firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
                     max_results: Some(1),
                     max_urls: Some(1),
                     timeout_ms: Some(2_000),
@@ -18216,6 +20656,8 @@ Rules:
                     no_network: Some(false),
                     firecrawl_fallback_on_empty_extraction: Some(false),
                     firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
                     max_results: Some(1),
                     max_urls: Some(1),
                     timeout_ms: Some(2_000),
@@ -18305,6 +20747,8 @@ Rules:
                     no_network: Some(false),
                     firecrawl_fallback_on_empty_extraction: Some(false),
                     firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
                     max_results: Some(1),
                     max_urls: Some(2),
                     timeout_ms: Some(2_000),
@@ -18386,6 +20830,8 @@ Rules:
                     no_network: Some(false),
                     firecrawl_fallback_on_empty_extraction: Some(false),
                     firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
                     max_results: Some(1),
                     max_urls: Some(1),
                     timeout_ms: Some(2_000),
@@ -18478,6 +20924,8 @@ Rules:
                     no_network: Some(false),
                     firecrawl_fallback_on_empty_extraction: Some(false),
                     firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
                     max_results: Some(1),
                     max_urls: Some(1),
                     timeout_ms: Some(2_000),
@@ -18624,6 +21072,8 @@ Rules:
                     no_network: Some(false),
                     firecrawl_fallback_on_empty_extraction: Some(false),
                     firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
                     max_results: Some(1),
                     max_urls: Some(2),
                     timeout_ms: Some(2_000),
@@ -18785,6 +21235,8 @@ Rules:
                     no_network: Some(false),
                     firecrawl_fallback_on_empty_extraction: Some(false),
                     firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
                     max_results: Some(1),
                     max_urls: Some(2),
                     timeout_ms: Some(2_000),
@@ -19044,6 +21496,8 @@ Rules:
                     no_network: Some(false),
                     firecrawl_fallback_on_empty_extraction: Some(true),
                     firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
                     max_results: Some(1),
                     max_urls: Some(1),
                     timeout_ms: Some(2_000),
@@ -19376,6 +21830,18 @@ Rules:
                 v3["configured"]["providers"]["tavily"].as_bool(),
                 Some(true)
             );
+
+            // Supported fetch_backends should include render (Playwright).
+            let empty: Vec<serde_json::Value> = vec![];
+            let fbs: Vec<&str> = v3["supported"]["fetch_backends"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(|x| x.as_str())
+                .collect();
+            assert!(fbs.contains(&"local"));
+            assert!(fbs.contains(&"firecrawl"));
+            assert!(fbs.contains(&"render"));
         }
 
         #[tokio::test]
@@ -19691,6 +22157,216 @@ Rules:
             assert_eq!(
                 v["error"]["code"].as_str(),
                 Some(ErrorCode::InvalidParams.as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn web_extract_render_disabled_is_not_configured_and_stable() {
+            let env = EnvGuard::new(&["WEBPIPE_CACHE_DIR", "WEBPIPE_RENDER_DISABLE"]);
+            env.set("WEBPIPE_RENDER_DISABLE", "1");
+
+            let svc = WebpipeMcp::new().expect("new");
+            let r = svc
+                .web_extract(Parameters(Some(WebExtractArgs {
+                    url: Some("https://example.com/".to_string()),
+                    fetch_backend: Some("render".to_string()),
+                    no_network: Some(false),
+                    width: Some(80),
+                    max_chars: Some(2_000),
+                    query: None,
+                    top_chunks: Some(3),
+                    max_chunk_chars: Some(200),
+                    include_text: Some(false),
+                    include_links: Some(false),
+                    max_links: Some(10),
+                    timeout_ms: Some(2_000),
+                    max_bytes: Some(200_000),
+                    retry_on_truncation: None,
+                    truncation_retry_max_bytes: None,
+                    cache_read: Some(false),
+                    cache_write: Some(false),
+                    cache_ttl_s: None,
+                    include_structure: Some(false),
+                    max_outline_items: None,
+                    max_blocks: None,
+                    max_block_chars: None,
+                    semantic_rerank: None,
+                    semantic_auto_fallback: None,
+                    semantic_top_k: None,
+                })))
+                .await
+                .expect("call");
+            let v = payload_from_call_tool_result(&r);
+            assert_eq!(v["kind"].as_str(), Some("web_extract"));
+            assert_eq!(v["ok"].as_bool(), Some(false));
+            assert_eq!(
+                v["error"]["code"].as_str(),
+                Some(ErrorCode::NotConfigured.as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn web_search_extract_render_disabled_is_not_configured_and_stable() {
+            let env = EnvGuard::new(&["WEBPIPE_CACHE_DIR", "WEBPIPE_RENDER_DISABLE"]);
+            env.set("WEBPIPE_RENDER_DISABLE", "1");
+
+            let svc = WebpipeMcp::new().expect("new");
+            let r = svc
+                .web_search_extract(p(WebSearchExtractArgs {
+                    query: Some("x".to_string()),
+                    urls: Some(vec!["https://example.com/".to_string()]),
+                    url_selection_mode: Some("preserve".to_string()),
+                    provider: Some("auto".to_string()),
+                    auto_mode: Some("fallback".to_string()),
+                    selection_mode: Some("pareto".to_string()),
+                    fetch_backend: Some("render".to_string()),
+                    no_network: Some(false),
+                    firecrawl_fallback_on_empty_extraction: Some(false),
+                    firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
+                    max_results: Some(1),
+                    max_urls: Some(1),
+                    timeout_ms: Some(2_000),
+                    max_bytes: Some(200_000),
+                    retry_on_truncation: Some(false),
+                    truncation_retry_max_bytes: None,
+                    width: Some(80),
+                    max_chars: Some(2_000),
+                    top_chunks: Some(3),
+                    max_chunk_chars: Some(200),
+                    include_links: Some(false),
+                    include_structure: Some(false),
+                    max_outline_items: None,
+                    max_blocks: None,
+                    max_block_chars: None,
+                    semantic_rerank: Some(false),
+                    semantic_top_k: None,
+                    max_links: None,
+                    include_text: Some(false),
+                    cache_read: Some(false),
+                    cache_write: Some(false),
+                    cache_ttl_s: None,
+                    exploration: Some("balanced".to_string()),
+                    agentic: Some(false),
+                    agentic_selector: Some("lexical".to_string()),
+                    agentic_max_search_rounds: Some(0),
+                    agentic_frontier_max: Some(0),
+                    planner_max_calls: Some(0),
+                    compact: Some(true),
+                }))
+                .await
+                .expect("call");
+            let v = payload_from_call_tool_result(&r);
+            assert_eq!(v["kind"].as_str(), Some("web_search_extract"));
+            assert_eq!(v["ok"].as_bool(), Some(false));
+            assert_eq!(
+                v["error"]["code"].as_str(),
+                Some(ErrorCode::NotConfigured.as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn web_extract_render_cdp_mode_rejects_proxy_without_needing_playwright() {
+            let env = EnvGuard::new(&[
+                "WEBPIPE_CACHE_DIR",
+                "WEBPIPE_PRIVACY_MODE",
+                "WEBPIPE_ANON_PROXY",
+                "WEBPIPE_RENDER_CDP_ENDPOINT",
+            ]);
+            env.set("WEBPIPE_PRIVACY_MODE", "anonymous");
+            env.set("WEBPIPE_ANON_PROXY", "http://127.0.0.1:9");
+            env.set("WEBPIPE_RENDER_CDP_ENDPOINT", "http://127.0.0.1:9222");
+
+            let svc = WebpipeMcp::new().expect("new");
+            let r = svc
+                .web_extract(Parameters(Some(WebExtractArgs {
+                    url: Some("https://example.com/".to_string()),
+                    fetch_backend: Some("render".to_string()),
+                    no_network: Some(false),
+                    width: Some(80),
+                    max_chars: Some(2_000),
+                    query: None,
+                    top_chunks: Some(3),
+                    max_chunk_chars: Some(200),
+                    include_text: Some(false),
+                    include_links: Some(false),
+                    max_links: Some(10),
+                    timeout_ms: Some(2_000),
+                    max_bytes: Some(200_000),
+                    retry_on_truncation: None,
+                    truncation_retry_max_bytes: None,
+                    cache_read: Some(false),
+                    cache_write: Some(false),
+                    cache_ttl_s: None,
+                    include_structure: Some(false),
+                    max_outline_items: None,
+                    max_blocks: None,
+                    max_block_chars: None,
+                    semantic_rerank: None,
+                    semantic_auto_fallback: None,
+                    semantic_top_k: None,
+                })))
+                .await
+                .expect("call");
+            let v = payload_from_call_tool_result(&r);
+            assert_eq!(v["kind"].as_str(), Some("web_extract"));
+            assert_eq!(v["ok"].as_bool(), Some(false));
+            assert_eq!(
+                v["error"]["code"].as_str(),
+                Some(ErrorCode::NotSupported.as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn web_extract_render_rejects_both_cdp_and_user_data_dir_without_needing_playwright() {
+            let env = EnvGuard::new(&[
+                "WEBPIPE_CACHE_DIR",
+                "WEBPIPE_PRIVACY_MODE",
+                "WEBPIPE_RENDER_CDP_ENDPOINT",
+                "WEBPIPE_RENDER_USER_DATA_DIR",
+            ]);
+            env.set("WEBPIPE_PRIVACY_MODE", "normal");
+            env.set("WEBPIPE_RENDER_CDP_ENDPOINT", "http://127.0.0.1:9222");
+            env.set("WEBPIPE_RENDER_USER_DATA_DIR", "/tmp/webpipe-test-profile");
+
+            let svc = WebpipeMcp::new().expect("new");
+            let r = svc
+                .web_extract(Parameters(Some(WebExtractArgs {
+                    url: Some("https://example.com/".to_string()),
+                    fetch_backend: Some("render".to_string()),
+                    no_network: Some(false),
+                    width: Some(80),
+                    max_chars: Some(2_000),
+                    query: None,
+                    top_chunks: Some(3),
+                    max_chunk_chars: Some(200),
+                    include_text: Some(false),
+                    include_links: Some(false),
+                    max_links: Some(10),
+                    timeout_ms: Some(2_000),
+                    max_bytes: Some(200_000),
+                    retry_on_truncation: None,
+                    truncation_retry_max_bytes: None,
+                    cache_read: Some(false),
+                    cache_write: Some(false),
+                    cache_ttl_s: None,
+                    include_structure: Some(false),
+                    max_outline_items: None,
+                    max_blocks: None,
+                    max_block_chars: None,
+                    semantic_rerank: None,
+                    semantic_auto_fallback: None,
+                    semantic_top_k: None,
+                })))
+                .await
+                .expect("call");
+            let v = payload_from_call_tool_result(&r);
+            assert_eq!(v["kind"].as_str(), Some("web_extract"));
+            assert_eq!(v["ok"].as_bool(), Some(false));
+            assert_eq!(
+                v["error"]["code"].as_str(),
+                Some(ErrorCode::NotSupported.as_str())
             );
         }
     }
