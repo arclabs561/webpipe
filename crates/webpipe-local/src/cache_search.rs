@@ -318,9 +318,22 @@ pub fn cache_search_extract(
         let pipe =
             extract::extract_pipeline_from_bytes(bytes, content_type.as_deref(), &final_url, cfg);
 
-        let score: u64 = pipe.chunks.iter().map(|c| c.score).sum();
+        // In cache-corpus mode, we want “query evidence”, not query-less filler.
+        //
+        // `extract_pipeline_from_bytes` deliberately falls back to `best_chunks_default` when
+        // query matching yields nothing, producing chunks with score=1. That’s useful for
+        // urls-mode with no query, but it pollutes offline cache-corpus searches (it can cause
+        // arbitrary PDFs to appear in the top chunks list).
+        let mut chunks = pipe.chunks.clone();
+        if !chunks.is_empty() && chunks.iter().all(|c| c.score <= 1) {
+            chunks.clear();
+        }
+        let score: u64 = chunks.iter().map(|c| c.score).sum();
         let extraction_engine = pipe.extracted.engine.to_string();
         let mut doc_warnings: Vec<&'static str> = pipe.extracted.warnings.clone();
+        if pipe.chunks.len() > 0 && chunks.is_empty() {
+            doc_warnings.push("no_query_overlap_doc");
+        }
         if (bytes_full.len() as u64) > max_bytes {
             doc_warnings.push("cache_body_truncated_for_scan");
         }
@@ -335,7 +348,7 @@ pub fn cache_search_extract(
             extraction_engine: extraction_engine.clone(),
             text_chars: pipe.text_chars,
             text_truncated: pipe.text_truncated,
-            chunks: pipe.chunks.clone(),
+            chunks: chunks.clone(),
             structure: pipe.structure.clone(),
             warnings: doc_warnings,
             score,
@@ -370,6 +383,16 @@ pub fn cache_search_extract(
             .then_with(|| b.fetched_at_epoch_s.cmp(&a.fetched_at_epoch_s))
             .then_with(|| a.final_url.cmp(&b.final_url))
     });
+
+    // Default behavior: return only documents that have query-overlap evidence.
+    //
+    // Many cached docs are unrelated to a given query; keeping them bloats the payload and
+    // increases the chance that “query-less fallback” snippets show up downstream.
+    let before = hits.len();
+    hits.retain(|h| h.score > 0 && !h.chunks.is_empty());
+    if hits.len() < before {
+        warnings.push("no_query_overlap_docs_dropped");
+    }
 
     // Optional: persist corpus on every call (best-effort, bounded).
     if persist {

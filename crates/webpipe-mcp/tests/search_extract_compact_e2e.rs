@@ -76,7 +76,7 @@ async fn web_search_extract_compact_urls_mode_drops_agentic_trace_and_keeps_extr
     // Use urls-mode (no provider keys required). Keep agentic=true to ensure trace exists.
     let v = call(
         &service,
-        "web_search_extract",
+        "search_evidence",
         serde_json::json!({
             "query": "compacttoken",
             "urls": [url],

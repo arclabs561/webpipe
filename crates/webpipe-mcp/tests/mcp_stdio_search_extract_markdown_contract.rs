@@ -39,6 +39,7 @@ fn webpipe_mcp_stdio_search_extract_markdown_default_contract() {
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
                     cmd.env("WEBPIPE_DOTENV", "0");
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "normal");
                     cmd.env("WEBPIPE_CACHE_DIR", cache_dir.path());
                     cmd.env("WEBPIPE_MCP_INCLUDE_JSON_TEXT", "0");
                     cmd.env("WEBPIPE_MCP_MARKDOWN_CHUNK_EXCERPTS", "0");
@@ -48,7 +49,7 @@ fn webpipe_mcp_stdio_search_extract_markdown_default_contract() {
 
         let r = service
             .call_tool(CallToolRequestParam {
-                name: "web_search_extract".into(),
+                name: "search_evidence".into(),
                 arguments: Some(
                     serde_json::json!({
                         "query": "unique token",
@@ -86,7 +87,10 @@ fn webpipe_mcp_stdio_search_extract_markdown_default_contract() {
             .map(|t| t.text.clone())
             .unwrap_or_default();
         assert!(
-            txt0.starts_with("## Query") || txt0.starts_with("## Request"),
+            txt0.starts_with("## Top chunks")
+                || txt0.starts_with("## Summary")
+                || txt0.starts_with("## Query")
+                || txt0.starts_with("## Request"),
             "expected Markdown heading, got: {txt0:?}"
         );
         assert!(txt0.contains("## Request"), "expected Request section");

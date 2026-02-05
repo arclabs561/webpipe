@@ -1,0 +1,44 @@
+[
+  {
+    "query": "HTTP status code 404 semantics",
+    "urls": [
+      "https://www.rfc-editor.org/rfc/rfc9110.pdf"
+    ],
+    "fetch_backend": "local",
+    "timeout_ms": 25000,
+    "max_bytes": 5000000,
+    "max_chars": 20000,
+    "top_chunks": 5,
+    "max_chunk_chars": 500,
+    "include_text": false,
+    "include_structure": false,
+    "include_links": false,
+    "compact": true,
+    "agentic": false,
+    "max_urls": 1,
+    "max_parallel_urls": 1,
+    "cache_read": true,
+    "cache_write": true
+  },
+  {
+    "query": "HTTP status code 404 semantics",
+    "urls": [
+      "https://www.rfc-editor.org/rfc/rfc9110.pdf"
+    ],
+    "fetch_backend": "local",
+    "timeout_ms": 30000,
+    "max_bytes": 5000000,
+    "max_chars": 20000,
+    "top_chunks": 5,
+    "max_chunk_chars": 500,
+    "include_text": false,
+    "include_structure": false,
+    "include_links": false,
+    "compact": true,
+    "agentic": false,
+    "max_urls": 1,
+    "max_parallel_urls": 1,
+    "cache_read": true,
+    "cache_write": true
+  }
+]

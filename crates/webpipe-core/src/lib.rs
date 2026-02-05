@@ -102,6 +102,13 @@ pub struct SearchQuery {
     pub max_results: Option<usize>,
     pub language: Option<String>,
     pub country: Option<String>,
+    /// Timeout for the search request (network + parsing).
+    ///
+    /// Notes:
+    /// - Some providers do not apply any default timeout; leaving this unset can hang indefinitely.
+    /// - Callers should set a bounded value (e.g. 8_000..20_000) for interactive use.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -64,6 +64,17 @@ async fn webpipe_web_fetch_handles_variety_of_urls_and_content_types() {
             }),
         )
         .route(
+            "/notfound",
+            get(|| async {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    [(header::CONTENT_TYPE, "text/html")],
+                    "<html><body><h1>Not Found</h1></body></html>",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
             "/redirect",
             get(|| async {
                 // 302 -> /html (fragment should never be sent; query should be ok).
@@ -167,6 +178,29 @@ async fn webpipe_web_fetch_handles_variety_of_urls_and_content_types() {
             .to_lowercase()
             .contains("hello"),
         "expected html text"
+    );
+
+    // HTTP status errors should be surfaced as a warning (even though ok=true).
+    let v_404 = call(
+        &service,
+        "web_fetch",
+        serde_json::json!({
+            "url": format!("{base}/notfound"),
+            "fetch_backend": "local",
+            "include_text": false,
+            "timeout_ms": 5000,
+            "max_bytes": 200_000,
+            "cache_read": false,
+            "cache_write": false
+        }),
+    )
+    .await;
+    assert_eq!(v_404["ok"].as_bool(), Some(true));
+    assert_eq!(v_404["status"].as_u64(), Some(404));
+    let codes = v_404["warning_codes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        codes.iter().any(|c| c.as_str() == Some("http_status_error")),
+        "expected http_status_error warning_codes; got {codes:?}"
     );
 
     service.cancel().await.expect("cancel");

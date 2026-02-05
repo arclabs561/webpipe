@@ -40,6 +40,8 @@ async fn web_cache_search_extract_finds_warmed_cache_entry() {
                 cmd.args(["mcp-stdio"]);
                 // Disable `.env` autoload so this test stays hermetic.
                 cmd.env("WEBPIPE_DOTENV", "0");
+                // This tool is intentionally not in the normal Cursor-facing toolset.
+                cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                 cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
             }))
             .expect("spawn mcp child"),
@@ -182,6 +184,8 @@ async fn web_cache_search_extract_can_load_persisted_corpus_opt_in() {
             .serve(
                 TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
+                    // This tool is intentionally not in the normal Cursor-facing toolset.
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
                     cmd.env("WEBPIPE_CACHE_SEARCH_PERSIST", "1");
                 }))
@@ -224,6 +228,8 @@ async fn web_cache_search_extract_can_load_persisted_corpus_opt_in() {
             .serve(
                 TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
+                    // This tool is intentionally not in the normal Cursor-facing toolset.
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
                     cmd.env("WEBPIPE_CACHE_SEARCH_PERSIST", "1");
                 }))

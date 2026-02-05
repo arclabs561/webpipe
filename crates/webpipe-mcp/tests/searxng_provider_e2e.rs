@@ -5,6 +5,7 @@ use rmcp::{
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
 use std::net::SocketAddr;
+use std::time::Duration;
 
 async fn serve(app: Router) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -37,14 +38,22 @@ async fn searxng_provider_e2e_via_stdio_server() {
     // Local SearXNG-like endpoint: /search?format=json -> { results: [{url,title,content}] }
     let app = Router::new().route(
         "/search",
-        get(|| async {
-            axum::Json(serde_json::json!({
-                "results": [
-                    {"url": "https://example.com/a", "title": "A", "content": "alpha"},
-                    {"url": "https://example.com/b", "title": "B", "content": "beta"}
-                ]
-            }))
-        }),
+        get(
+            |q: axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                if q.get("q")
+                    .map(|s| s.to_ascii_lowercase().contains("slow"))
+                    .unwrap_or(false)
+                {
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                }
+                axum::Json(serde_json::json!({
+                    "results": [
+                        {"url": "https://example.com/a", "title": "A", "content": "alpha"},
+                        {"url": "https://example.com/b", "title": "B", "content": "beta"}
+                    ]
+                }))
+            },
+        ),
     );
     let addr = serve(app).await;
     let endpoint = format!("http://{addr}");
@@ -58,6 +67,8 @@ async fn searxng_provider_e2e_via_stdio_server() {
                 cmd.args(["mcp-stdio"]);
                 // Disable `.env` autoload so this test stays hermetic.
                 cmd.env("WEBPIPE_DOTENV", "0");
+                // `web_search` is a debug-only tool; enable full surface for this provider test.
+                cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                 cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
                 cmd.env("WEBPIPE_SEARXNG_ENDPOINT", &endpoint);
                 // Ensure we don't accidentally use real keys on dev machines.
@@ -118,6 +129,21 @@ async fn searxng_provider_e2e_via_stdio_server() {
     .await;
     assert_eq!(v3["ok"].as_bool(), Some(true));
     assert_eq!(v3["backend_provider"].as_str(), Some("searxng"));
+
+    // Timeout propagation: a slow endpoint should error quickly when timeout_ms is low.
+    let v4 = call(
+        &service,
+        "web_search",
+        serde_json::json!({
+            "provider": "searxng",
+            "query": "slow",
+            "max_results": 2,
+            "timeout_ms": 1_000
+        }),
+    )
+    .await;
+    assert_eq!(v4["ok"].as_bool(), Some(false));
+    assert!(v4.get("error").is_some());
 
     service.cancel().await.expect("cancel");
 }

@@ -167,7 +167,7 @@ async fn webpipe_search_extract_stubbed_search_and_offline_cache() {
     // --- 1) Search+fetch+extract via stubbed SearXNG endpoint ---
     let v1 = call(
         &service,
-        "web_search_extract",
+        "search_evidence",
         serde_json::json!({
             "provider": "searxng",
             "query": "route handlers",
@@ -203,7 +203,7 @@ async fn webpipe_search_extract_stubbed_search_and_offline_cache() {
     // --- 2) Warm cache via urls-mode, then verify offline replay succeeds ---
     let warm = call(
         &service,
-        "web_search_extract",
+        "search_evidence",
         serde_json::json!({
             "provider": "auto",
             "auto_mode": "fallback",
@@ -228,7 +228,7 @@ async fn webpipe_search_extract_stubbed_search_and_offline_cache() {
 
     let offline = call(
         &service,
-        "web_search_extract",
+        "search_evidence",
         serde_json::json!({
             "provider": "auto",
             "auto_mode": "fallback",

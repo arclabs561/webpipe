@@ -15,6 +15,7 @@ pub mod ollama;
 pub mod openai_compat;
 pub mod papers;
 pub mod perplexity;
+pub mod render_playwright;
 pub mod rewrite;
 pub mod search;
 pub mod semantic;
@@ -268,21 +269,170 @@ impl FsCache {
 pub struct LocalFetcher {
     client: reqwest::Client,
     cache: Option<FsCache>,
+    rate_limiter: Option<std::sync::Arc<RateLimiter>>,
+    cache_io_disabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug)]
+struct RateLimiter {
+    interval: Duration,
+    next_ok: tokio::sync::Mutex<std::time::Instant>,
+}
+
+impl RateLimiter {
+    fn from_env() -> Option<Self> {
+        // WEBPIPE_RATE_LIMIT format (best-effort):
+        // - "none"/"off"/"unlimited" => disabled
+        // - "N" => N per second
+        // - "N/duration" => e.g. "10/1s", "60/1m", "5/2s"
+        //
+        // This is intentionally simple + dependency-free.
+        let raw = std::env::var("WEBPIPE_RATE_LIMIT").ok()?;
+        let s = raw.trim().to_ascii_lowercase();
+        if s.is_empty() {
+            return None;
+        }
+        if matches!(
+            s.as_str(),
+            "none" | "off" | "unlimited" | "disabled" | "nolimit"
+        ) {
+            return None;
+        }
+        let (n_s, per_s) = if let Some((a, b)) = s.split_once('/') {
+            (a.trim(), b.trim())
+        } else {
+            (s.as_str(), "1s")
+        };
+        let n: u64 = n_s.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        let per = parse_simple_duration(per_s)?;
+        if per.is_zero() {
+            return None;
+        }
+        // interval = per / n
+        let nanos = per.as_nanos() / (n as u128);
+        let nanos = nanos.max(1);
+        let interval = Duration::from_nanos(nanos as u64);
+        Some(Self {
+            interval,
+            next_ok: tokio::sync::Mutex::new(std::time::Instant::now()),
+        })
+    }
+
+    async fn wait(&self) {
+        // Deterministic “spacing” limiter (good enough for politeness / fewer bans).
+        // Not a precise token bucket; avoids additional deps.
+        let mut guard = self.next_ok.lock().await;
+        let now = std::time::Instant::now();
+        if *guard > now {
+            tokio::time::sleep(*guard - now).await;
+        }
+        *guard = std::time::Instant::now() + self.interval;
+    }
+}
+
+fn parse_simple_duration(s: &str) -> Option<Duration> {
+    // Accept: "<n>ms", "<n>s", "<n>m", "<n>h" (case-insensitive), or raw seconds "<n>".
+    let ss = s.trim().to_ascii_lowercase();
+    if ss.is_empty() {
+        return None;
+    }
+    let (num, unit) = if ss.ends_with("ms") {
+        (&ss[..ss.len() - 2], "ms")
+    } else if ss.ends_with('s') {
+        (&ss[..ss.len() - 1], "s")
+    } else if ss.ends_with('m') {
+        (&ss[..ss.len() - 1], "m")
+    } else if ss.ends_with('h') {
+        (&ss[..ss.len() - 1], "h")
+    } else {
+        (ss.as_str(), "s")
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    Some(match unit {
+        "ms" => Duration::from_millis(n),
+        "s" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n.saturating_mul(60)),
+        "h" => Duration::from_secs(n.saturating_mul(3600)),
+        _ => Duration::from_secs(n),
+    })
 }
 
 impl LocalFetcher {
+    fn cache_io_timeout_ms_from_env() -> u64 {
+        // Cache IO (fs::read/fs::write) can stall indefinitely on some filesystems (NFS,
+        // flaky external drives, corrupted mounts). Bound it so the agent doesn't "hang forever".
+        //
+        // Default: on (small). Set to 0 to disable cache IO entirely (cache becomes inert).
+        std::env::var("WEBPIPE_CACHE_IO_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(2_000)
+            .clamp(0, 30_000)
+    }
+
+    fn privacy_mode_from_env() -> String {
+        // Values: "normal" (default), "offline", "anonymous".
+        std::env::var("WEBPIPE_PRIVACY_MODE")
+            .unwrap_or_else(|_| "normal".to_string())
+            .trim()
+            .to_ascii_lowercase()
+    }
+
+    fn anon_proxy_from_env() -> Option<String> {
+        // Prefer an explicit webpipe knob; fall back to standard proxy envs.
+        // (Do not treat this as secret; but callers may still prefer not to log it.)
+        for k in [
+            "WEBPIPE_ANON_PROXY",
+            "WEBPIPE_PROXY",
+            "ALL_PROXY",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+        ] {
+            if let Ok(v) = std::env::var(k) {
+                let s = v.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn is_localhost_host(host: &str) -> bool {
+        let h = host.trim().to_ascii_lowercase();
+        h == "localhost" || h == "127.0.0.1" || h == "::1" || h.ends_with(".localhost")
+    }
+
     pub fn new(cache_dir: Option<PathBuf>) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let mut b = reqwest::Client::builder()
             .user_agent("webpipe-local/0.1")
             .redirect(reqwest::redirect::Policy::limited(10))
             // Safety defaults: avoid “hang forever” on DNS/TLS/body stalls.
             // Per-request timeouts (FetchRequest.timeout_ms) can still override this.
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Fetch(e.to_string()))?;
+            .timeout(Duration::from_secs(30));
+
+        // Anonymous mode: route outbound traffic via explicit proxy if provided.
+        // (If no proxy is set, the higher-level MCP layer is expected to block outbound
+        // requests in anonymous mode; we keep LocalFetcher constructible so tool listing works.)
+        if Self::privacy_mode_from_env() == "anonymous" {
+            if let Some(p) = Self::anon_proxy_from_env() {
+                b = b.proxy(reqwest::Proxy::all(p).map_err(|e| Error::Fetch(e.to_string()))?);
+            }
+        }
+
+        let client = b.build().map_err(|e| Error::Fetch(e.to_string()))?;
         let cache = cache_dir.map(FsCache::new);
-        Ok(Self { client, cache })
+        let rate_limiter = RateLimiter::from_env().map(std::sync::Arc::new);
+        Ok(Self {
+            client,
+            cache,
+            rate_limiter,
+            cache_io_disabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
     }
 
     fn allow_unsafe_request_headers() -> bool {
@@ -409,18 +559,58 @@ impl FetchBackend for LocalFetcher {
         if let Some(cache) = self.cache.clone() {
             let req2 = req.clone();
             let t0 = std::time::Instant::now();
-            let hit = tokio::task::spawn_blocking(move || cache.get(&req2))
-                .await
-                .map_err(|e| Error::Cache(format!("cache get join failed: {e}")))??;
-            timings_ms.insert("cache_get".to_string(), t0.elapsed().as_millis());
-            if let Some(mut hit) = hit {
-                hit.timings_ms = timings_ms;
-                return Ok(hit);
+            let cache_timeout_ms = Self::cache_io_timeout_ms_from_env();
+            let cache_io_disabled = self
+                .cache_io_disabled
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if !cache_io_disabled {
+                if cache_timeout_ms == 0 {
+                    timings_ms.insert("cache_get_timeout".to_string(), 0);
+                    self.cache_io_disabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    let mut handle = tokio::task::spawn_blocking(move || cache.get(&req2));
+                    let join = tokio::select! {
+                        r = &mut handle => Ok(r),
+                        _ = tokio::time::sleep(Duration::from_millis(cache_timeout_ms)) => {
+                            handle.abort();
+                            Err(())
+                        }
+                    };
+                    match join {
+                        Ok(r) => {
+                            let hit = r
+                                .map_err(|e| Error::Cache(format!("cache get join failed: {e}")))??;
+                            timings_ms.insert("cache_get".to_string(), t0.elapsed().as_millis());
+                            if let Some(mut hit) = hit {
+                                hit.timings_ms = timings_ms;
+                                return Ok(hit);
+                            }
+                        }
+                        Err(()) => {
+                            timings_ms.insert("cache_get_timeout".to_string(), t0.elapsed().as_millis());
+                            self.cache_io_disabled
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
             }
         }
 
         let t_req = std::time::Instant::now();
         let url = url::Url::parse(&req.url).map_err(|e| Error::InvalidUrl(e.to_string()))?;
+
+        // Anonymous mode: fail closed unless a proxy is configured, for any non-localhost URL.
+        // We do this *after* cache lookup, so warmed-cache workflows still work without proxy.
+        if Self::privacy_mode_from_env() == "anonymous" {
+            let host = url.host_str().unwrap_or("");
+            if !Self::is_localhost_host(host) && Self::anon_proxy_from_env().is_none() {
+                return Err(Error::NotConfigured(
+                    "anonymous mode requires a proxy (set WEBPIPE_ANON_PROXY, e.g. socks5h://127.0.0.1:9050)"
+                        .to_string(),
+                ));
+            }
+        }
 
         // YouTube: transcript-first via yt-dlp (opt-in/auto).
         //
@@ -463,10 +653,46 @@ impl FetchBackend for LocalFetcher {
                         let req2 = req.clone();
                         let out2 = out.clone();
                         let t_put = std::time::Instant::now();
-                        tokio::task::spawn_blocking(move || cache.put(&req2, &out2))
-                            .await
-                            .map_err(|e| Error::Cache(format!("cache put join failed: {e}")))??;
-                        timings_ms.insert("cache_put".to_string(), t_put.elapsed().as_millis());
+                        let cache_timeout_ms = Self::cache_io_timeout_ms_from_env();
+                        let cache_io_disabled = self
+                            .cache_io_disabled
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if !cache_io_disabled {
+                            if cache_timeout_ms == 0 {
+                                timings_ms.insert("cache_put_timeout".to_string(), 0);
+                                self.cache_io_disabled
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                let mut handle =
+                                    tokio::task::spawn_blocking(move || cache.put(&req2, &out2));
+                                let join = tokio::select! {
+                                    r = &mut handle => Ok(r),
+                                    _ = tokio::time::sleep(Duration::from_millis(cache_timeout_ms)) => {
+                                        handle.abort();
+                                        Err(())
+                                    }
+                                };
+                                match join {
+                                    Ok(r) => {
+                                        r.map_err(|e| {
+                                            Error::Cache(format!("cache put join failed: {e}"))
+                                        })??;
+                                        timings_ms
+                                            .insert("cache_put".to_string(), t_put.elapsed().as_millis());
+                                    }
+                                    Err(()) => {
+                                        timings_ms.insert(
+                                            "cache_put_timeout".to_string(),
+                                            t_put.elapsed().as_millis(),
+                                        );
+                                        self.cache_io_disabled.store(
+                                            true,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     return Ok(FetchResponse { timings_ms, ..out });
                 }
@@ -476,6 +702,17 @@ impl FetchBackend for LocalFetcher {
                     }
                     // auto mode: fall through to normal HTML fetch.
                 }
+            }
+        }
+
+        // Best-effort politeness limiter (helps avoid bans / “silent throttles”).
+        // Only apply to non-localhost network fetches.
+        if let Some(lim) = self.rate_limiter.as_ref() {
+            let host = url.host_str().unwrap_or("");
+            if !Self::is_localhost_host(host) {
+                let t0 = std::time::Instant::now();
+                lim.wait().await;
+                timings_ms.insert("rate_limit_wait".to_string(), t0.elapsed().as_millis());
             }
         }
 
@@ -533,10 +770,37 @@ impl FetchBackend for LocalFetcher {
             let req2 = req.clone();
             let out2 = out.clone();
             let t_put = std::time::Instant::now();
-            tokio::task::spawn_blocking(move || cache.put(&req2, &out2))
-                .await
-                .map_err(|e| Error::Cache(format!("cache put join failed: {e}")))??;
-            timings_ms.insert("cache_put".to_string(), t_put.elapsed().as_millis());
+            let cache_timeout_ms = Self::cache_io_timeout_ms_from_env();
+            let cache_io_disabled = self
+                .cache_io_disabled
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if !cache_io_disabled {
+                if cache_timeout_ms == 0 {
+                    timings_ms.insert("cache_put_timeout".to_string(), 0);
+                    self.cache_io_disabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    let mut handle = tokio::task::spawn_blocking(move || cache.put(&req2, &out2));
+                    let join = tokio::select! {
+                        r = &mut handle => Ok(r),
+                        _ = tokio::time::sleep(Duration::from_millis(cache_timeout_ms)) => {
+                            handle.abort();
+                            Err(())
+                        }
+                    };
+                    match join {
+                        Ok(r) => {
+                            r.map_err(|e| Error::Cache(format!("cache put join failed: {e}")))??;
+                            timings_ms.insert("cache_put".to_string(), t_put.elapsed().as_millis());
+                        }
+                        Err(()) => {
+                            timings_ms.insert("cache_put_timeout".to_string(), t_put.elapsed().as_millis());
+                            self.cache_io_disabled
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
         }
 
         Ok(FetchResponse { timings_ms, ..out })

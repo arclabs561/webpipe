@@ -1,0 +1,40 @@
+[
+  {
+    "query": "Elias-Fano encoding",
+    "urls": [
+      "https://en.wikipedia.org/wiki/Elias%E2%80%93Fano_encoding",
+      "https://en.wikipedia.org/wiki/Shannon%E2%80%93Fano%E2%80%93Elias_coding"
+    ],
+    "fetch_backend": "local",
+    "timeout_ms": 15000,
+    "max_bytes": 2000000,
+    "max_chars": 25000,
+    "top_chunks": 6,
+    "max_chunk_chars": 500,
+    "include_text": false,
+    "include_structure": false,
+    "include_links": false,
+    "compact": true,
+    "cache_read": true,
+    "cache_write": true
+  },
+  {
+    "query": "Elias-Fano encoding",
+    "urls": [
+      "https://en.wikipedia.org/wiki/Elias%E2%80%93Fano_encoding",
+      "https://en.wikipedia.org/wiki/Shannon%E2%80%93Fano%E2%80%93Elias_coding"
+    ],
+    "fetch_backend": "local",
+    "timeout_ms": 15000,
+    "max_bytes": 2000000,
+    "max_chars": 60000,
+    "top_chunks": 6,
+    "max_chunk_chars": 500,
+    "include_text": false,
+    "include_structure": false,
+    "include_links": false,
+    "compact": true,
+    "cache_read": true,
+    "cache_write": true
+  }
+]

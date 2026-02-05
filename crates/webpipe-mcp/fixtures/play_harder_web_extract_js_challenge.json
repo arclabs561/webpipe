@@ -1,0 +1,30 @@
+[
+  {
+    "url": "https://wolfgarbe.medium.com/elias-fano-quasi-succinct-compression-of-sorted-integers-in-c-89f92a8c9986",
+    "fetch_backend": "local",
+    "timeout_ms": 15000,
+    "max_bytes": 2000000,
+    "max_chars": 20000,
+    "top_chunks": 5,
+    "max_chunk_chars": 500,
+    "include_text": false,
+    "include_structure": false,
+    "include_links": false,
+    "cache_read": true,
+    "cache_write": true
+  },
+  {
+    "url": "https://wolfgarbe.medium.com/elias-fano-quasi-succinct-compression-of-sorted-integers-in-c-89f92a8c9986",
+    "fetch_backend": "render",
+    "timeout_ms": 15000,
+    "max_bytes": 2000000,
+    "max_chars": 20000,
+    "top_chunks": 5,
+    "max_chunk_chars": 500,
+    "include_text": false,
+    "include_structure": false,
+    "include_links": false,
+    "cache_read": true,
+    "cache_write": true
+  }
+]

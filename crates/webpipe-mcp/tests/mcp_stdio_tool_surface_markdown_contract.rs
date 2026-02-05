@@ -149,17 +149,37 @@ fn webpipe_mcp_stdio_tool_surface_markdown_contract_offlineish() {
             Some("webpipe_usage")
         );
 
-        // web_seed_urls
-        let seeds = service
+        // search_evidence (urls-mode; no web search; stays local)
+        let ev = service
             .call_tool(CallToolRequestParam {
-                name: "web_seed_urls".into(),
-                arguments: Some(serde_json::json!({"max": 5}).as_object().cloned().unwrap()),
+                name: "search_evidence".into(),
+                arguments: Some(
+                    serde_json::json!({
+                        "query": "mcp-surface unique token",
+                        "urls": [doc_url],
+                        "url_selection_mode": "preserve",
+                        "fetch_backend": "local",
+                        "max_urls": 1,
+                        "timeout_ms": 5000,
+                        "max_bytes": 1_000_000,
+                        "include_text": false,
+                        "include_links": false,
+                        "include_structure": false,
+                        "top_chunks": 3,
+                        "max_chunk_chars": 200,
+                        "compact": true,
+                        "agentic": false
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ),
             })
             .await?;
-        assert_markdown_view(&seeds);
+        assert_markdown_view(&ev);
         assert_eq!(
-            seeds.structured_content.clone().unwrap()["kind"].as_str(),
-            Some("web_seed_urls")
+            ev.structured_content.clone().unwrap()["kind"].as_str(),
+            Some("web_search_extract")
         );
 
         // web_fetch (also warms cache)
@@ -221,30 +241,48 @@ fn webpipe_mcp_stdio_tool_surface_markdown_contract_offlineish() {
             Some("web_extract")
         );
 
-        // web_search (error path is fine; should still be Markdown)
+        // search_evidence (search-mode error path is fine; should still be Markdown)
         let search_err = service
             .call_tool(CallToolRequestParam {
-                name: "web_search".into(),
-                arguments: Some(serde_json::json!({"query": ""}).as_object().cloned().unwrap()),
+                name: "search_evidence".into(),
+                arguments: Some(
+                    serde_json::json!({
+                        "query": "mcp tool surface contract",
+                        "provider": "auto",
+                        "auto_mode": "fallback",
+                        "max_results": 3,
+                        "max_urls": 1,
+                        "fetch_backend": "local",
+                        "compact": true,
+                        "agentic": false,
+                        "timeout_ms": 2000
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ),
             })
             .await?;
         assert_markdown_view(&search_err);
         assert_eq!(
             search_err.structured_content.clone().unwrap()["kind"].as_str(),
-            Some("web_search")
+            Some("web_search_extract")
         );
 
-        // web_cache_search_extract (should work with warmed cache + bounded params)
+        // search_evidence cache-corpus mode (replaces web_cache_search_extract in normal toolset)
         let cache_search = service
             .call_tool(CallToolRequestParam {
-                name: "web_cache_search_extract".into(),
+                name: "search_evidence".into(),
                 arguments: Some(
                     serde_json::json!({
                         "query": "mcp-surface",
-                        "max_docs": 10,
-                        "max_scan_entries": 500,
+                        "no_network": true,
                         "include_text": false,
-                        "compact": true
+                        "include_links": false,
+                        "include_structure": false,
+                        "compact": true,
+                        "top_chunks": 5,
+                        "max_chunk_chars": 200
                     })
                     .as_object()
                     .cloned()
@@ -255,7 +293,7 @@ fn webpipe_mcp_stdio_tool_surface_markdown_contract_offlineish() {
         assert_markdown_view(&cache_search);
         assert_eq!(
             cache_search.structured_content.clone().unwrap()["kind"].as_str(),
-            Some("web_cache_search_extract")
+            Some("web_search_extract")
         );
 
         // arxiv_search (success path via local stub)

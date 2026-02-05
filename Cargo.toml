@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/webpipe",
   "crates/webpipe-core",
   "crates/webpipe-local",
   "crates/webpipe-mcp",

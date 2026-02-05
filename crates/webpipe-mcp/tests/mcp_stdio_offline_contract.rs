@@ -74,7 +74,11 @@ fn webpipe_mcp_stdio_offline_contract() {
                     cmd.args(["mcp-stdio"]);
                     // Disable `.env` autoload so this test stays hermetic.
                     cmd.env("WEBPIPE_DOTENV", "0");
+                    // This contract asserts the full tool surface (including debug-only tools).
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env("WEBPIPE_CACHE_DIR", cache_dir.path());
+                    // For contract tests, force full offline-only behavior (localhost fixtures still work).
+                    cmd.env("WEBPIPE_OFFLINE_ONLY", "1");
                     cmd.env_remove("WEBPIPE_ALLOW_UNSAFE_HEADERS");
                     // Ensure no provider keys are present for deterministic error-path checks.
                     cmd.env_remove("WEBPIPE_BRAVE_API_KEY");
@@ -101,7 +105,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             "web_fetch",
             "web_search",
             "web_extract",
-            "web_search_extract",
+            "search_evidence",
         ] {
             assert!(names.contains(must_have), "missing tool {must_have}");
         }
@@ -110,7 +114,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             "web_fetch",
             "web_search",
             "web_extract",
-            "web_search_extract",
+            "search_evidence",
         ] {
             let t = by_name.get(must_have).expect("tool exists");
             let desc = t.description.as_deref().unwrap_or("");
@@ -130,7 +134,7 @@ fn webpipe_mcp_stdio_offline_contract() {
             ("web_fetch", true, true),
             ("web_extract", true, true),
             ("web_search", true, true),
-            ("web_search_extract", true, true),
+            ("search_evidence", true, true),
             ("web_seed_search_extract", true, true),
             ("web_deep_research", true, true),
             ("arxiv_search", true, true),
@@ -254,6 +258,7 @@ fn webpipe_mcp_stdio_offline_contract() {
         assert_eq!(meta_v["schema_version"].as_u64(), Some(2));
         assert_eq!(meta_v["kind"].as_str(), Some("webpipe_meta"));
         assert_eq!(meta_v["ok"].as_bool(), Some(true));
+        assert_eq!(meta_v["offline_only"].as_bool(), Some(true));
         assert!(meta_v["configured"]["providers"]["brave"].is_boolean());
         assert!(meta_v["configured"]["providers"]["tavily"].is_boolean());
         assert!(meta_v["configured"]["remote_fetch"]["firecrawl"].is_boolean());
@@ -287,13 +292,13 @@ fn webpipe_mcp_stdio_offline_contract() {
         assert_eq!(search_v["kind"].as_str(), Some("web_search"));
         assert_eq!(search_v["ok"].as_bool(), Some(false));
         assert_eq!(search_v["provider"].as_str(), Some("auto"));
-        assert_eq!(search_v["error"]["code"].as_str(), Some("not_configured"));
+        assert_eq!(search_v["error"]["code"].as_str(), Some("not_supported"));
         assert_eq!(search_v["error"]["retryable"].as_bool(), Some(false));
 
-        // web_search_extract should reject missing query+urls with invalid_params.
+        // search_evidence should fail closed in offline mode when urls are missing.
         let bad = service
             .call_tool(CallToolRequestParam {
-                name: "web_search_extract".into(),
+                name: "search_evidence".into(),
                 arguments: Some(serde_json::json!({}).as_object().cloned().unwrap()),
             })
             .await?;
@@ -303,12 +308,12 @@ fn webpipe_mcp_stdio_offline_contract() {
             .ok_or("expected structured_content")?;
         assert_eq!(bad_v["kind"].as_str(), Some("web_search_extract"));
         assert_eq!(bad_v["ok"].as_bool(), Some(false));
-        assert_eq!(bad_v["error"]["code"].as_str(), Some("invalid_params"));
+        assert_eq!(bad_v["error"]["code"].as_str(), Some("not_supported"));
 
-        // web_search_extract in offline mode (urls provided) should return top chunks.
+        // search_evidence in offline mode (urls provided) should return top chunks.
         let hydrate = service
             .call_tool(CallToolRequestParam {
-                name: "web_search_extract".into(),
+                name: "search_evidence".into(),
                 arguments: Some(
                     serde_json::json!({
                         "query": "hello",

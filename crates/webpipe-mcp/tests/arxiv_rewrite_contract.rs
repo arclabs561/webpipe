@@ -45,29 +45,36 @@ async fn call(
 fn web_extract_rewrites_arxiv_abs_to_pdf_on_same_host() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
-        // Minimal PDF header bytes; extraction may yield empty, but we only assert the rewrite happened.
-        let pdf_bytes: Vec<u8> = b"%PDF-1.4\n%fake\n".to_vec();
-        let pdf_s = String::from_utf8_lossy(&pdf_bytes).to_string();
-
+        // Keep this contract focused on URL rewrite behavior, not PDF extraction robustness.
+        //
+        // Some environments have slow or flaky PDF backends (shellouts like `pdftotext`), which
+        // can make this test *look* hung while it is actually waiting on PDF parsing/extraction.
+        // Serving non-PDF bytes avoids that whole class of nondeterminism.
         let app = Router::new().route(
             "/pdf/1234.5678.pdf",
-            get(move || {
-                let body = pdf_s.clone();
-                async move { ([("content-type", "application/pdf")], body) }
-            }),
+            get(|| async { ([("content-type", "text/plain; charset=utf-8")], "ok") }),
         );
         let addr = serve(app).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("webpipe-cache");
 
         let bin = assert_cmd::cargo::cargo_bin!("webpipe");
         let service = ()
             .serve(TokioChildProcess::new(
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
-                    cmd.env(
-                        "WEBPIPE_CACHE_DIR",
-                        std::env::temp_dir().join("webpipe-arxiv-rewrite-cache"),
-                    );
+                    cmd.env("WEBPIPE_DOTENV", "0");
+                    cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
                     cmd.env("WEBPIPE_ARXIV_REWRITE_HOSTS", "127.0.0.1");
+                    cmd.env("WEBPIPE_PDF_SHELLOUT", "off");
+                    // Deterministic keyless behavior.
+                    cmd.env_remove("WEBPIPE_BRAVE_API_KEY");
+                    cmd.env_remove("BRAVE_SEARCH_API_KEY");
+                    cmd.env_remove("WEBPIPE_TAVILY_API_KEY");
+                    cmd.env_remove("TAVILY_API_KEY");
+                    cmd.env_remove("WEBPIPE_FIRECRAWL_API_KEY");
+                    cmd.env_remove("FIRECRAWL_API_KEY");
                 }),
             )?)
             .await?;

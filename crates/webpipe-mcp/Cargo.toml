@@ -1,22 +1,27 @@
 [package]
-name = "webpipe-mcp"
+name = "webpipe"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-publish = false
-description = "webpipe MCP stdio server + CLI harness."
+publish = true
+description = "Local search/fetch/extract plumbing (CLI + MCP stdio server)."
+repository = "https://github.com/arclabs561/webpipe"
+homepage = "https://github.com/arclabs561/webpipe"
+documentation = "https://docs.rs/webpipe"
+readme = "README.md"
 
 [dependencies]
-webpipe-core = { path = "../webpipe-core" }
-webpipe-local = { path = "../webpipe-local" }
+webpipe-core = { version = "0.1.0", path = "../webpipe-core" }
+webpipe-local = { version = "0.1.0", path = "../webpipe-local" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy", "socks"] }
 flate2 = "1.0"
+futures = "0.3"
 base64 = { version = "0.22", optional = true }
 dirs = "5.0"
 rmcp = { version = "0.12.0", optional = true, features = ["macros", "server", "client", "transport-io", "transport-child-process", "schemars"] }

@@ -1,5 +1,10 @@
 target/
 target-webpipe/
+target-cursor/
+target-webpipe-install/
+target-webpipe-check/
+target-webpipe-validate/
+crates/target-install-webpipe/
 .generated/
 
 # OS/editor

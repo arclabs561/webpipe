@@ -75,6 +75,8 @@ fn web_sitemap_extract_discovers_urls_from_robots_and_sitemap() {
             .serve(TokioChildProcess::new(
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
+                    // web_sitemap_extract is a debug-only tool; enable full surface for contract tests.
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env(
                         "WEBPIPE_CACHE_DIR",
                         std::env::temp_dir().join("webpipe-sitemap-cache"),
@@ -184,6 +186,8 @@ fn web_sitemap_extract_handles_sitemapindex_and_gz() {
             .serve(TokioChildProcess::new(
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
+                    // web_sitemap_extract is a debug-only tool; enable full surface for contract tests.
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env(
                         "WEBPIPE_CACHE_DIR",
                         std::env::temp_dir().join("webpipe-sitemap-gz-cache"),

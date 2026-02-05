@@ -14,8 +14,10 @@ fn get_env_any(keys: &[&str]) -> Option<String> {
 #[test]
 fn webpipe_live_search_caps_smoke_opt_in() {
     // This test makes real paid network calls. Opt-in only.
-    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1") {
-        eprintln!("skipping: set WEBPIPE_LIVE=1 to run live search caps smoke");
+    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1")
+        || std::env::var("WEBPIPE_LIVE_PAID").ok().as_deref() != Some("1")
+    {
+        eprintln!("skipping: set WEBPIPE_LIVE=1 WEBPIPE_LIVE_PAID=1 to run live search caps smoke");
         return;
     }
 
@@ -23,8 +25,7 @@ fn webpipe_live_search_caps_smoke_opt_in() {
     let brave_key = get_env_any(&["WEBPIPE_BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"]);
     let tavily_key = get_env_any(&["WEBPIPE_TAVILY_API_KEY", "TAVILY_API_KEY"]);
     if brave_key.is_none() || tavily_key.is_none() {
-        eprintln!("skipping: need both Brave + Tavily keys to run this test");
-        return;
+        panic!("need both Brave + Tavily keys to run this test");
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");

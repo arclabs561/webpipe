@@ -1,0 +1,32 @@
+[
+  {
+    "url": "https://www.rfc-editor.org/rfc/rfc9110.pdf",
+    "fetch_backend": "local",
+    "timeout_ms": 25000,
+    "max_bytes": 5000000,
+    "max_chars": 20000,
+    "top_chunks": 5,
+    "max_chunk_chars": 500,
+    "include_text": false,
+    "include_structure": false,
+    "include_links": false,
+    "cache_read": true,
+    "cache_write": true,
+    "retry_on_truncation": true
+  },
+  {
+    "url": "https://www.rfc-editor.org/rfc/rfc9110.pdf",
+    "fetch_backend": "local",
+    "timeout_ms": 25000,
+    "max_bytes": 5000000,
+    "max_chars": 8000,
+    "top_chunks": 5,
+    "max_chunk_chars": 500,
+    "include_text": false,
+    "include_structure": false,
+    "include_links": false,
+    "cache_read": true,
+    "cache_write": true,
+    "retry_on_truncation": true
+  }
+]

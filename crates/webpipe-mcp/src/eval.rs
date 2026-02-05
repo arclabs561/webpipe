@@ -283,6 +283,7 @@ pub async fn eval_search(spec: EvalSearchSpec) -> Result<PathBuf> {
             max_results: Some(max_results),
             language: spec.language.clone(),
             country: spec.country.clone(),
+            timeout_ms: Some(20_000),
         };
 
         let mut per_provider = Vec::new();

@@ -81,11 +81,11 @@ It includes a timeline, affected package names, and mitigation steps.
             .iter()
             .map(|t| t.name.clone().into_owned())
             .collect();
-        assert!(names.contains("web_search_extract"));
+        assert!(names.contains("search_evidence"));
 
         let resp = service
             .call_tool(CallToolRequestParam {
-                name: "web_search_extract".into(),
+                name: "search_evidence".into(),
                 arguments: Some(
                     serde_json::json!({
                         "query": "dependency confusion incident",

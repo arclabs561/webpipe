@@ -1,7 +1,19 @@
 use serde::Serialize;
 
-pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
+pub(crate) fn warning_hint(code: &str) -> Option<&'static str> {
     match code {
+        "boilerplate_reduced" => Some(
+            "Boilerplate/navigation was reduced. If the remaining text is still noisy, try fetch_backend=\"firecrawl\" (if configured) or pass urls=[...] that point to a specific article/docs page.",
+        ),
+        "text_truncated_by_max_chars" => Some(
+            "Text was truncated by max_chars. Increase max_chars (bounded; e.g. 60_000) or use include_text=false + top_chunks for a smaller, higher-signal evidence pack.",
+        ),
+        "text_windowed_for_query" => Some(
+            "Text was windowed around the best-matching query chunk (to avoid nav-first truncation on long docs pages). If you need the document prefix, increase max_chars or set include_text=true and fetch the page directly.",
+        ),
+        "cache_doc_reused" => Some(
+            "Multiple cache entries mapped to the same URL. The server may deduplicate and keep the best-scoring match to reduce repetition.",
+        ),
         "cache_only" => Some(
             "This result was served from cache (no_network=true). To refresh, set no_network=false.",
         ),
@@ -20,6 +32,9 @@ pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
         "links_unavailable" => Some(
             "Link extraction is unavailable for this backend/content type (e.g. firecrawl or pdf).",
         ),
+        "links_timeout" => Some(
+            "Link extraction exceeded its bounded timeout and returned no links. Increase WEBPIPE_LINKS_TIMEOUT_MS or disable include_links.",
+        ),
         "headers_unavailable" => Some("Headers are unavailable for this backend (e.g. firecrawl)."),
         "text_unavailable_for_pdf" => Some(
             "This looks like a PDF; use web_extract to extract text from PDFs (web_fetch is bytes/text-only).",
@@ -27,8 +42,20 @@ pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
         "semantic_backend_not_configured" => Some(
             "Semantic rerank requested but embeddings backend is not configured. Set an embeddings API key or disable semantic_rerank.",
         ),
+        "semantic_rerank_timeout" => Some(
+            "Semantic rerank exceeded its bounded timeout and was skipped. If you need it, increase WEBPIPE_SEMANTIC_TIMEOUT_MS or disable semantic_rerank/semantic_auto_fallback.",
+        ),
         "blocked_by_js_challenge" => Some(
             "This looks like a JS/CAPTCHA/auth wall. Try fetch_backend=\"firecrawl\" (if configured) or choose a different URL.",
+        ),
+        "client_side_redirect" => Some(
+            "This page appears to be a client-side redirect/interstitial (meta refresh / JS). Use the redirect target URL directly (or increase max_urls) so the tool can fetch the real content.",
+        ),
+        "silently_throttled" => Some(
+            "This looks like a throttling/interstitial page even though the HTTP status was OK. Try a different source URL, reduce request rate, or switch fetch_backend (render/firecrawl).",
+        ),
+        "http_status_error" => Some(
+            "HTTP status was >= 400 (likely an error/challenge page). The result is shown for auditability, but its chunks should not be treated as high-quality evidence.",
         ),
         "main_content_low_signal" => Some(
             "Extraction appears dominated by navigation/boilerplate. Try fetch_backend=\"firecrawl\" (if configured) or increase max_chars.",
@@ -36,11 +63,17 @@ pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
         "chunks_filtered_low_signal" => Some(
             "Some extracted chunks looked like JS/app-shell gunk and were filtered. If you need raw output, try include_text=true or fetch_backend=\"firecrawl\".",
         ),
+        "structure_html_skipped_long_token" => Some(
+            "HTML structure parsing was skipped because the page contained an extremely long unbroken token (often minified JS/base64 blobs). Structure was derived from extracted text instead.",
+        ),
         "all_chunks_low_signal" => Some(
             "All extracted chunks appear low-signal (likely app-shell/JS bundle/auth wall). Try fetch_backend=\"firecrawl\" (if configured), choose a different URL, or pass urls=[...] that point to a specific article/docs page.",
         ),
         "extract_input_truncated" => Some(
             "The fetched body was large; extraction only used the first WEBPIPE_EXTRACT_MAX_BYTES bytes. To change this, lower max_bytes or increase WEBPIPE_EXTRACT_MAX_BYTES (server env).",
+        ),
+        "extract_pipeline_timeout" => Some(
+            "Extraction exceeded its bounded pipeline timeout and returned a minimal empty result. Try reducing max_bytes/max_chars, switching fetch_backend, or increasing WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS.",
         ),
         "truncation_retry_used" => Some(
             "The initial fetch was truncated by max_bytes, so we retried once with a larger max_bytes (bounded) to recover tail content.",
@@ -50,6 +83,42 @@ pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
         ),
         "firecrawl_fallback_on_low_signal" => Some(
             "Local extraction looked like low-signal app-shell/JS gunk, so we retried this URL via Firecrawl (bounded).",
+        ),
+        "render_fallback_on_empty_extraction" => Some(
+            "Local extraction was empty, so we retried this URL via Playwright render (bounded). If this keeps happening, consider using fetch_backend=\"render\" directly for this workflow.",
+        ),
+        "render_fallback_on_low_signal" => Some(
+            "Local extraction looked low-signal (likely JS/app-shell), so we retried this URL via Playwright render (bounded). If the page is highly dynamic, try increasing timeout_ms.",
+        ),
+        "render_fallback_disabled" => Some(
+            "Render fallback was requested but is disabled (WEBPIPE_RENDER_DISABLE=1). Unset WEBPIPE_RENDER_DISABLE (and install Playwright) to enable render fallback, or disable render_fallback_* flags.",
+        ),
+        "render_fallback_failed" => Some(
+            "Render fallback failed for this URL. Try increasing timeout_ms, or use fetch_backend=\"render\" directly to debug. In anonymous mode, ensure WEBPIPE_ANON_PROXY points to an HTTP proxy (not socks5h://).",
+        ),
+        "deadline_exceeded_partial" => Some(
+            "Hard deadline hit; returned partial results. Increase deadline_ms (or reduce max_urls/timeout_ms) if you need more coverage.",
+        ),
+        "no_query_overlap_any_url" => Some(
+            "No extracted chunks matched the query tokens across the selected URLs. Try different URLs (or deeper links), increase max_chars, or enable render_fallback_on_low_signal / fetch_backend=\"render\" for JS-heavy docs.",
+        ),
+        "no_query_overlap_doc" => Some(
+            "This cached document had no chunk-level overlap with the query, so it was skipped for evidence selection. Refine the query or restrict domains (or pass urls=[...] to search only intended sources).",
+        ),
+        "no_query_overlap_docs_dropped" => Some(
+            "Most cached documents did not match the query and were dropped from results to keep output compact. If you expected matches, refine the query or increase max_docs/max_scan_entries (debug toolset), or warm cache with relevant URLs first.",
+        ),
+        "cache_search_timeout" => Some(
+            "Cache search+extract exceeded its bounded timeout and returned no results. Increase WEBPIPE_CACHE_SEARCH_TIMEOUT_MS (or reduce max_scan_entries/max_docs).",
+        ),
+        "cache_io_timeout" => Some(
+            "Cache filesystem IO exceeded its bounded timeout; cache was bypassed to keep the tool responsive. If this happens often, check filesystem health or increase WEBPIPE_CACHE_IO_TIMEOUT_MS.",
+        ),
+        "render_fallback_not_configured" => Some(
+            "Render fallback could not run (missing configuration). Install Playwright (Node) + browsers, and ensure Node can require('playwright').",
+        ),
+        "render_fallback_not_supported" => Some(
+            "Render fallback is not supported in the current mode/config (e.g. privacy_mode=offline, or anonymous mode with a socks5h:// proxy). For anonymous render, use an HTTP proxy endpoint (Tor users often run Privoxy).",
         ),
         "perplexity_search_mode_off_rejected" => Some(
             "Tried to disable provider-side browsing (search_mode=\"off\"), but the provider rejected it; we retried without search_mode.",
@@ -87,6 +156,9 @@ pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
         "pdf_extract_failed" => Some(
             "PDF text extraction failed. The PDF may be scanned/image-only or the environment may lack shellout tools. Try enabling/installing PDF tools (pdftotext/mutool) or use an OCR backend for scanned PDFs.",
         ),
+        "pdf_extract_panicked" => Some(
+            "The PDF parser crashed on malformed input. webpipe recovered, but the page has no usable extracted text. Try a different PDF URL, enable PDF shellout tools (pdftotext/mutool), or re-warm cache from a non-truncated source.",
+        ),
         "pdf_shellout_unavailable" => Some(
             "PDF shellout tools are unavailable here. Install `pdftotext` (poppler) or `mutool` (MuPDF), and set WEBPIPE_PDF_SHELLOUT=auto (or a specific tool) to enable higher-robustness PDF extraction.",
         ),
@@ -97,7 +169,7 @@ pub(crate) fn warning_hint(code: &'static str) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn warning_hints_from(codes: &[&'static str]) -> serde_json::Value {
+pub(crate) fn warning_hints_from(codes: &[&str]) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     for c in codes {
         if let Some(h) = warning_hint(c) {

@@ -127,6 +127,22 @@ enum Commands {
     EvalGenerateDomainPack(EvalGenerateDomainPackCmd),
     /// Diagnose configuration/launch issues (json; no secrets).
     Doctor(DoctorCmd),
+    /// List tools exposed by the MCP stdio server (for auditing what Cursor sees).
+    #[cfg(feature = "stdio")]
+    McpListTools(McpListToolsCmd),
+    /// Call an MCP tool via a spawned `mcp-stdio` child and print its Markdown.
+    ///
+    /// This is a local debugging bridge for “what does Cursor see?” without needing the
+    /// Cursor UI. It spawns `webpipe mcp-stdio`, calls a tool, and prints the returned
+    /// Markdown content to stdout.
+    #[cfg(feature = "stdio")]
+    McpCall(McpCallCmd),
+    /// Run a small, tool-agnostic MCP smoke sweep (single child server).
+    ///
+    /// This is a debugging helper for validating that all MCP-visible tools work end-to-end
+    /// in one process, so `webpipe_usage` reflects the full run.
+    #[cfg(feature = "stdio")]
+    McpSweep(McpSweepCmd),
     /// Summarize a transcript JSONL into a compact JSON report.
     ///
     /// This is the “index” for later audits: counts by stage/run_kind, parse-fail rates,
@@ -136,7 +152,7 @@ enum Commands {
     /// Summarize multiple VLM critique artifacts into a compact meta report (json).
     ///
     /// Inputs are JSON artifacts produced by `webpipe vlm-openrouter`.
-    #[cfg(feature = "eval")]
+    #[cfg(all(feature = "eval", feature = "vlm"))]
     EvalVlmSummarize(EvalVlmSummarizeCmd),
     /// Run a VLM over multiple images (and optionally summarize) (json).
     ///
@@ -146,14 +162,14 @@ enum Commands {
     /// - writes per-image artifacts under `--out-dir`
     /// - optionally appends transcript events
     /// - writes a meta summary JSON like `eval-vlm-summarize`
-    #[cfg(feature = "eval")]
+    #[cfg(all(feature = "eval", feature = "vlm"))]
     EvalVlmRun(EvalVlmRunCmd),
     /// Bundle page + plots VLM summaries into one artifact (json).
     ///
     /// This is a convenience “one file to hand to a meta-judge” wrapper over:
     /// - `eval-vlm-run` (full-page screenshots)
     /// - `eval-vlm-run` (plot images)
-    #[cfg(feature = "eval")]
+    #[cfg(all(feature = "eval", feature = "vlm"))]
     EvalVlmBundle(EvalVlmBundleCmd),
     /// Print version info.
     Version(VersionCmd),
@@ -812,8 +828,8 @@ struct EvalFetchCmd {
 
 #[derive(clap::Args, Debug)]
 struct DoctorCmd {
-    /// Output format: json|text
-    #[arg(long = "output", alias = "format", default_value = "json")]
+    /// Output format: pretty|json|text
+    #[arg(long = "output", alias = "format", default_value = "pretty")]
     output: String,
     /// Attempt a local stdio MCP handshake (list_tools) to prove Cursor can start the server.
     ///
@@ -824,6 +840,73 @@ struct DoctorCmd {
     /// Timeout for the stdio handshake (ms).
     #[arg(long, default_value_t = 3000)]
     timeout_ms: u64,
+}
+
+#[cfg(feature = "stdio")]
+#[derive(clap::Args, Debug)]
+struct McpListToolsCmd {
+    /// Output format: pretty|json
+    #[arg(long = "output", alias = "format", default_value = "pretty")]
+    output: String,
+    /// Timeout for the MCP call (ms).
+    #[arg(long, default_value_t = 3000)]
+    timeout_ms: u64,
+    /// Include the full JSON Schema for each tool (can be large).
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    include_schema: bool,
+}
+
+#[cfg(feature = "stdio")]
+#[derive(clap::Args, Debug)]
+struct McpCallCmd {
+    /// Tool name to call (e.g. "search_evidence", "web_extract", "web_search_extract").
+    #[arg(long)]
+    tool: String,
+    /// JSON object string for tool arguments (e.g. '{"query":"...","max_urls":3}').
+    ///
+    /// Note: must be a JSON object (top-level `{...}`), not an array.
+    #[arg(long, conflicts_with = "args_json_file")]
+    args_json: Option<String>,
+    /// Path to a JSON file containing either:
+    /// - a single JSON object `{...}` (one call), or
+    /// - a JSON array of objects `[{...},{...}]` (multiple calls)
+    ///
+    /// This is the easiest way to compare parameter sets in one spawned MCP server,
+    /// so cache/process overhead doesn't dominate (e.g. sequential vs parallel knobs).
+    #[arg(long, conflicts_with = "args_json")]
+    args_json_file: Option<std::path::PathBuf>,
+    /// Repeat the call(s) this many times (default: 1).
+    ///
+    /// When multiple args objects are provided (via --args-json-file array),
+    /// the entire sequence is repeated.
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
+    /// Timeout for the MCP call (ms).
+    #[arg(long, default_value_t = 25_000)]
+    timeout_ms: u64,
+    /// If true, also print the structured JSON payload (pretty) after the Markdown.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    print_structured: bool,
+    /// If true, print Markdown for every call (default: only print the first call's Markdown).
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    print_each: bool,
+}
+
+#[cfg(feature = "stdio")]
+#[derive(clap::Args, Debug)]
+struct McpSweepCmd {
+    /// Output format: pretty|json
+    #[arg(long = "output", alias = "format", default_value = "pretty")]
+    output: String,
+    /// Timeout for each MCP call (ms).
+    #[arg(long, default_value_t = 25_000)]
+    timeout_ms: u64,
+    /// Max number of URLs for the search_evidence call (bounded).
+    #[arg(long, default_value_t = 4)]
+    max_urls: usize,
+    /// Max chars for extraction-heavy calls (bounded).
+    #[arg(long, default_value_t = 20_000)]
+    max_chars: usize,
 }
 
 #[cfg(feature = "eval")]
@@ -849,7 +932,7 @@ struct EvalTranscriptSummarizeCmd {
     now_epoch_s: Option<u64>,
 }
 
-#[cfg(feature = "eval")]
+#[cfg(all(feature = "eval", feature = "vlm"))]
 #[derive(clap::Args, Debug)]
 struct EvalVlmSummarizeCmd {
     /// Input JSON artifact(s) produced by `webpipe vlm-openrouter`.
@@ -863,7 +946,7 @@ struct EvalVlmSummarizeCmd {
     now_epoch_s: Option<u64>,
 }
 
-#[cfg(feature = "eval")]
+#[cfg(all(feature = "eval", feature = "vlm"))]
 #[derive(clap::Args, Debug)]
 struct EvalVlmRunCmd {
     /// One or more image paths to critique (repeatable).
@@ -959,7 +1042,7 @@ struct EvalVlmRunCmd {
     now_epoch_s: Option<u64>,
 }
 
-#[cfg(feature = "eval")]
+#[cfg(all(feature = "eval", feature = "vlm"))]
 #[derive(clap::Args, Debug)]
 struct EvalVlmBundleCmd {
     /// Page-level VLM summary JSON (typically produced by `eval-vlm-run` on *_full.png).
@@ -1622,8 +1705,7 @@ mod mcp {
         },
         prompt, prompt_router,
         service::RequestContext,
-        tool, tool_router,
-        ErrorData as McpError, RoleServer, ServiceExt,
+        tool, tool_router, ErrorData as McpError, RoleServer, ServiceExt,
     };
     use schemars::generate::SchemaSettings;
     use schemars::{JsonSchema, SchemaGenerator};
@@ -1687,6 +1769,7 @@ mod mcp {
                     | "web_fetch"
                     | "web_extract"
                     | "search_evidence"
+                    | "web_perplexity"
                     | "arxiv_search"
                     | "arxiv_enrich"
                     | "paper_search"
@@ -2146,7 +2229,13 @@ mod mcp {
 
     fn anon_proxy_from_env() -> Option<String> {
         // Prefer an explicit knob; fall back to standard proxy envs.
-        for k in ["WEBPIPE_ANON_PROXY", "WEBPIPE_PROXY", "ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"] {
+        for k in [
+            "WEBPIPE_ANON_PROXY",
+            "WEBPIPE_PROXY",
+            "ALL_PROXY",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+        ] {
             if let Ok(v) = std::env::var(k) {
                 let s = v.trim();
                 if !s.is_empty() {
@@ -2161,7 +2250,10 @@ mod mcp {
         // Full-privacy / offline-only mode: forbid non-localhost networking regardless of tool args.
         // Accept a few common truthy values.
         match std::env::var("WEBPIPE_OFFLINE_ONLY") {
-            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            Ok(v) => matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
             Err(_) => false,
         }
     }
@@ -2211,6 +2303,10 @@ mod mcp {
         // Generic (non-domain-specific) heuristics to avoid agentic loops getting stuck on
         // auth walls / JS challenges / consent gates.
         let u = url.to_ascii_lowercase();
+        // GitHub UI routes that almost always require auth (and are rarely substantive content).
+        if u.contains("github.com/") && u.contains("/edit/") {
+            return true;
+        }
         // Path-ish signals.
         for needle in [
             "/login",
@@ -2233,10 +2329,18 @@ mod mcp {
         }
         // Wiki / CMS patterns that often route to auth walls (but don't include "/login" etc).
         // Example observed in live use: Wikipedia `Special:CreateAccount` redirects.
-        for needle in ["special:createaccount", "special:userlogin", "special:login"] {
+        for needle in [
+            "special:createaccount",
+            "special:userlogin",
+            "special:login",
+        ] {
             if u.contains(needle) {
                 return true;
             }
+        }
+        // Wikipedia special pages are navigation/utility, not substantive content.
+        if u.contains("wikipedia.org/wiki/special:") {
+            return true;
         }
         // Query-ish signals.
         for needle in [
@@ -2260,6 +2364,104 @@ mod mcp {
         false
     }
 
+    fn url_looks_like_js_challenge_prone_host(url: &str) -> bool {
+        // Domain-specific heuristics for hosts that commonly block headless/local fetching
+        // with JS challenges (and therefore frequently produce low-signal extracts).
+        //
+        // Keep this list conservative: it is used only for score *penalties*, not hard exclusion.
+        let u = url.to_ascii_lowercase();
+        u.contains("dl.acm.org/")
+    }
+
+    fn url_is_localhost(url: &str) -> bool {
+        // Used to interpret `no_network=true` as “no non-localhost networking”.
+        //
+        // This keeps offline/CI harnesses safe while still allowing deterministic localhost
+        // fixture servers.
+        let Ok(u) = reqwest::Url::parse(url.trim()) else {
+            return false;
+        };
+        let Some(h) = u.host_str() else {
+            return false;
+        };
+        let h = h.trim().to_ascii_lowercase();
+        if h == "localhost" {
+            return true;
+        }
+        if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+            return ip.is_loopback();
+        }
+        false
+    }
+
+    fn normalize_domain_rule(raw: &str) -> Option<String> {
+        // Accept either a bare hostname ("example.com") or a full URL ("https://example.com/x").
+        // Normalize to lowercase host only.
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let lower = s.to_ascii_lowercase();
+        if lower.contains("://") {
+            if let Ok(u) = reqwest::Url::parse(s) {
+                if let Some(h) = u.host_str() {
+                    let h = h.trim().to_ascii_lowercase();
+                    return (!h.is_empty()).then_some(h);
+                }
+            }
+            return None;
+        }
+        // Strip any path-ish suffix.
+        let host = lower
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches('.');
+        (!host.is_empty()).then_some(host.to_string())
+    }
+
+    fn host_matches_domain_rule(host: &str, rule: &str) -> bool {
+        let h = host.trim().to_ascii_lowercase();
+        let r = rule.trim().to_ascii_lowercase();
+        if h.is_empty() || r.is_empty() {
+            return false;
+        }
+        if h == r {
+            return true;
+        }
+        h.ends_with(&format!(".{r}"))
+    }
+
+    fn url_allowed_by_domain_filters(
+        url: &str,
+        domains_allow: &[String],
+        domains_deny: &[String],
+    ) -> bool {
+        // Deny wins over allow.
+        let Ok(u) = reqwest::Url::parse(url.trim()) else {
+            return false;
+        };
+        let Some(host) = u.host_str() else {
+            return false;
+        };
+        let host = host.trim().to_ascii_lowercase();
+        for d in domains_deny {
+            if host_matches_domain_rule(&host, d) {
+                return false;
+            }
+        }
+        if !domains_allow.is_empty() {
+            for a in domains_allow {
+                if host_matches_domain_rule(&host, a) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        true
+    }
+
     fn url_looks_like_promo_or_tracking(url: &str) -> bool {
         // Heuristics for "marketing/promo" URLs that frequently show up in search results and
         // waste extraction budget (e.g. banners, home pages with UTM tags).
@@ -2267,6 +2469,56 @@ mod mcp {
         // We treat these as *soft junk*: skip when we have enough alternatives, but allow as
         // a fallback rather than returning an empty set.
         let u = url.to_ascii_lowercase();
+
+        // Known low-value index pages that frequently collide with query tokens.
+        if u.contains("jmlr.org/mloss") {
+            return true;
+        }
+        // “Quick review” aggregators are usually derivative and noisy for evidence packs.
+        if u.contains("liner.com/review/") {
+            return true;
+        }
+        // Stack-style product/vuln aggregators are usually noisy for primary sources.
+        if u.contains("stack.watch/") {
+            return true;
+        }
+        // Changelog/announcements feeds are rarely a good answer for technical queries.
+        if u.contains("github.blog/changelog") {
+            return true;
+        }
+        // Donation pages are almost never relevant evidence.
+        if u.contains("donate.wikimedia.org/") {
+            return true;
+        }
+        // Wikidata entity pages are typically low-signal for definition queries.
+        if u.contains("wikidata.org/wiki/special:entitypage/") {
+            return true;
+        }
+        // Wikipedia utility/admin pages.
+        if u.contains("wikipedia.org/wiki/special:")
+            || u.contains("wikipedia.org/wiki/mediawiki:")
+            || u.contains("wikipedia.org/wiki/wikipedia:")
+            || u.contains("wikipedia.org/wiki/help:")
+        {
+            return true;
+        }
+        if u.contains("wikipedia.org/wiki/portal:")
+            || u.contains("wikipedia.org/wiki/main_page")
+            || u.contains("wikipedia.org/w/index.php?title=special:")
+        {
+            return true;
+        }
+        if u.contains("foundation.wikimedia.org/wiki/special:") {
+            return true;
+        }
+        // Non-English Wikipedia is often a detour unless explicitly requested.
+        // (Prefer the English canonical page when we have enough alternatives.)
+        if u.contains("wikipedia.org/") {
+            // Any non-English subdomain is treated as soft-junk by default.
+            if !u.contains("://en.wikipedia.org/") && !u.contains("://www.wikipedia.org/") {
+                return true;
+            }
+        }
 
         // Tracking params (very common across vendors).
         for needle in ["utm_", "gclid=", "fbclid=", "yclid=", "mc_cid=", "mc_eid="] {
@@ -2279,11 +2531,13 @@ mod mcp {
         for needle in [
             "/pricing",
             "/enterprise",
+            "/features",
             "/customers",
             "/case-studies",
             "/solutions",
             "/contact",
             "/newsletter",
+            "/marketplace",
             "/home",
             "/showcase",
             "/events",
@@ -2452,6 +2706,55 @@ mod mcp {
                 if sl.contains(needle) {
                     return true;
                 }
+            }
+        }
+
+        false
+    }
+
+    fn extracted_text_looks_like_nav_shell(text: &str) -> bool {
+        // Secondary guard for `main_content_low_signal`: avoid false positives where the
+        // page structure is nav-heavy but the extracted text is actually substantive docs.
+        //
+        // Keep it cheap + deterministic (no tokenizers/ML).
+        let t = text.trim();
+        if t.is_empty() {
+            return true;
+        }
+        let lc = t.to_ascii_lowercase();
+        let mut chrome_hits = 0usize;
+        for needle in [
+            "skip to content",
+            "search documentation",
+            "search docs",
+            "table of contents",
+            "feedback",
+            "menu",
+        ] {
+            if lc.contains(needle) {
+                chrome_hits = chrome_hits.saturating_add(1);
+            }
+        }
+        // Prefer precision over recall: this signal gates fallbacks that can increase
+        // cost (render/firecrawl) and should not trigger on “real docs” pages.
+        if chrome_hits >= 2 {
+            return true;
+        }
+
+        // Shape heuristic (weaker): only treat “many short lines” as nav-like if we also
+        // saw at least one chrome token above.
+        if chrome_hits >= 1 {
+            let mut total = 0usize;
+            let mut short = 0usize;
+            for line in t.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).take(400) {
+                total = total.saturating_add(1);
+                if line.chars().count() <= 40 {
+                    short = short.saturating_add(1);
+                }
+            }
+            if total >= 40 && short.saturating_mul(4) >= total.saturating_mul(3) {
+                // >= ~75% short lines.
+                return true;
             }
         }
 
@@ -2968,14 +3271,120 @@ mod mcp {
             .map(|a| a.len())
             .unwrap_or(0);
 
-        let mut md = String::new();
-        if !query.is_empty() {
-            md.push_str("## Query\n\n");
-            md.push_str(query);
-            md.push_str("\n\n");
+        // Precompute stable source URL order so chunks can cite sources as [1], [2], ...
+        // (Even when we print chunks before the Sources section.)
+        let mut source_urls: Vec<String> = Vec::new();
+        if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
+            for r in arr.iter() {
+                let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if !url.is_empty() {
+                    source_urls.push(url.to_string());
+                }
+            }
         }
 
-        // Request knobs (bounded + stable ordering).
+        let mut md = String::new();
+        let chunk_excerpts = matches!(
+            std::env::var("WEBPIPE_MCP_MARKDOWN_CHUNK_EXCERPTS")
+                .unwrap_or_else(|_| "0".to_string())
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+
+        fn norm_one_line(s: &str) -> String {
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        // Chunks first: this is what users want to see immediately.
+        // Keep it compact; full details remain available in structured_content.
+        let mut top_chunks_already_printed = false;
+        if let Some(arr) = payload.get("top_chunks").and_then(|v| v.as_array()) {
+            if !arr.is_empty() {
+                top_chunks_already_printed = true;
+                md.push_str("## Top chunks\n\n");
+                for (i, c) in arr.iter().enumerate() {
+                    let url = c.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let score = c.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let text0 = c.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    if text0.is_empty() {
+                        continue;
+                    }
+
+                    let mut src_i: Option<usize> = None;
+                    if !url.is_empty() {
+                        for (j, u) in source_urls.iter().enumerate() {
+                            if u == url {
+                                src_i = Some(j + 1);
+                                break;
+                            }
+                        }
+                    }
+
+                    let short = norm_one_line(text0).chars().take(260).collect::<String>();
+                    let mut line = format!("- **Chunk {}**", i + 1);
+                    if let Some(si) = src_i {
+                        line.push_str(&format!(" (source [{si}])"));
+                    }
+                    if score != 0 {
+                        line.push_str(&format!(" (score {score})"));
+                    }
+                    if !url.is_empty() {
+                        line.push_str(&format!(": {url}"));
+                    }
+                    line.push_str(" — ");
+                    line.push_str(short.trim_end());
+                    md.push_str(&line);
+                    md.push('\n');
+
+                    // Optional excerpts: keep bounded and readable.
+                    if chunk_excerpts && i < 3 {
+                        md.push_str("\n```text\n");
+                        md.push_str(text0);
+                        md.push_str("\n```\n\n");
+                    }
+                }
+                md.push('\n');
+            }
+        }
+
+        // Dense summary: one bullet line.
+        md.push_str("## Summary\n\n");
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!("**ok**: {}", if ok { "true" } else { "false" }));
+        if !mode.is_empty() {
+            parts.push(format!("**mode**: `{mode}`"));
+        }
+        if !provider.is_empty() && mode != "urls" {
+            parts.push(format!("**provider**: `{provider}`"));
+        }
+        if !backend_provider.is_empty() {
+            parts.push(format!("**backend_provider**: `{backend_provider}`"));
+        }
+        parts.push(format!("**urls**: {url_count_in}→{url_count_used}"));
+        parts.push(format!("**results**: {results_count}"));
+        parts.push(format!("**chunks**: {top_chunks_count}"));
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            parts.push(format!("**elapsed_ms**: {ms}"));
+        }
+        if let Some(codes) = payload.get("warning_codes").and_then(|v| v.as_array()) {
+            let codes_s: Vec<&str> = codes.iter().filter_map(|v| v.as_str()).collect();
+            if !codes_s.is_empty() {
+                let shown = codes_s
+                    .iter()
+                    .take(4)
+                    .map(|c| format!("`{}`", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("**warn**: {shown}"));
+            }
+        }
+        md.push_str("- ");
+        md.push_str(&parts.join("; "));
+        md.push_str("\n\n");
+
+        // Request knobs (stable ordering; lower priority than summary).
         md.push_str("## Request\n\n");
         if !mode.is_empty() {
             md.push_str("- **mode**: `");
@@ -3016,6 +3425,7 @@ mod mcp {
         for (k, label) in [
             ("max_results", "max_results"),
             ("max_urls", "max_urls"),
+            ("max_parallel_urls", "max_parallel_urls"),
             ("max_chars", "max_chars"),
             ("top_chunks", "top_chunks"),
             ("max_chunk_chars", "max_chunk_chars"),
@@ -3030,71 +3440,11 @@ mod mcp {
         }
         md.push('\n');
 
-        // Compact meta (Cursor-friendly, bounded).
-        md.push_str("## Summary\n\n");
-        md.push_str("- **ok**: ");
-        md.push_str(if ok { "true" } else { "false" });
-        md.push('\n');
-        if !mode.is_empty() {
-            md.push_str("- **mode**: `");
-            md.push_str(mode);
-            md.push_str("`\n");
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
         }
-        if !provider.is_empty() && mode != "urls" {
-            md.push_str("- **provider**: `");
-            md.push_str(provider);
-            md.push_str("`\n");
-        }
-        if !backend_provider.is_empty() {
-            md.push_str("- **backend_provider**: `");
-            md.push_str(backend_provider);
-            md.push_str("`\n");
-        }
-        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
-            md.push_str("- **elapsed_ms**: ");
-            md.push_str(&ms.to_string());
-            md.push('\n');
-        }
-        md.push_str("- **urls_in**: ");
-        md.push_str(&url_count_in.to_string());
-        md.push('\n');
-        md.push_str("- **urls_used**: ");
-        md.push_str(&url_count_used.to_string());
-        md.push('\n');
-        md.push_str("- **results**: ");
-        md.push_str(&results_count.to_string());
-        md.push('\n');
-        md.push_str("- **top_chunks**: ");
-        md.push_str(&top_chunks_count.to_string());
-        md.push('\n');
-        // Make warnings visible in the primary summary (Cursor users rarely scroll).
-        if let Some(codes) = payload.get("warning_codes").and_then(|v| v.as_array()) {
-            let codes_s: Vec<&str> = codes.iter().filter_map(|v| v.as_str()).collect();
-            if !codes_s.is_empty() {
-                md.push_str("- **warning_codes**: ");
-                for (i, c) in codes_s.iter().take(3).enumerate() {
-                    if i > 0 {
-                        md.push_str(", ");
-                    }
-                    md.push('`');
-                    md.push_str(c);
-                    md.push('`');
-                }
-                if codes_s.len() > 3 {
-                    md.push_str(", ...");
-                }
-                md.push('\n');
-            }
-        }
-        if let Some(hints) = payload.get("warning_hints").and_then(|v| v.as_array()) {
-            let hs: Vec<&str> = hints.iter().filter_map(|v| v.as_str()).collect();
-            if !hs.is_empty() {
-                md.push_str("- **warning_hint**: ");
-                md.push_str(hs[0]);
-                md.push('\n');
-            }
-        }
-        md.push('\n');
 
         if !ok {
             md.push_str("## Error\n\n");
@@ -3176,19 +3526,23 @@ mod mcp {
             }
         }
 
-        // Sources (bounded, Cursor-friendly).
-        // Use stable indices so a client can cite sources as [1], [2], ...
-        let mut source_urls: Vec<String> = Vec::new();
+        // Sources (bounded by max_urls <= 10). Use stable indices so chunks can cite sources as [1], [2], ...
+        let include_text = req
+            .get("include_text")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let include_structure = req
+            .get("include_structure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
             if !arr.is_empty() {
                 md.push_str("## Sources\n\n");
-                for (i, r) in arr.iter().take(10).enumerate() {
+                for (i, r) in arr.iter().enumerate() {
                     let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
                     if url.is_empty() {
                         continue;
                     }
-                    source_urls.push(url.to_string());
-
                     // Prefer a human title when available (only present when include_structure=true).
                     let title = r
                         .pointer("/extract/structure/title")
@@ -3201,36 +3555,66 @@ mod mcp {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .trim();
+                    let engine = r
+                        .pointer("/extract/engine")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let text_chars = r
+                        .pointer("/extract/text_chars")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     let warn_codes: Vec<&str> = r
                         .get("warning_codes")
                         .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|x| x.as_str()).take(3).collect())
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).take(8).collect())
                         .unwrap_or_default();
 
-                    md.push_str(&format!("{}. ", i + 1));
+                    md.push_str(&format!("### [{}] ", i + 1));
                     if !title.is_empty() {
-                        md.push_str("**");
                         md.push_str(title);
-                        md.push_str("**\n");
-                        md.push_str("   - url: ");
-                        md.push_str(url);
-                        md.push('\n');
                     } else {
                         md.push_str(url);
-                        md.push('\n');
                     }
+                    md.push('\n');
+                    md.push('\n');
+                    md.push_str("- url: ");
+                    md.push_str(url);
+                    md.push('\n');
                     if status != 0 {
-                        md.push_str("   - status: ");
+                        md.push_str("- status: ");
                         md.push_str(&status.to_string());
                         md.push('\n');
                     }
                     if !fb.is_empty() {
-                        md.push_str("   - fetch_backend: `");
+                        md.push_str("- fetch_backend: `");
                         md.push_str(fb);
                         md.push_str("`\n");
                     }
+                    if !engine.is_empty() {
+                        md.push_str("- engine: `");
+                        md.push_str(engine);
+                        md.push_str("`\n");
+                    }
+                    if engine == "redirect" {
+                        let target = r
+                            .pointer("/extract/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        if !target.is_empty() {
+                            md.push_str("- redirect_target: ");
+                            md.push_str(target);
+                            md.push('\n');
+                        }
+                    }
+                    if text_chars != 0 {
+                        md.push_str("- text_chars: ");
+                        md.push_str(&text_chars.to_string());
+                        md.push('\n');
+                    }
                     if !warn_codes.is_empty() {
-                        md.push_str("   - warnings: ");
+                        md.push_str("- warning_codes: ");
                         for (j, c) in warn_codes.iter().enumerate() {
                             if j > 0 {
                                 md.push_str(", ");
@@ -3241,108 +3625,69 @@ mod mcp {
                         }
                         md.push('\n');
                     }
+                    md.push('\n');
 
-                    // Show a short “actual content” excerpt by default.
+                    if include_structure {
+                        if let Some(outline) = r
+                            .pointer("/extract/structure/outline")
+                            .and_then(|v| v.as_array())
+                        {
+                            if !outline.is_empty() {
+                                md.push_str("#### Outline\n\n");
+                                for it in outline.iter().filter_map(|v| v.as_str()).take(12) {
+                                    let t = it.trim();
+                                    if t.is_empty() {
+                                        continue;
+                                    }
+                                    md.push_str("- ");
+                                    md.push_str(t);
+                                    md.push('\n');
+                                }
+                                md.push('\n');
+                            }
+                        }
+                    }
+
+                    // Show text preview always; show full text when include_text=true.
                     let preview0 = r
                         .pointer("/extract/text_preview")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .trim();
                     if !preview0.is_empty() {
-                        let mut preview = String::new();
-                        for ch in preview0.chars().take(240) {
-                            preview.push(ch);
+                        md.push_str("#### Excerpt\n\n");
+                        md.push_str("```text\n");
+                        md.push_str(preview0.trim_end());
+                        md.push_str("\n```\n\n");
+                    }
+                    if include_text {
+                        let full = r
+                            .pointer("/extract/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        let blocked = warn_codes.iter().any(|&c| {
+                            normalize_warning_code(c) == "blocked_by_js_challenge"
+                                || normalize_warning_code(c) == "unsupported_content_no_text"
+                        });
+                        let tiny_hint =
+                            engine == "html_hint" && text_chars > 0 && text_chars <= 200;
+                        if !full.is_empty() && !blocked && !tiny_hint {
+                            md.push_str("#### Text\n\n");
+                            md.push_str("```text\n");
+                            md.push_str(full);
+                            md.push_str("\n```\n\n");
+                        } else if blocked || tiny_hint {
+                            md.push_str("#### Text\n\n");
+                            md.push_str("- Omitted (blocked/low-signal). Use `fetch_backend=\"render\"` or a PDF/arXiv/PMLR mirror.\n\n");
                         }
-                        md.push_str("   - excerpt: ");
-                        md.push_str(&preview);
-                        if preview0.chars().count() > 240 {
-                            md.push_str("…");
-                        }
-                        md.push('\n');
                     }
                 }
-                md.push('\n');
             }
         }
 
-        // Top chunks (short excerpts by default; bounded).
-        if let Some(arr) = payload.get("top_chunks").and_then(|v| v.as_array()) {
-            if !arr.is_empty() {
-                md.push_str("## Top chunks\n\n");
-                let mut seen_excerpt = std::collections::BTreeSet::<String>::new();
-                let mut used_sources = std::collections::BTreeSet::<usize>::new();
-                let mut emitted = 0usize;
-                // Prefer diversity: emit at most one chunk per source first.
-                for pass in 0..2 {
-                    for c in arr.iter() {
-                        if emitted >= 6 {
-                            break;
-                        }
-                        let url = c.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
-                        let score = c.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let text0 = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
-
-                        let mut excerpt = String::new();
-                        for ch in text0.chars().take(220) {
-                            excerpt.push(ch);
-                        }
-                        let ex0 = excerpt
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                            .trim()
-                            .to_string();
-                        if ex0.is_empty() {
-                            continue;
-                        }
-                        if !seen_excerpt.insert(ex0.clone()) {
-                            continue;
-                        }
-
-                        // Map chunk URL -> source index (if present).
-                        let mut src_i: Option<usize> = None;
-                        if !url.is_empty() {
-                            for (i, u) in source_urls.iter().enumerate() {
-                                if u == url {
-                                    src_i = Some(i + 1);
-                                    break;
-                                }
-                            }
-                        }
-                        if pass == 0 {
-                            if let Some(si) = src_i {
-                                if used_sources.contains(&si) {
-                                    continue;
-                                }
-                            }
-                        }
-
-                        md.push_str("- ");
-                        if let Some(si) = src_i {
-                            md.push_str(&format!("[{si}] "));
-                            used_sources.insert(si);
-                        } else if !url.is_empty() {
-                            md.push_str("**");
-                            md.push_str(url);
-                            md.push_str("** ");
-                        }
-                        if score != 0 {
-                            md.push_str(&format!("(score {score}) "));
-                        }
-                        md.push_str(&excerpt);
-                        if text0.chars().count() > 220 {
-                            md.push_str("…");
-                        }
-                        md.push('\n');
-                        emitted += 1;
-                    }
-                    if emitted >= 6 {
-                        break;
-                    }
-                }
-                md.push('\n');
-            }
-        }
+        // Top chunks were already emitted earlier (scan-first).
+        let _ = top_chunks_already_printed;
 
         // Next steps (actionable, bounded).
         let mut all_codes = std::collections::BTreeSet::<String>::new();
@@ -3473,8 +3818,45 @@ mod mcp {
             .unwrap_or("")
             .trim();
         let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let papers_n = payload
+            .get("papers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let warnings_n = payload
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+            })
+            .unwrap_or(0);
 
         let mut md = String::new();
+        md.push_str("## Summary\n\n");
+        md.push_str("- **ok**: ");
+        md.push_str(if ok { "true" } else { "false" });
+        md.push('\n');
+        md.push_str("- **papers**: ");
+        md.push_str(&papers_n.to_string());
+        md.push('\n');
+        if warnings_n > 0 {
+            md.push_str("- **warnings**: ");
+            md.push_str(&warnings_n.to_string());
+            md.push('\n');
+        }
+        if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            md.push_str("- **elapsed_ms**: ");
+            md.push_str(&ms.to_string());
+            md.push('\n');
+        }
+        if warnings_n > 0 && papers_n == 0 {
+            md.push_str("- **next**: try `arxiv_search` (often more reliable for arXiv-heavy topics) or adjust `backends` / credentials.\n");
+        }
+        md.push('\n');
+
         if !query.is_empty() {
             md.push_str("## Query\n\n");
             md.push_str(query);
@@ -3686,12 +4068,6 @@ mod mcp {
             .unwrap_or(false);
 
         let mut md = String::new();
-        if !url.is_empty() {
-            md.push_str("## URL\n\n");
-            md.push_str(url);
-            md.push_str("\n\n");
-        }
-
         md.push_str("## Summary\n\n");
         md.push_str("- **ok**: ");
         md.push_str(if ok { "true" } else { "false" });
@@ -3735,6 +4111,12 @@ mod mcp {
             md.push('\n');
         }
         md.push('\n');
+
+        if !url.is_empty() {
+            md.push_str("## URL\n\n");
+            md.push_str(url);
+            md.push_str("\n\n");
+        }
 
         md.push_str("## Notes\n\n");
         md.push_str("- The Markdown below is a summary view. The canonical JSON payload is always in `structured_content`.\n");
@@ -3920,6 +4302,11 @@ mod mcp {
 
     fn web_extract_markdown(payload: &serde_json::Value) -> String {
         let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let query = payload
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let url = payload
             .get("url")
             .and_then(|v| v.as_str())
@@ -3950,13 +4337,13 @@ mod mcp {
             .and_then(|e| e.get("links"))
             .and_then(|v| v.as_array())
             .map(|a| a.len());
+        let warn_codes: Vec<&str> = payload
+            .get("warning_codes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).take(8).collect())
+            .unwrap_or_default();
 
         let mut md = String::new();
-        if !url.is_empty() {
-            md.push_str("## URL\n\n");
-            md.push_str(url);
-            md.push_str("\n\n");
-        }
         md.push_str("## Summary\n\n");
         md.push_str("- **ok**: ");
         md.push_str(if ok { "true" } else { "false" });
@@ -4000,7 +4387,30 @@ mod mcp {
             md.push_str(final_url);
             md.push('\n');
         }
+        if !warn_codes.is_empty() {
+            md.push_str("- **warning_codes**: ");
+            for (i, c) in warn_codes.iter().enumerate() {
+                if i > 0 {
+                    md.push_str(", ");
+                }
+                md.push('`');
+                md.push_str(c);
+                md.push('`');
+            }
+            md.push('\n');
+        }
         md.push('\n');
+
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
+        }
+        if !url.is_empty() {
+            md.push_str("## URL\n\n");
+            md.push_str(url);
+            md.push_str("\n\n");
+        }
 
         if !ok {
             md.push_str("## Error\n\n");
@@ -4035,24 +4445,37 @@ mod mcp {
         }
 
         if !text.is_empty() {
-            let preview: String = text.chars().take(1500).collect();
-            md.push_str("## Text (preview)\n\n```text\n");
-            md.push_str(preview.trim_end());
+            // Full text (already bounded by max_chars upstream). Prefer full Markdown evidence over
+            // a short preview: Cursor tool output is often read via the initial lines + expand.
+            md.push_str("## Text\n\n```text\n");
+            md.push_str(text.trim_end());
             md.push_str("\n```\n\n");
         } else if let Some(cs) = chunks {
             md.push_str("## Top chunks\n\n");
-            for (i, c) in cs.iter().take(6).enumerate() {
+            for (i, c) in cs.iter().enumerate() {
+                let sc = c.get("start_char").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ec = c.get("end_char").and_then(|v| v.as_u64()).unwrap_or(0);
+                let score = c.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
                 let t = c.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
                 if t.is_empty() {
                     continue;
                 }
-                let short: String = t.chars().take(260).collect();
-                md.push_str(&format!("{}. {}\n", i + 1, short.trim_end()));
-                if t.chars().count() > 260 {
-                    md.push_str("…\n");
+                md.push_str(&format!("### Chunk {}\n\n", i + 1));
+                if score != 0 {
+                    md.push_str("- score: ");
+                    md.push_str(&score.to_string());
+                    md.push('\n');
                 }
+                if sc != 0 || ec != 0 {
+                    md.push_str("- span: ");
+                    md.push_str(&format!("{sc}..{ec}"));
+                    md.push('\n');
+                }
+                md.push('\n');
+                md.push_str("```text\n");
+                md.push_str(t);
+                md.push_str("\n```\n\n");
             }
-            md.push('\n');
         }
 
         if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
@@ -4448,11 +4871,6 @@ mod mcp {
         let page = payload.get("page").and_then(|v| v.as_u64());
 
         let mut md = String::new();
-        if !query.is_empty() {
-            md.push_str("## Query\n\n");
-            md.push_str(query);
-            md.push_str("\n\n");
-        }
         md.push_str("## Summary\n\n");
         md.push_str("- **ok**: ");
         md.push_str(if ok { "true" } else { "false" });
@@ -4478,6 +4896,12 @@ mod mcp {
             md.push('\n');
         }
         md.push('\n');
+
+        if !query.is_empty() {
+            md.push_str("## Query\n\n");
+            md.push_str(query);
+            md.push_str("\n\n");
+        }
 
         if !ok {
             md.push_str("## Error\n\n");
@@ -5160,6 +5584,47 @@ mod mcp {
         language: Option<String>,
         #[serde(default)]
         country: Option<String>,
+        /// Search timeout (ms). Default: 20_000; max: 60_000.
+        ///
+        /// Some search providers do not apply any default timeout; leaving this unset can hang.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    }
+
+    /// Arguments for `web_perplexity`.
+    ///
+    /// This is the "Perplexity replacement" tool: ask Perplexity directly and return
+    /// an answer with citations (bounded).
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
+    struct WebPerplexityArgs {
+        /// Prompt/question (required).
+        #[serde(default)]
+        query: Option<String>,
+        /// Model name (default: "sonar").
+        #[serde(default)]
+        model: Option<String>,
+        /// Max tokens to generate (default: 800; max: 4_000).
+        #[serde(default)]
+        max_tokens: Option<u64>,
+        /// Temperature (optional).
+        #[serde(default)]
+        temperature: Option<f64>,
+        /// Top-p (optional).
+        #[serde(default)]
+        top_p: Option<f64>,
+        /// Perplexity search mode (optional). Common values: "web", "off".
+        /// If omitted, defaults to "web" when no_network=false, else "off".
+        #[serde(default)]
+        search_mode: Option<String>,
+        /// Timeout for the request (ms). Default: 20_000; max: 60_000.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// If true, disallow network browsing (forces search_mode="off").
+        #[serde(default)]
+        no_network: Option<bool>,
+        /// Hard cap on returned answer characters (default: 4_000; max: 20_000).
+        #[serde(default)]
+        max_answer_chars: Option<usize>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema, Default)]
@@ -5176,6 +5641,11 @@ mod mcp {
         /// Page number (1-based). Default: 1.
         #[serde(default)]
         page: Option<usize>,
+        /// Alias for per_page (matches web_search args). Default: 10; max: 50.
+        ///
+        /// If both `per_page` and `max_results` are provided, `per_page` wins.
+        #[serde(default)]
+        max_results: Option<usize>,
         /// Results per page. Default: 10; max: 50.
         #[serde(default)]
         per_page: Option<usize>,
@@ -5390,6 +5860,31 @@ mod mcp {
         /// Max URLs to actually fetch/extract (default: 3; max: 10).
         #[serde(default)]
         pub(crate) max_urls: Option<usize>,
+        /// Max in-flight URL fetch+extract operations (default: 3; max: 10).
+        ///
+        /// This enables "wide parallel" hydration for urls-mode and non-agentic runs.
+        /// Results remain deterministic (input order preserved).
+        #[serde(default)]
+        pub(crate) max_parallel_urls: Option<usize>,
+        /// Hard overall deadline for the full search→fetch→extract pipeline (ms).
+        ///
+        /// This is a "wall clock" cap used to prevent worst-case hangs from any single stage.
+        /// When hit, the tool returns partial results (if any) and includes `deadline_exceeded_partial`
+        /// in top-level `warning_codes`.
+        #[serde(default)]
+        pub(crate) deadline_ms: Option<u64>,
+        /// Optional allow-list of domains/hosts. If set (non-empty), only URLs whose host matches
+        /// one of these rules are considered.
+        ///
+        /// Rules are hostnames like `slsa.dev` or `learn.microsoft.com`. A rule matches either:
+        /// - exact host, or
+        /// - any subdomain of that host (e.g. `docs.slsa.dev` matches `slsa.dev`).
+        #[serde(default)]
+        pub(crate) domains_allow: Option<Vec<String>>,
+        /// Optional deny-list of domains/hosts. If set, any URL whose host matches one of these
+        /// rules is excluded (even if it also matches domains_allow).
+        #[serde(default)]
+        pub(crate) domains_deny: Option<Vec<String>>,
         /// Fetch timeout per URL (ms).
         #[serde(default)]
         pub(crate) timeout_ms: Option<u64>,
@@ -5460,7 +5955,8 @@ mod mcp {
         ///
         /// - "balanced" (default): current defaults
         /// - "wide": more breadth (more search + frontier) with shallower per-page extraction
-        /// - "deep": fewer pages, deeper per-page extraction
+        /// - "deep": fewer pages, deeper per-page extraction, enables agentic discovery
+        /// - "smart": balanced but enables agentic discovery
         #[serde(default)]
         pub(crate) exploration: Option<String>,
 
@@ -5956,13 +6452,12 @@ mod mcp {
             let mut httpb = reqwest::Client::builder().user_agent("webpipe-mcp/0.1");
             if privacy == PrivacyMode::Anonymous {
                 if let Some(p) = anon_proxy_from_env() {
-                    httpb = httpb
-                        .proxy(reqwest::Proxy::all(p).map_err(|e| {
-                            McpError::invalid_params(
-                                format!("invalid proxy url: {e}"),
-                                Some(serde_json::json!({"code":"invalid_proxy"})),
-                            )
-                        })?);
+                    httpb = httpb.proxy(reqwest::Proxy::all(p).map_err(|e| {
+                        McpError::invalid_params(
+                            format!("invalid proxy url: {e}"),
+                            Some(serde_json::json!({"code":"invalid_proxy"})),
+                        )
+                    })?);
                 }
             }
             Ok(Self {
@@ -6380,7 +6875,7 @@ mod mcp {
                     },
                 };
                 let t0 = std::time::Instant::now();
-                let resp = if no_network {
+                let resp = if no_network && !url_is_localhost(&req.url) {
                     self.fetcher.cache_get(&req).ok().flatten()
                 } else {
                     self.fetcher.fetch(&req).await.ok()
@@ -6653,6 +7148,23 @@ mod mcp {
                 return false;
             }
             let lc = t.to_ascii_lowercase();
+            // Check for common blocking/challenge messages
+            if lc.contains("please enable javascript")
+                || lc.contains("enable javascript to continue")
+                || lc.contains("javascript is required")
+                || lc.contains("browser does not support javascript")
+                || lc.contains("checking your browser")
+                || lc.contains("cloudflare") && lc.contains("ray id")
+                || lc.contains("verify you are human")
+                || lc.contains("pardon our interruption")
+                || lc.contains("turn on javascript")
+                || lc.contains("cookie") && lc.contains("consent") && t.len() < 1000
+                || lc.contains("403 forbidden") && t.len() < 500
+                || lc.contains("access denied") && t.len() < 500
+            {
+                return true;
+            }
+
             lc.contains("self.__next_s")
                 || lc.contains("suppresshydrationwarning")
                 || lc.contains("__webpack")
@@ -6729,6 +7241,7 @@ mod mcp {
                 match normalize_warning_code(w) {
                     "blocked_by_js_challenge" => p += 100,
                     "empty_extraction" => p += 80,
+                    "http_status_error" => p += 60,
                     "main_content_low_signal" => p += 25,
                     "chunks_filtered_low_signal" => p += 15,
                     "body_truncated_by_max_bytes" => p += 12,
@@ -6736,6 +7249,7 @@ mod mcp {
                     "retried_due_to_truncation" => p += 3,
                     "truncation_retry_failed" => p += 8,
                     "pdf_extract_failed" => p += 15,
+                    "pdf_extract_panicked" => p += 20,
                     "pdf_shellout_used" => p += 2,
                     "pdf_shellout_unavailable" => p += 15,
                     "pandoc_failed" => p += 12,
@@ -7495,6 +8009,9 @@ mod mcp {
                             "agentic": true,
                             "max_results": 5,
                             "max_urls": 3,
+                            // Wide parallel hydration can materially reduce tail latency when callers
+                            // provide multiple urls=[...] (and in a safe subset of agentic urls-mode).
+                            "max_parallel_urls": 3,
                             // Prefer auto_plus when we have a query: do a bounded hint pre-pass to avoid
                             // burning max_urls on portal/app-shell pages.
                             "url_selection_mode": "auto_plus",
@@ -8249,7 +8766,11 @@ mod mcp {
             }
 
             let page = args.page.unwrap_or(1).max(1);
-            let per_page = args.per_page.unwrap_or(10).clamp(1, 50);
+            let per_page = args
+                .per_page
+                .or(args.max_results)
+                .unwrap_or(10)
+                .clamp(1, 50);
             let timeout_ms = args.timeout_ms.unwrap_or(20_000);
             let categories = args.categories.unwrap_or_default();
             let years = args.years.unwrap_or_default();
@@ -8388,12 +8909,23 @@ mod mcp {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+            // Warnings are set-like; keep them deduped for stable UX.
+            let mut warnings = resp.warnings.clone();
+            warnings.sort();
+            warnings.dedup();
+            let mut warning_codes: Vec<String> = warnings
+                .iter()
+                .map(|w| normalize_warning_code(*w).to_string())
+                .collect();
+            warning_codes.sort();
+            warning_codes.dedup();
+
             let mut payload = serde_json::json!({
                 "ok": resp.ok,
                 "query": resp.query,
                 "backends": resp.backends,
                 "papers": resp.papers,
-                "warnings": resp.warnings,
+                "warnings": warnings,
                 "timings_ms": resp.timings_ms,
                 "request": {
                     "query": query,
@@ -8404,6 +8936,11 @@ mod mcp {
                     "include_abstract": include_abstract
                 }
             });
+            if !warning_codes.is_empty() {
+                let codes_ref: Vec<&str> = warning_codes.iter().map(|s| s.as_str()).collect();
+                payload["warning_codes"] = serde_json::json!(warning_codes);
+                payload["warning_hints"] = warning_hints_from(&codes_ref);
+            }
             add_envelope_fields(&mut payload, "paper_search", t0.elapsed().as_millis());
             let md = paper_search_markdown(&payload);
             Ok(tool_result_markdown_with_json(payload, md))
@@ -8475,6 +9012,7 @@ mod mcp {
                         max_results: Some(max_discussion_urls),
                         language: None,
                         country: None,
+                        ..Default::default()
                     }))
                     .await?;
                 payload["discussion_search"] = payload_from_result(&r);
@@ -8705,7 +9243,7 @@ mod mcp {
                 };
 
                 let per_t0 = std::time::Instant::now();
-                let fetched = if no_network {
+                let fetched = if no_network && !url_is_localhost(&req.url) {
                     self.fetcher.cache_get(&req).ok().flatten()
                 } else {
                     self.fetcher.fetch(&req).await.ok()
@@ -8713,7 +9251,7 @@ mod mcp {
 
                 let Some(resp) = fetched else {
                     let mut warnings: Vec<&'static str> = Vec::new();
-                    if no_network {
+                    if no_network && !url_is_localhost(&req.url) {
                         warnings.push("cache_only");
                         warnings.push("no_network_may_require_warm_cache");
                     }
@@ -8775,9 +9313,15 @@ mod mcp {
                 } else {
                     Some(query.clone())
                 };
-                let pipeline = match tokio::task::spawn_blocking(move || {
+                // Extraction can involve HTML parsing; keep it bounded so agentic loops can't hang.
+                let extract_timeout_ms = std::env::var("WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(12_000);
+                let pipeline = if extract_timeout_ms == 0 {
+                    // Deterministic: 0ms means “skip extraction immediately”.
                     let cfg = webpipe_local::extract::ExtractPipelineCfg {
-                        query: query0.as_deref(),
+                        query: None,
                         width,
                         max_chars,
                         top_chunks,
@@ -8787,19 +9331,13 @@ mod mcp {
                         max_blocks: 0,
                         max_block_chars: 0,
                     };
-                    webpipe_local::extract::extract_pipeline_from_bytes(
-                        bytes2.as_ref(),
-                        ct2.as_deref(),
-                        fu2.as_str(),
-                        cfg,
-                    )
-                })
-                .await
-                {
-                    Ok(p) => p,
-                    Err(_) => {
+                    let mut p = webpipe_local::extract::extract_pipeline_from_bytes(&[], None, "", cfg);
+                    p.extracted.warnings.push("extract_pipeline_timeout");
+                    p
+                } else {
+                    let handle = tokio::task::spawn_blocking(move || {
                         let cfg = webpipe_local::extract::ExtractPipelineCfg {
-                            query: None,
+                            query: query0.as_deref(),
                             width,
                             max_chars,
                             top_chunks,
@@ -8809,7 +9347,50 @@ mod mcp {
                             max_blocks: 0,
                             max_block_chars: 0,
                         };
-                        webpipe_local::extract::extract_pipeline_from_bytes(&[], None, "", cfg)
+                        webpipe_local::extract::extract_pipeline_from_bytes(
+                            bytes2.as_ref(),
+                            ct2.as_deref(),
+                            fu2.as_str(),
+                            cfg,
+                        )
+                    });
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(extract_timeout_ms),
+                        handle,
+                    )
+                    .await
+                    {
+                        Ok(join) => join.unwrap_or_else(|_| {
+                            let cfg = webpipe_local::extract::ExtractPipelineCfg {
+                                query: None,
+                                width,
+                                max_chars,
+                                top_chunks,
+                                max_chunk_chars,
+                                include_structure: false,
+                                max_outline_items: 0,
+                                max_blocks: 0,
+                                max_block_chars: 0,
+                            };
+                            webpipe_local::extract::extract_pipeline_from_bytes(&[], None, "", cfg)
+                        }),
+                        Err(_) => {
+                            let cfg = webpipe_local::extract::ExtractPipelineCfg {
+                                query: None,
+                                width,
+                                max_chars,
+                                top_chunks,
+                                max_chunk_chars,
+                                include_structure: false,
+                                max_outline_items: 0,
+                                max_blocks: 0,
+                                max_block_chars: 0,
+                            };
+                            let mut p =
+                                webpipe_local::extract::extract_pipeline_from_bytes(&[], None, "", cfg);
+                            p.extracted.warnings.push("extract_pipeline_timeout");
+                            p
+                        }
                     }
                 };
 
@@ -8817,6 +9398,11 @@ mod mcp {
                 let mut warnings: Vec<&'static str> = Vec::new();
                 if resp.truncated {
                     warnings.push("body_truncated_by_max_bytes");
+                }
+                if resp.timings_ms.contains_key("cache_get_timeout")
+                    || resp.timings_ms.contains_key("cache_put_timeout")
+                {
+                    warnings.push("cache_io_timeout");
                 }
                 if arxiv_rewrote {
                     warnings.push("arxiv_abs_rewritten_to_pdf");
@@ -8844,7 +9430,7 @@ mod mcp {
                 for w in &extracted.warnings {
                     warnings.push(*w);
                 }
-                if no_network {
+                if no_network && !url_is_localhost(&req.url) {
                     warnings.push("cache_only");
                 }
 
@@ -8857,12 +9443,42 @@ mod mcp {
                         .to_ascii_lowercase()
                         .starts_with("text/html");
                 if is_html && max_links_per_page > 0 {
-                    let html = String::from_utf8_lossy(resp_bytes.as_ref()).to_string();
-                    link_cands = webpipe_local::links::extract_link_candidates(
-                        &html,
-                        Some(resp_final_url.as_str()),
-                        max_links_per_page,
-                    );
+                    let links_timeout_ms = std::env::var("WEBPIPE_LINKS_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(1_500);
+                    if links_timeout_ms == 0 {
+                        warnings.push("links_timeout");
+                    } else {
+                        let bytes = resp_bytes.clone();
+                        let base_url = resp_final_url.clone();
+                        let max_links = max_links_per_page;
+                        let handle = tokio::task::spawn_blocking(move || {
+                            // Link candidates are usually in the head/nav; avoid parsing huge bodies.
+                            let cap_bytes = 750_000usize;
+                            let b: &[u8] = bytes.as_slice();
+                            let b = if b.len() > cap_bytes { &b[..cap_bytes] } else { b };
+                            let html = String::from_utf8_lossy(b).to_string();
+                            webpipe_local::links::extract_link_candidates(
+                                &html,
+                                Some(base_url.as_str()),
+                                max_links,
+                            )
+                        });
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(links_timeout_ms),
+                            handle,
+                        )
+                        .await
+                        {
+                            Ok(join) => {
+                                link_cands = join.unwrap_or_else(|_| Vec::new());
+                            }
+                            Err(_) => {
+                                warnings.push("links_timeout");
+                            }
+                        }
+                    }
                 }
 
                 // Expand frontier.
@@ -9833,7 +10449,7 @@ mod mcp {
                     },
                 };
                 let t = std::time::Instant::now();
-                let fetched = if no_network {
+                let fetched = if no_network && !url_is_localhost(&req.url) {
                     self.fetcher.cache_get(&req).ok().flatten()
                 } else {
                     self.fetcher.fetch(&req).await.ok()
@@ -9920,7 +10536,7 @@ mod mcp {
                     },
                 };
                 let t = std::time::Instant::now();
-                let fetched = if no_network {
+                let fetched = if no_network && !url_is_localhost(&req.url) {
                     self.fetcher.cache_get(&req).ok().flatten()
                 } else {
                     self.fetcher.fetch(&req).await.ok()
@@ -10070,6 +10686,7 @@ mod mcp {
                         agentic_frontier_max: None,
                         planner_max_calls: Some(0),
                         compact: Some(true),
+                        ..Default::default()
                     }))
                     .await?;
                 payload["extract"] = payload_from_result(&r);
@@ -10084,7 +10701,7 @@ mod mcp {
         }
 
         #[tool(
-            description = "Primary Cursor workflow: search (optional) → fetch → extract → rank top chunks into an evidence pack.\n\nModes:\n- urls-mode: pass urls=[...] (no web search; best for curated sources)\n- search-mode: pass query=... (uses provider/auto_mode if configured)\n- cache-corpus: pass query=... + no_network=true and omit urls (search over WEBPIPE_CACHE_DIR)\n\nWhat you get (by default):\n- Markdown: Sources + short excerpts + top chunks + “Next” suggestions when blocked/low-signal\n- structured JSON: `results[*].extract.text_preview` (always) + `top_chunks` (always)\n\nFor full page text per URL, set include_text=true (bounded by max_chars).",
+            description = "Primary Cursor workflow: search (optional) → fetch → extract → rank top chunks into an evidence pack.\n\nModes:\n- urls-mode: pass urls=[...] (no web search; best for curated sources)\n- search-mode: pass query=... (uses provider/auto_mode if configured)\n- cache-corpus: pass query=... + no_network=true and omit urls (search over WEBPIPE_CACHE_DIR)\n\nPresets (exploration):\n- balanced (default)\n- deep (more thorough; enables agentic discovery)\n- smart (balanced + agentic)\n\nWhat you get (by default):\n- Markdown: Sources + short excerpts + top chunks + “Next” suggestions when blocked/low-signal\n- structured JSON: `results[*].extract.text_preview` (always) + `top_chunks` (always)\n\nFor full page text per URL, set include_text=true (bounded by max_chars).",
             input_schema = Arc::new(tool_input_schema_draft07::<WebSearchExtractArgs>()),
             annotations(title = "Evidence pack", read_only_hint = true, open_world_hint = true)
         )]
@@ -10104,6 +10721,13 @@ mod mcp {
                 open_world_hint = true
             )
         )]
+        pub(crate) async fn _web_search_extract_debug(
+            &self,
+            params: Parameters<Option<WebSearchExtractArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            self.web_search_extract(params).await
+        }
+
         pub(crate) async fn web_search_extract(
             &self,
             params: Parameters<Option<WebSearchExtractArgs>>,
@@ -10115,20 +10739,24 @@ mod mcp {
             // Cursor UX guardrail: when the user provides `urls=[...]`, agentic discovery should not
             // silently wander to unrelated hosts (e.g. Wikipedia language variants) and replace the
             // user's intended sources. We allow discovery *within* the provided hosts.
-            let url_scope_hosts: Option<std::collections::BTreeSet<String>> = args.urls.as_ref().map(|us| {
-                let mut hs = std::collections::BTreeSet::<String>::new();
-                for u in us {
-                    if let Ok(p) = reqwest::Url::parse(u.trim()) {
-                        if let Some(h) = p.host_str() {
-                            let h = h.trim().to_ascii_lowercase();
-                            if !h.is_empty() {
-                                hs.insert(h);
+            let url_scope_hosts: Option<std::collections::BTreeSet<String>> = args
+                .urls
+                .as_ref()
+                .map(|us| {
+                    let mut hs = std::collections::BTreeSet::<String>::new();
+                    for u in us {
+                        if let Ok(p) = reqwest::Url::parse(u.trim()) {
+                            if let Some(h) = p.host_str() {
+                                let h = h.trim().to_ascii_lowercase();
+                                if !h.is_empty() {
+                                    hs.insert(h);
+                                }
                             }
                         }
                     }
-                }
-                hs
-            }).and_then(|hs| if hs.is_empty() { None } else { Some(hs) });
+                    hs
+                })
+                .and_then(|hs| if hs.is_empty() { None } else { Some(hs) });
             let user_urls_provided = args.urls.is_some();
             let user_urls_len = args.urls.as_ref().map(|u| u.len()).unwrap_or(0);
 
@@ -10138,12 +10766,41 @@ mod mcp {
             let max_chars_user = args.max_chars.is_some();
             let top_chunks_user = args.top_chunks.is_some();
             let max_chunk_chars_user = args.max_chunk_chars.is_some();
+            let include_structure_user = args.include_structure.is_some();
 
             let mut max_results = args.max_results.unwrap_or(5).clamp(1, 20);
             let mut max_urls = args.max_urls.unwrap_or(3).clamp(1, 10);
             let timeout_ms = args.timeout_ms.unwrap_or(20_000);
             let max_bytes = args.max_bytes.unwrap_or(5_000_000);
             let width = args.width.unwrap_or(100).clamp(20, 240);
+            let deadline_ms_raw = args
+                .deadline_ms
+                .unwrap_or_else(|| timeout_ms.saturating_mul((max_urls as u64).saturating_add(2)));
+            let deadline_ms = if args.deadline_ms.is_some() {
+                // Respect explicit caller deadlines, including small values (useful for quick “bail out”
+                // workflows and tests). Still cap the worst case.
+                deadline_ms_raw.min(300_000)
+            } else {
+                // Default overall budget should not be too tiny, or the tool will almost always return
+                // partial results even for healthy URLs.
+                deadline_ms_raw.clamp(5_000, 300_000)
+            };
+            let deadline = t0 + std::time::Duration::from_millis(deadline_ms);
+
+            let domains_allow: Vec<String> = args
+                .domains_allow
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|s| normalize_domain_rule(&s))
+                .collect();
+            let domains_deny: Vec<String> = args
+                .domains_deny
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|s| normalize_domain_rule(&s))
+                .collect();
             // Defaults tuned for research use cases (more content, more chunks).
             let mut max_chars = args.max_chars.unwrap_or(30_000).min(200_000);
             let mut top_chunks = args.top_chunks.unwrap_or(8).min(50);
@@ -10162,9 +10819,13 @@ mod mcp {
             let compact = args.compact.unwrap_or(true);
             let retry_on_truncation = args.retry_on_truncation.unwrap_or(false);
             let truncation_retry_max_bytes = args.truncation_retry_max_bytes;
-            // Default to agentic loop (bounded by max_urls) for better “query → right page” behavior.
-            // Callers can opt out with agentic=false.
-            let agentic = args.agentic.unwrap_or(true);
+            // Default to agentic loop only when we're discovering URLs (search-mode).
+            //
+            // When the caller provides `urls=[...]`, “agentic discovery” is surprising: it can
+            // legitimately wander to generic portal pages within the same host (e.g. /models) and
+            // bury the explicitly provided URL. If callers want that behavior, they can opt in.
+            let agentic_default = args.urls.is_none();
+            let mut agentic = args.agentic.unwrap_or(agentic_default);
             let agentic_selector = args.agentic_selector.unwrap_or_else(|| "auto".to_string());
 
             let cache_read = args.cache_read.unwrap_or(true);
@@ -10200,7 +10861,11 @@ mod mcp {
                         ),
                         "request": { "fetch_backend": fetch_backend, "no_network": no_network }
                     });
-                    add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                    add_envelope_fields(
+                        &mut payload,
+                        "web_search_extract",
+                        t0.elapsed().as_millis(),
+                    );
                     let md = web_search_extract_markdown(&payload);
                     return Ok(tool_result_markdown_with_json(payload, md));
                 }
@@ -10225,7 +10890,11 @@ mod mcp {
                             "no_network": no_network
                         }
                     });
-                    add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                    add_envelope_fields(
+                        &mut payload,
+                        "web_search_extract",
+                        t0.elapsed().as_millis(),
+                    );
                     let md = web_search_extract_markdown(&payload);
                     return Ok(tool_result_markdown_with_json(payload, md));
                 }
@@ -10236,18 +10905,22 @@ mod mcp {
                         if no_network {
                             // ok: cache-only
                         } else {
-                        let mut payload = serde_json::json!({
-                            "ok": false,
-                            "error": error_obj(
-                                ErrorCode::NotSupported,
-                                "privacy_mode=offline blocks network fetches to non-localhost URLs",
-                                "Use localhost URLs, or warm the cache in normal mode and then use no_network=true with fetch_backend=\"local\"."
-                            ),
-                            "request": { "privacy_mode": "offline", "no_network": no_network }
-                        });
-                        add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
-                        let md = web_search_extract_markdown(&payload);
-                        return Ok(tool_result_markdown_with_json(payload, md));
+                            let mut payload = serde_json::json!({
+                                "ok": false,
+                                "error": error_obj(
+                                    ErrorCode::NotSupported,
+                                    "privacy_mode=offline blocks network fetches to non-localhost URLs",
+                                    "Use localhost URLs, or warm the cache in normal mode and then use no_network=true with fetch_backend=\"local\"."
+                                ),
+                                "request": { "privacy_mode": "offline", "no_network": no_network }
+                            });
+                            add_envelope_fields(
+                                &mut payload,
+                                "web_search_extract",
+                                t0.elapsed().as_millis(),
+                            );
+                            let md = web_search_extract_markdown(&payload);
+                            return Ok(tool_result_markdown_with_json(payload, md));
                         }
                     }
                 } else {
@@ -10264,7 +10937,11 @@ mod mcp {
                             ),
                             "request": { "privacy_mode": "offline", "no_network": no_network }
                         });
-                        add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                        add_envelope_fields(
+                            &mut payload,
+                            "web_search_extract",
+                            t0.elapsed().as_millis(),
+                        );
                         let md = web_search_extract_markdown(&payload);
                         return Ok(tool_result_markdown_with_json(payload, md));
                     }
@@ -10285,16 +10962,18 @@ mod mcp {
                             "no_network": no_network
                         }
                     });
-                    add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                    add_envelope_fields(
+                        &mut payload,
+                        "web_search_extract",
+                        t0.elapsed().as_millis(),
+                    );
                     let md = web_search_extract_markdown(&payload);
                     return Ok(tool_result_markdown_with_json(payload, md));
                 }
                 if !no_network && anon_proxy_from_env().is_none() {
                     // If urls are provided, we will fetch them; require a proxy for any non-localhost URL.
                     if let Some(urls) = args.urls.as_ref() {
-                        let needs_outbound = urls
-                            .iter()
-                            .any(|u| !is_localhost_url(u));
+                        let needs_outbound = urls.iter().any(|u| !is_localhost_url(u));
                         if needs_outbound {
                             let mut payload = serde_json::json!({
                                 "ok": false,
@@ -10355,15 +11034,14 @@ mod mcp {
                 let configured =
                     has_env("WEBPIPE_FIRECRAWL_API_KEY") || has_env("FIRECRAWL_API_KEY");
                 args.firecrawl_fallback_on_empty_extraction
-                    .unwrap_or(configured && fetch_backend == "local")
+                    .unwrap_or(configured) // Default to true if configured
             };
             let firecrawl_fallback_on_low_signal = if no_network {
                 false
             } else {
                 let configured =
                     has_env("WEBPIPE_FIRECRAWL_API_KEY") || has_env("FIRECRAWL_API_KEY");
-                args.firecrawl_fallback_on_low_signal
-                    .unwrap_or(configured && fetch_backend == "local")
+                args.firecrawl_fallback_on_low_signal.unwrap_or(configured) // Default to true if configured, regardless of backend
             };
             // Render fallback is always opt-in (never default-on); it can be expensive.
             let render_fallback_on_empty_extraction = if no_network {
@@ -10384,6 +11062,7 @@ mod mcp {
                 .exploration
                 .clone()
                 .unwrap_or_else(|| "balanced".to_string());
+            let mut preset_max_search_rounds: Option<usize> = None;
             match exploration.as_str() {
                 "balanced" => {}
                 "wide" => {
@@ -10408,7 +11087,7 @@ mod mcp {
                         max_results = 5;
                     }
                     if !max_urls_user {
-                        max_urls = 2;
+                        max_urls = 8; // Bumped from 3 to allow deeper exploration
                     }
                     if !max_chars_user {
                         max_chars = 60_000;
@@ -10418,6 +11097,23 @@ mod mcp {
                     }
                     if !max_chunk_chars_user {
                         max_chunk_chars = 800;
+                    }
+                    // Deep mode implies agentic discovery unless explicitly disabled.
+                    if args.agentic.is_none() {
+                        agentic = true;
+                    }
+                    if args.agentic_max_search_rounds.is_none() {
+                        preset_max_search_rounds = Some(2);
+                    }
+                }
+                "smart" => {
+                    // "Smart" preset: balanced but agentic.
+                    if args.agentic.is_none() {
+                        agentic = true;
+                    }
+                    // Ensure we have enough budget to actually expand the frontier.
+                    if !max_urls_user && max_urls < 5 {
+                        max_urls = 5;
                     }
                 }
                 _ => {
@@ -10429,7 +11125,7 @@ mod mcp {
                         "error": error_obj(
                             ErrorCode::InvalidParams,
                             "unknown exploration preset",
-                            "Allowed exploration values: balanced, wide, deep"
+                            "Allowed exploration values: balanced, wide, deep, smart"
                         ),
                     });
                     add_envelope_fields(
@@ -10605,44 +11301,36 @@ mod mcp {
                         return Ok(tool_result_markdown_with_json(payload, md));
                     }
 
-                    let Some(cache_dir) = cache_dir_from_env() else {
-                        let mut payload = serde_json::json!({
-                            "ok": false,
-                            "mode": "cache",
-                            "provider": "cache",
-                            "query": q,
-                            "error": error_obj(
-                                ErrorCode::NotConfigured,
-                                "WEBPIPE_CACHE_DIR is not set",
-                                "Set WEBPIPE_CACHE_DIR (and warm it using web_fetch/web_extract), then retry with no_network=true."
-                            ),
-                            "request": { "no_network": true }
-                        });
-                        add_envelope_fields(
-                            &mut payload,
-                            "web_search_extract",
-                            t0.elapsed().as_millis(),
-                        );
-                        let md = web_search_extract_markdown(&payload);
-                        return Ok(tool_result_markdown_with_json(payload, md));
-                    };
+                    // Cache-corpus mode: prefer an explicit cache dir, but fall back to a
+                    // persistent default so "warm cache + no_network" works out-of-the-box.
+                    let cache_dir = cache_dir_from_env().unwrap_or_else(default_cache_dir);
 
                     // Cache-corpus search: bounded, deterministic, offline.
                     let cache_dir2 = cache_dir.clone();
                     let q2 = q.clone();
-                    let max_docs = 50usize;
-                    let max_scan_entries = 2000usize;
+                    // Cache-corpus mode is for "offline inspiration" and should stay fast.
+                    // Keep these conservative so the default deadline_ms is usually respected.
+                    let max_docs = 30usize;
+                    let max_scan_entries = 800usize;
                     let max_chars2 = max_chars;
                     let max_bytes2 = max_bytes;
                     let width2 = width;
                     let top_chunks2 = top_chunks;
                     let max_chunk_chars2 = max_chunk_chars;
-                    let include_structure2 = include_structure;
+                    // Cache-corpus mode should stay fast by default. Structure can be useful
+                    // for debugging, but it's expensive when scanning many cached docs.
+                    let include_structure2 = if include_structure_user {
+                        include_structure
+                    } else {
+                        false
+                    };
                     let max_outline_items2 = max_outline_items;
                     let max_blocks2 = max_blocks;
                     let max_block_chars2 = max_block_chars;
 
-                    let r = tokio::task::spawn_blocking(move || {
+                    let now = std::time::Instant::now();
+                    let remaining = deadline.saturating_duration_since(now);
+                    let handle = tokio::task::spawn_blocking(move || {
                         webpipe_local::cache_search::cache_search_extract(
                             &cache_dir2,
                             &q2,
@@ -10659,16 +11347,39 @@ mod mcp {
                             include_text,
                             max_scan_entries,
                         )
-                    })
-                    .await
-                    .ok()
-                    .unwrap_or_else(|| webpipe_local::cache_search::CacheSearchResult {
-                        ok: false,
-                        scanned_entries: 0,
-                        selected_docs: 0,
-                        results: vec![],
-                        warnings: vec!["cache_search_task_failed"],
                     });
+                    let r = match tokio::time::timeout(remaining, handle).await {
+                        Ok(join) => join.unwrap_or_else(|_| webpipe_local::cache_search::CacheSearchResult {
+                            ok: false,
+                            scanned_entries: 0,
+                            selected_docs: 0,
+                            results: vec![],
+                            warnings: vec!["cache_search_task_failed"],
+                        }),
+                        Err(_) => {
+                            let mut payload = serde_json::json!({
+                                "ok": false,
+                                "mode": "cache",
+                                "provider": "cache",
+                                "query": q,
+                                "warning_codes": ["deadline_exceeded_partial"],
+                                "warning_hints": warning_hints_from(&["deadline_exceeded_partial"]),
+                                "error": error_obj(
+                                    ErrorCode::CacheError,
+                                    "cache corpus search timed out",
+                                    format!("Increase deadline_ms (current value: {deadline_ms}ms) or reduce cache size; or pass urls=[...] to avoid scanning the whole cache corpus.")
+                                ),
+                                "request": { "no_network": true, "cache_dir": cache_dir.to_string_lossy().to_string(), "deadline_ms": deadline_ms }
+                            });
+                            add_envelope_fields(
+                                &mut payload,
+                                "web_search_extract",
+                                t0.elapsed().as_millis(),
+                            );
+                            let md = web_search_extract_markdown(&payload);
+                            return Ok(tool_result_markdown_with_json(payload, md));
+                        }
+                    };
 
                     if !r.ok {
                         let mut payload = serde_json::json!({
@@ -10679,9 +11390,9 @@ mod mcp {
                             "error": error_obj(
                                 ErrorCode::CacheError,
                                 "cache corpus search failed",
-                                "Ensure WEBPIPE_CACHE_DIR points to a valid webpipe cache dir."
+                                format!("Ensure WEBPIPE_CACHE_DIR points to a valid webpipe cache dir (or warm the default cache dir at {}).", cache_dir.display())
                             ),
-                            "request": { "no_network": true }
+                            "request": { "no_network": true, "cache_dir": cache_dir.to_string_lossy().to_string() }
                         });
                         add_envelope_fields(
                             &mut payload,
@@ -10823,6 +11534,7 @@ mod mcp {
                         max_results: Some(max_results),
                         language: None,
                         country: None,
+                        timeout_ms: Some(timeout_ms),
                     }))
                     .await?;
                 let sv = payload_from_result(&sr);
@@ -10876,10 +11588,15 @@ mod mcp {
                 let mut dropped_auth = 0usize;
                 let mut dropped_promo = 0usize;
                 let mut dropped_home = 0usize;
+                let mut dropped_domain = 0usize;
                 // Prefer non-auth-wall URLs when we have enough candidates.
                 for u in &out_all {
                     if out.len() >= cap {
                         break;
+                    }
+                    if !url_allowed_by_domain_filters(u, &domains_allow, &domains_deny) {
+                        dropped_domain += 1;
+                        continue;
                     }
                     if !url_looks_like_auth_or_challenge(u)
                         && !url_looks_like_promo_or_tracking(u)
@@ -10905,13 +11622,18 @@ mod mcp {
                         if out.iter().any(|x| x == u) {
                             continue;
                         }
+                        if !url_allowed_by_domain_filters(u, &domains_allow, &domains_deny) {
+                            dropped_domain += 1;
+                            continue;
+                        }
                         if url_looks_like_auth_or_challenge(u) {
                             continue;
                         }
                         // Prefer returning fewer seeds over adding obvious soft-junk.
                         // Agentic exploration can expand from good seeds; promo/homepage URLs tend to waste budget.
                         if out.len() >= 1
-                            && (url_looks_like_promo_or_tracking(u) || url_looks_like_low_value_homepage(u))
+                            && (url_looks_like_promo_or_tracking(u)
+                                || url_looks_like_low_value_homepage(u))
                         {
                             continue;
                         }
@@ -10927,7 +11649,8 @@ mod mcp {
                             let mut already_have_same_host = false;
                             for e in &out {
                                 if let Ok(pe) = reqwest::Url::parse(e.trim()) {
-                                    if pe.host_str().map(|s| s.to_ascii_lowercase()) == Some(h.clone())
+                                    if pe.host_str().map(|s| s.to_ascii_lowercase())
+                                        == Some(h.clone())
                                         && !url_looks_like_low_value_homepage(e)
                                     {
                                         already_have_same_host = true;
@@ -10951,6 +11674,10 @@ mod mcp {
                         if out.iter().any(|x| x == u) {
                             continue;
                         }
+                        if !url_allowed_by_domain_filters(u, &domains_allow, &domains_deny) {
+                            dropped_domain += 1;
+                            continue;
+                        }
                         out.push(u.clone());
                     }
                 }
@@ -10970,6 +11697,7 @@ mod mcp {
                     "auth_wall_urls_skipped": dropped_auth,
                     "promo_or_tracking_urls_skipped": dropped_promo,
                     "homepage_urls_skipped": dropped_home,
+                    "domain_urls_skipped": dropped_domain,
                 }));
                 search_rounds = 1;
 
@@ -10987,12 +11715,34 @@ mod mcp {
                         continue;
                     }
                     let s = us.to_string();
+                    if !url_allowed_by_domain_filters(&s, &domains_allow, &domains_deny) {
+                        continue;
+                    }
                     if seen.insert(s.clone()) {
                         out.push(s);
                     }
                 }
                 out
             };
+            if urls.is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "provider": requested_provider,
+                    "query": query,
+                    "error": error_obj(
+                        ErrorCode::InvalidParams,
+                        "all candidate URLs were filtered out by domains_allow/domains_deny",
+                        "Relax domains_allow/domains_deny, or provide urls=[...] that match the allowed domains."
+                    ),
+                    "request": {
+                        "domains_allow": domains_allow.clone(),
+                        "domains_deny": domains_deny.clone()
+                    }
+                });
+                add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                let md = web_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
+            }
 
             // URL selection under max_urls. For the "auto_plus" mode, we do a bounded pre-pass:
             // fetch small bytes (cache-first) and rank by title/h1 hints + URL tokens.
@@ -11056,8 +11806,10 @@ mod mcp {
                                 q_toks.iter().map(|t| (t.clone(), 0u64)).collect();
                             for u in &urls {
                                 let u_scrub = textprep::scrub(u);
+                                let toks: std::collections::BTreeSet<&str> =
+                                    u_scrub.split_whitespace().collect();
                                 for t in &q_toks {
-                                    if u_scrub.contains(t) {
+                                    if toks.contains(t.as_str()) {
                                         if let Some(v) = df.get_mut(t) {
                                             *v += 1;
                                         }
@@ -11080,9 +11832,11 @@ mod mcp {
                             .enumerate()
                             .map(|(i, u)| {
                                 let u_scrub = textprep::scrub(u);
+                                let toks: std::collections::BTreeSet<&str> =
+                                    u_scrub.split_whitespace().collect();
                                 let mut s = 0u64;
                                 for t in &q_toks {
-                                    if u_scrub.contains(t) {
+                                    if toks.contains(t.as_str()) {
                                         s = s.saturating_add(*token_weights.get(t).unwrap_or(&1));
                                     }
                                 }
@@ -11123,9 +11877,11 @@ mod mcp {
                                     let html = fr.text_lossy();
                                     let hint = webpipe_local::extract::html_hint_text(&html, 400);
                                     let hint_scrub = textprep::scrub(&hint);
+                                    let hint_toks: std::collections::BTreeSet<&str> =
+                                        hint_scrub.split_whitespace().collect();
                                     let mut s = 0u64;
                                     for t in &q_toks {
-                                        if hint_scrub.contains(t) {
+                                        if hint_toks.contains(t.as_str()) {
                                             s = s.saturating_add(
                                                 *token_weights.get(t).unwrap_or(&1),
                                             );
@@ -11136,7 +11892,20 @@ mod mcp {
                                 Err(_) => (0u64, false),
                             };
 
-                            scored.push((i, hint_score, url_score, cache_hit, u));
+                            let mut hint_score2 = hint_score;
+                            let mut url_score2 = url_score;
+                            if url_looks_like_auth_or_challenge(&u) {
+                                hint_score2 /= 4;
+                                url_score2 /= 4;
+                            }
+                            // If we’re doing local fetching, downrank hosts that often trip JS challenges.
+                            if fetch_backend == "local"
+                                && url_looks_like_js_challenge_prone_host(&u)
+                            {
+                                hint_score2 /= 4;
+                                url_score2 /= 4;
+                            }
+                            scored.push((i, hint_score2, url_score2, cache_hit, u));
                         }
 
                         // Sort: hint_score, then url_score, then cache_hit, then original order.
@@ -11146,19 +11915,36 @@ mod mcp {
                                 .then_with(|| (b.3 as u8).cmp(&(a.3 as u8)))
                                 .then_with(|| a.0.cmp(&b.0))
                         });
-                        let mut picked: Vec<String> = scored
-                            .into_iter()
-                            .take(max_urls)
-                            .map(|(_, _, _, _, u)| u)
-                            .collect();
+                        // Prefer URLs with *any* signal. If we have enough, drop zero-signal tail URLs
+                        // rather than wasting fetch budget on clearly irrelevant pages (common with query
+                        // token collisions like "loss"→"mloss").
+                        let min_urls = max_urls.min(3);
+                        let mut picked: Vec<String> = Vec::new();
+                        for (_i, hint_s, url_s, _cache_hit, u) in &scored {
+                            if *hint_s > 0 || *url_s > 0 {
+                                picked.push(u.clone());
+                                if picked.len() >= max_urls {
+                                    break;
+                                }
+                            }
+                        }
+                        if picked.len() < min_urls {
+                            picked = scored
+                                .into_iter()
+                                .take(max_urls)
+                                .map(|(_, _, _, _, u)| u)
+                                .collect();
+                        }
 
-                        if picked.len() < max_urls {
+                        // Only backfill up to a small minimum. If we already have enough signal-bearing
+                        // URLs, prefer returning fewer URLs over including obvious junk.
+                        if picked.len() < min_urls {
                             let mut seen = std::collections::HashSet::<String>::new();
                             for u in &picked {
                                 seen.insert(u.clone());
                             }
                             for (_i, _s, u) in by_url_score {
-                                if picked.len() >= max_urls {
+                                if picked.len() >= min_urls {
                                     break;
                                 }
                                 if seen.insert(u.clone()) {
@@ -11210,6 +11996,9 @@ mod mcp {
             };
             let mut seen_frontier = std::collections::HashSet::<String>::new();
             frontier.retain(|u| {
+                if !url_allowed_by_domain_filters(u, &domains_allow, &domains_deny) {
+                    return false;
+                }
                 canonicalize_url_no_frag(u)
                     .map(|k| seen_frontier.insert(k))
                     .unwrap_or(false)
@@ -11294,7 +12083,7 @@ mod mcp {
                     None
                 };
             let mut planner_calls: usize = 0;
-            let max_search_rounds = args
+            let mut max_search_rounds = args
                 .agentic_max_search_rounds
                 .or_else(|| {
                     std::env::var("WEBPIPE_AGENTIC_MAX_SEARCH_ROUNDS")
@@ -11303,10 +12092,486 @@ mod mcp {
                 })
                 .unwrap_or(1)
                 .clamp(1, 5);
+            if args.agentic_max_search_rounds.is_none() {
+                if let Some(v) = preset_max_search_rounds {
+                    max_search_rounds = v.clamp(1, 5);
+                }
+            }
             let frontier_max = args.agentic_frontier_max.unwrap_or(200).clamp(50, 2_000);
             let mut stuck_streak: usize = 0;
 
+            let mut deadline_exceeded_partial: bool = false;
+            let remaining_ms = || -> u64 {
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            };
+            let max_parallel_urls = args
+                .max_parallel_urls
+                .unwrap_or(3)
+                .clamp(1, 10)
+                .min(max_urls);
+
             while per_url.len() < max_urls {
+                // Hard-stop the loop when we ran out of wall clock budget. Return partial results.
+                let rem0 = remaining_ms();
+                if rem0 < 800 {
+                    deadline_exceeded_partial = true;
+                    break;
+                }
+                // Bound per-request time to the remaining budget (leave a small margin for processing).
+                let timeout_ms_eff = timeout_ms.min(rem0.saturating_sub(200).max(1_000));
+
+                // Wide parallel hydration: run a small batch concurrently.
+                //
+                // This reduces tail latency for multi-URL evidence packs while preserving deterministic ordering.
+                //
+                // We enable this in:
+                // - non-agentic runs (straight urls-mode hydration), and
+                // - a safe agentic subset: user-provided urls=[...] with len>1, agentic_selector="lexical".
+                //   In that case, "agentic expansion" is disabled anyway, and URL ordering depends only on the
+                //   deterministic lexical selector (no fetched-content feedback), so we can pre-pick a small batch.
+                let agentic_parallel_ok = agentic
+                    && user_urls_provided
+                    && user_urls_len > 1
+                    && agentic_selector.as_str() == "lexical";
+                if (agentic_parallel_ok || !agentic) && max_parallel_urls > 1 {
+                    if frontier.is_empty() {
+                        break;
+                    }
+
+                    // Pull a deterministic batch from the frontier.
+                    let want = (max_urls.saturating_sub(per_url.len()))
+                        .min(max_parallel_urls)
+                        .min(frontier.len());
+                    let mut batch_urls: Vec<String> = Vec::new();
+                    if agentic_parallel_ok {
+                        // Simulate the lexical agentic selector (without fetching) for `want` picks,
+                        // recomputing token weights each time to preserve semantics.
+                        for _ in 0..want {
+                            if frontier.is_empty() {
+                                break;
+                            }
+
+                            // Token rarity weights over current frontier (cheap DF over URL strings).
+                            let token_weights: std::collections::HashMap<String, u64> = {
+                                let mut df: std::collections::HashMap<String, u64> =
+                                    q_toks.iter().map(|t| (t.clone(), 0u64)).collect();
+                                for u in &frontier {
+                                    let u_scrub = textprep::scrub(u);
+                                    let toks: std::collections::BTreeSet<&str> =
+                                        u_scrub.split_whitespace().collect();
+                                    for t in &q_toks {
+                                        if toks.contains(t.as_str()) {
+                                            if let Some(v) = df.get_mut(t) {
+                                                *v += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                df.into_iter()
+                                    .map(|(t, c)| {
+                                        let w = 1_000u64 / (1 + c);
+                                        (t, w.max(1))
+                                    })
+                                    .collect()
+                            };
+
+                            // Compute (url_score, prior_score) for each frontier URL, then pick a Pareto-optimal
+                            // candidate and break ties deterministically.
+                            let mut url_scores: Vec<u64> = Vec::with_capacity(frontier.len());
+                            let mut prior_scores: Vec<u64> = Vec::with_capacity(frontier.len());
+                            let mut canon: Vec<String> = Vec::with_capacity(frontier.len());
+                            for u in &frontier {
+                                let u_scrub = textprep::scrub(u);
+                                let toks: std::collections::BTreeSet<&str> =
+                                    u_scrub.split_whitespace().collect();
+                                let mut s = 0u64;
+                                for t in &q_toks {
+                                    if toks.contains(t.as_str()) {
+                                        s = s.saturating_add(*token_weights.get(t).unwrap_or(&1));
+                                    }
+                                }
+                                if url_looks_like_auth_or_challenge(u) {
+                                    s /= 4;
+                                }
+                                let k = canonicalize_url_no_frag(u).unwrap_or_else(|| u.clone());
+                                let p = *priors.get(&k).unwrap_or(&0);
+                                url_scores.push(s);
+                                prior_scores.push(p);
+                                canon.push(k);
+                            }
+
+                            let metrics: Vec<Vec<f32>> = (0..frontier.len())
+                                .map(|i| vec![url_scores[i] as f32, prior_scores[i] as f32])
+                                .collect();
+                            let mut idxs = pare::pareto_indices(&metrics)
+                                .unwrap_or_else(|| (0..frontier.len()).collect());
+                            // Prefer higher prior (content-backed), then higher url_score, then stable order.
+                            idxs.sort_by(|&ia, &ib| {
+                                prior_scores[ib]
+                                    .cmp(&prior_scores[ia])
+                                    .then_with(|| url_scores[ib].cmp(&url_scores[ia]))
+                                    .then_with(|| ia.cmp(&ib))
+                            });
+                            let mut best_i = idxs.first().copied().unwrap_or(0);
+                            if best_i >= frontier.len() {
+                                best_i = 0;
+                            }
+
+                            let picked = frontier.swap_remove(best_i);
+                            let best_s = url_scores.get(best_i).copied().unwrap_or(0);
+                            let trace_obj = serde_json::json!({
+                                "picked_url": canonicalize_url_no_frag(&picked).unwrap_or_else(|| picked.clone()),
+                                "score": best_s,
+                                "prior": *priors.get(&canonicalize_url_no_frag(&picked).unwrap_or_else(|| picked.clone())).unwrap_or(&0),
+                                "selector": "lexical",
+                                "planner_action": "pick_url",
+                                "planner_reason": serde_json::Value::Null,
+                                "planner_calls": planner_calls,
+                                "force_firecrawl": false,
+                                "frontier_len_before": frontier.len() + 1
+                            });
+                            agentic_trace.push(trace_obj);
+                            batch_urls.push(picked);
+                        }
+                    } else {
+                        for _ in 0..want {
+                            if frontier.is_empty() {
+                                break;
+                            }
+                            batch_urls.push(frontier.remove(0));
+                        }
+                    }
+
+                    // Helper: warning penalty for dynamic warning strings.
+                    fn warning_penalty_strs(warnings: &[String]) -> i64 {
+                        let mut p: i64 = 0;
+                        for w in warnings {
+                            match normalize_warning_code(w.as_str()) {
+                                "blocked_by_js_challenge" => p += 100,
+                                "empty_extraction" => p += 80,
+                                "http_status_error" => p += 60,
+                                "main_content_low_signal" => p += 25,
+                                "chunks_filtered_low_signal" => p += 15,
+                                "body_truncated_by_max_bytes" => p += 12,
+                                "text_truncated_by_max_chars" => p += 8,
+                                "retried_due_to_truncation" => p += 3,
+                                "truncation_retry_failed" => p += 8,
+                                "pdf_extract_failed" => p += 15,
+                                "pdf_shellout_used" => p += 2,
+                                "pdf_shellout_unavailable" => p += 15,
+                                "pandoc_failed" => p += 12,
+                                "image_no_text_extraction" => p += 30,
+                                "media_no_text_extraction" => p += 30,
+                                "cache_error" => p += 10,
+                                "fetch_failed" => p += 12,
+                                _ => {}
+                            }
+                        }
+                        p
+                    }
+
+                    #[derive(Debug)]
+                    struct OneOut {
+                        one: serde_json::Value,
+                        candidates: Vec<ChunkCandidate>,
+                        ok: bool,
+                        hard_junk: bool,
+                        soft_junk: bool,
+                    }
+
+                    use futures::future::join_all;
+                    let fetch_backend0 = fetch_backend.clone();
+                    let query0 = query.clone();
+                    let futs = batch_urls.iter().cloned().map(|url0| {
+                        let fetch_backend1 = fetch_backend0.clone();
+                        let query1 = query0.clone();
+                        async move {
+                        let per_t0 = std::time::Instant::now();
+                        let r = self
+                            .web_extract(p(WebExtractArgs {
+                                url: Some(url0.clone()),
+                                fetch_backend: Some(fetch_backend1.clone()),
+                                no_network: Some(no_network),
+                                timeout_ms: Some(timeout_ms_eff),
+                                max_bytes: Some(max_bytes),
+                                cache_read: Some(cache_read_effective),
+                                cache_write: Some(cache_write_effective),
+                                cache_ttl_s,
+                                width: Some(width),
+                                max_chars: Some(max_chars),
+                                query: Some(query1.clone()).filter(|s| !s.trim().is_empty()),
+                                top_chunks: Some(top_chunks),
+                                max_chunk_chars: Some(max_chunk_chars),
+                                include_text: Some(include_text),
+                                include_links: Some(include_links),
+                                max_links: Some(max_links),
+                                include_structure: Some(include_structure),
+                                max_outline_items: Some(max_outline_items),
+                                max_blocks: Some(max_blocks),
+                                max_block_chars: Some(max_block_chars),
+                                semantic_rerank: Some(semantic_rerank),
+                                semantic_auto_fallback: Some(false),
+                                semantic_top_k: Some(semantic_top_k),
+                                retry_on_truncation: Some(retry_on_truncation),
+                                truncation_retry_max_bytes,
+                                ..Default::default()
+                            }))
+                            .await?;
+                        let v = payload_from_result(&r);
+                        let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+
+                        // Normalize warnings to Vec<String>.
+                        let mut warnings: Vec<String> = v
+                            .get("warnings")
+                            .and_then(|x| x.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect();
+                        let status_u = v.get("status").and_then(|x| x.as_u64()).unwrap_or(200);
+                        let status_bad = status_u >= 400;
+                        if status_bad && !warnings.iter().any(|w| w == "http_status_error") {
+                            warnings.push("http_status_error".to_string());
+                        }
+                        let hard_junk = warnings
+                            .iter()
+                            .any(|w| normalize_warning_code(w.as_str()) == "blocked_by_js_challenge");
+                        let soft_junk = warnings.iter().any(|w| {
+                            matches!(
+                                normalize_warning_code(w.as_str()),
+                                "empty_extraction" | "main_content_low_signal" | "chunks_filtered_low_signal"
+                            )
+                        });
+
+                        // Collect chunk candidates from extract.chunks.
+                        let wp = warning_penalty_strs(&warnings);
+                        let cache_hit = v
+                            .get("fetch_source")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            == "cache";
+                        let mut candidates: Vec<ChunkCandidate> = Vec::new();
+                        if ok && !status_bad {
+                            if let Some(chs) = v
+                                .get("extract")
+                                .and_then(|e| e.get("chunks"))
+                                .and_then(|x| x.as_array())
+                            {
+                                for c in chs {
+                                    let score = c
+                                        .get("score")
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(0);
+                                    let start_char = c
+                                        .get("start_char")
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(0) as usize;
+                                    let end_char = c
+                                        .get("end_char")
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(0) as usize;
+                                    let text = c
+                                        .get("text")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    candidates.push(ChunkCandidate {
+                                        url: url0.clone(),
+                                        score,
+                                        start_char,
+                                        end_char,
+                                        text,
+                                        warning_penalty: wp,
+                                        cache_hit,
+                                    });
+                                }
+                            }
+                        }
+
+                        // Build per-URL object consistent with search_evidence output.
+                        let mut warning_codes: Vec<String> = warnings
+                            .iter()
+                            .map(|w| normalize_warning_code(w.as_str()).to_string())
+                            .collect();
+                        warning_codes.sort();
+                        warning_codes.dedup();
+                        let warning_code_refs: Vec<&str> =
+                            warning_codes.iter().map(|s| s.as_str()).collect();
+                        let mut one = serde_json::json!({
+                            "url": url0,
+                            "ok": ok,
+                            "fetch_backend": fetch_backend1,
+                            "final_url": v.get("final_url").cloned().unwrap_or(serde_json::Value::Null),
+                            "status": v.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                            "content_type": v.get("content_type").cloned().unwrap_or(serde_json::Value::Null),
+                            "bytes": v.get("bytes").cloned().unwrap_or(serde_json::Value::Null),
+                            "truncated": v.get("truncated").cloned().unwrap_or(serde_json::Value::Null),
+                            "fetch_source": v.get("fetch_source").cloned().unwrap_or(serde_json::Value::Null),
+                            "attempts": serde_json::Value::Null,
+                            "extract": v.get("extract").cloned().unwrap_or(serde_json::Value::Null),
+                            "warnings": serde_json::json!(warnings),
+                            "warning_codes": serde_json::json!(warning_codes),
+                            "warning_hints": warning_hints_from(&warning_code_refs),
+                            "elapsed_ms": per_t0.elapsed().as_millis(),
+                        });
+                        if ok && status_bad {
+                            // 4xx/5xx pages are usually error shells; include them as per-URL results
+                            // but do not allow them to dominate evidence selection.
+                            let code = "http_status_error";
+                            match one.get_mut("warnings") {
+                                Some(serde_json::Value::Array(a)) => {
+                                    if !a.iter().any(|v| v.as_str() == Some(code)) {
+                                        a.push(serde_json::Value::String(code.to_string()));
+                                    }
+                                }
+                                _ => {
+                                    one["warnings"] = serde_json::json!([code]);
+                                }
+                            }
+                            match one.get_mut("warning_codes") {
+                                Some(serde_json::Value::Array(a)) => {
+                                    if !a.iter().any(|v| v.as_str() == Some(code)) {
+                                        a.push(serde_json::Value::String(code.to_string()));
+                                    }
+                                }
+                                _ => {
+                                    one["warning_codes"] = serde_json::json!([code]);
+                                }
+                            }
+                            match one.get_mut("warning_hints") {
+                                Some(serde_json::Value::Object(m)) => {
+                                    if !m.contains_key(code) {
+                                        if let serde_json::Value::Object(h) =
+                                            warning_hints_from(&[code])
+                                        {
+                                            if let Some(v) = h.get(code) {
+                                                m.insert(code.to_string(), v.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    one["warning_hints"] = warning_hints_from(&[code]);
+                                }
+                            }
+                        }
+                        let cache_io_disabled = std::env::var("WEBPIPE_CACHE_IO_TIMEOUT_MS")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                            .unwrap_or(2_000)
+                            == 0;
+                        if cache_io_disabled {
+                            // Surface cache IO disablement deterministically for agentic callers:
+                            // if cache IO is disabled (timeout_ms=0), warn even if we did no cache ops.
+                            let code = "cache_io_timeout";
+                            match one.get_mut("warnings") {
+                                Some(serde_json::Value::Array(a)) => {
+                                    if !a.iter().any(|v| v.as_str() == Some(code)) {
+                                        a.push(serde_json::Value::String(code.to_string()));
+                                    }
+                                }
+                                _ => {
+                                    one["warnings"] = serde_json::json!([code]);
+                                }
+                            }
+                            match one.get_mut("warning_codes") {
+                                Some(serde_json::Value::Array(a)) => {
+                                    if !a.iter().any(|v| v.as_str() == Some(code)) {
+                                        a.push(serde_json::Value::String(code.to_string()));
+                                    }
+                                }
+                                _ => {
+                                    one["warning_codes"] = serde_json::json!([code]);
+                                }
+                            }
+                            match one.get_mut("warning_hints") {
+                                Some(serde_json::Value::Object(m)) => {
+                                    if !m.contains_key(code) {
+                                        if let serde_json::Value::Object(h) =
+                                            warning_hints_from(&[code])
+                                        {
+                                            if let Some(v) = h.get(code) {
+                                                m.insert(code.to_string(), v.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    one["warning_hints"] = warning_hints_from(&[code]);
+                                }
+                            }
+                        }
+                        if !ok {
+                            if let Some(e) = v.get("error") {
+                                one["error"] = e.clone();
+                            }
+                        }
+
+                        // Apply compact shaping consistent with the sequential path.
+                        if compact {
+                            if let Some(ex) = one.get_mut("extract").and_then(|v| v.as_object_mut()) {
+                                ex.remove("chunks");
+                                ex.remove("width");
+                                ex.remove("max_chars");
+                                ex.remove("top_chunks");
+                                ex.remove("max_chunk_chars");
+                            }
+                            let mut out = serde_json::Map::new();
+                            for k in [
+                                "url",
+                                "final_url",
+                                "ok",
+                                "fetch_backend",
+                                "attempts",
+                                "status",
+                                "content_type",
+                                "bytes",
+                                "elapsed_ms",
+                                "warnings",
+                                "warning_codes",
+                                "warning_hints",
+                                "extract",
+                            ] {
+                                if let Some(v) = one.get(k) {
+                                    out.insert(k.to_string(), v.clone());
+                                }
+                            }
+                            one = serde_json::Value::Object(out);
+                        }
+
+                        Ok::<OneOut, McpError>(OneOut {
+                            one,
+                            candidates,
+                            ok,
+                            hard_junk,
+                            soft_junk,
+                        })
+                    }
+                    });
+
+                    let outs: Vec<OneOut> = join_all(futs)
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for o in outs {
+                        if o.ok {
+                            total_urls_ok = total_urls_ok.saturating_add(1);
+                            if o.hard_junk {
+                                hard_junk_urls = hard_junk_urls.saturating_add(1);
+                            } else if o.soft_junk {
+                                soft_junk_urls = soft_junk_urls.saturating_add(1);
+                            }
+                        }
+                        for c in o.candidates {
+                            all_chunks.push(c);
+                        }
+                        per_url.push(o.one);
+                    }
+                    continue;
+                }
                 if frontier.is_empty() {
                     // Agentic escape hatch: do another bounded search round when we ran out of frontier.
                     // This is cost-aware: default max_search_rounds=1 unless explicitly enabled.
@@ -11344,6 +12609,7 @@ mod mcp {
                             max_results: Some(max_results),
                             language: None,
                             country: None,
+                            timeout_ms: Some(timeout_ms_eff),
                         }))
                         .await?;
                     let sv2 = payload_from_result(&sr2);
@@ -11367,6 +12633,10 @@ mod mcp {
                     if let Some(rs) = sv2.get("results").and_then(|v| v.as_array()) {
                         for r in rs {
                             if let Some(u) = r.get("url").and_then(|v| v.as_str()) {
+                                if !url_allowed_by_domain_filters(u, &domains_allow, &domains_deny)
+                                {
+                                    continue;
+                                }
                                 if let Some(k) = canonicalize_url_no_frag(u) {
                                     if seen_frontier.insert(k) {
                                         frontier.push(u.to_string());
@@ -11397,8 +12667,10 @@ mod mcp {
                             q_toks.iter().map(|t| (t.clone(), 0u64)).collect();
                         for u in &frontier {
                             let u_scrub = textprep::scrub(u);
+                            let toks: std::collections::BTreeSet<&str> =
+                                u_scrub.split_whitespace().collect();
                             for t in &q_toks {
-                                if u_scrub.contains(t) {
+                                if toks.contains(t.as_str()) {
                                     if let Some(v) = df.get_mut(t) {
                                         *v += 1;
                                     }
@@ -11421,9 +12693,11 @@ mod mcp {
                     let mut canon: Vec<String> = Vec::with_capacity(frontier.len());
                     for u in &frontier {
                         let u_scrub = textprep::scrub(u);
+                        let toks: std::collections::BTreeSet<&str> =
+                            u_scrub.split_whitespace().collect();
                         let mut s = 0u64;
                         for t in &q_toks {
-                            if u_scrub.contains(t) {
+                            if toks.contains(t.as_str()) {
                                 s = s.saturating_add(*token_weights.get(t).unwrap_or(&1));
                             }
                         }
@@ -11541,7 +12815,7 @@ Rules:
                             let resp = client
                                 .chat_messages_with_options(
                                     msgs,
-                                    timeout_ms,
+                                    timeout_ms_eff,
                                     Some(300),
                                     Some(0.0),
                                     Some(1.0),
@@ -11678,6 +12952,7 @@ Rules:
                     used_render_fallback,
                     used_firecrawl_fallback,
                     extracted_obj,
+                    cache_io_timed_out,
                 ) = if let Some(fc) = if use_firecrawl_agentic {
                     firecrawl_agentic.as_ref()
                 } else {
@@ -11739,6 +13014,7 @@ Rules:
                             text: md,
                             warnings: Vec::new(),
                         },
+                        false,
                     )
                 } else {
                     let (url0, arxiv_attempts) = self.maybe_rewrite_arxiv_abs_url(url);
@@ -11749,7 +13025,7 @@ Rules:
                     let (fetch_url, github_repo_attempts) = self
                         .maybe_rewrite_github_repo_url(
                             &url3,
-                            timeout_ms,
+                            timeout_ms_eff,
                             max_bytes,
                             no_network,
                             cache_read,
@@ -11760,7 +13036,7 @@ Rules:
 
                     let req = FetchRequest {
                         url: fetch_url.clone(),
-                        timeout_ms: Some(timeout_ms),
+                        timeout_ms: Some(timeout_ms_eff),
                         max_bytes: Some(max_bytes),
                         headers: BTreeMap::new(),
                         cache: FetchCachePolicy {
@@ -11836,7 +13112,7 @@ Rules:
 
                         let pr = match webpipe_local::render_playwright::render_html_playwright(
                             fetch_url0.as_str(),
-                            timeout_ms,
+                            timeout_ms_eff,
                             proxy_for_render,
                         )
                         .await
@@ -11914,7 +13190,7 @@ Rules:
                                 m
                             },
                         }
-                    } else if no_network {
+                    } else if no_network && !url_is_localhost(&req.url) {
                         match self.fetcher.cache_get(&req) {
                             Ok(Some(r)) => r,
                             Ok(None) => {
@@ -12023,7 +13299,7 @@ Rules:
                             }));
                             let req2 = FetchRequest {
                                 url: fetch_url0.clone(),
-                                timeout_ms: Some(timeout_ms),
+                                timeout_ms: Some(timeout_ms_eff),
                                 max_bytes: Some(retry_cap),
                                 headers: BTreeMap::new(),
                                 cache: FetchCachePolicy {
@@ -12116,6 +13392,14 @@ Rules:
                         FetchSource::Cache => "cache",
                         FetchSource::Network => "network",
                     };
+                    let cache_io_disabled = std::env::var("WEBPIPE_CACHE_IO_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(2_000)
+                        == 0;
+                    let cache_io_timed_out = cache_io_disabled
+                        || fetched.timings_ms.contains_key("cache_get_timeout")
+                        || fetched.timings_ms.contains_key("cache_put_timeout");
 
                     // Attempt local extraction first; if it's empty and fallback is enabled + configured,
                     // retry *just this URL* via Firecrawl.
@@ -12127,13 +13411,37 @@ Rules:
                     } else {
                         fetched.text_lossy()
                     };
-                    let mut local_extracted_obj = webpipe_local::extract::best_effort_text_from_bytes(
-                        &fetched.bytes,
-                        local_content_type.as_deref(),
-                        &local_final_url,
-                        width,
-                        500,
-                    );
+                    let mut local_extracted_obj =
+                        webpipe_local::extract::best_effort_text_from_bytes(
+                            &fetched.bytes,
+                            local_content_type.as_deref(),
+                            &local_final_url,
+                            width,
+                            500,
+                        );
+
+                    // Handle client-side redirects (meta refresh / JS): enqueue the target if found.
+                    if local_extracted_obj.engine == "redirect" {
+                        let target = local_extracted_obj.text.trim();
+                        if !target.is_empty() {
+                            let next = if let Ok(u) = reqwest::Url::parse(target) {
+                                Some(u)
+                            } else if let Ok(base) = reqwest::Url::parse(&local_final_url) {
+                                base.join(target).ok()
+                            } else {
+                                None
+                            };
+                            if let Some(u) = next {
+                                if let Some(k) = canonicalize_url_no_frag(u.as_str()) {
+                                    if seen_frontier.insert(k) {
+                                        // Prioritize the redirect target.
+                                        frontier.insert(0, u.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let (_local_text, local_text_chars, _local_text_clipped) =
                         Self::truncate_to_chars(&local_extracted_obj.text, max_chars);
                     let local_empty_extraction = local_text_chars == 0 && local_bytes_len > 0;
@@ -12142,12 +13450,15 @@ Rules:
                         && Self::looks_like_bundle_gunk(&local_extracted_obj.text);
 
                     if let Some(render_tuple) = {
-                        let wants_render = (local_empty_extraction && render_fallback_on_empty_extraction)
+                        let wants_render = (local_empty_extraction
+                            && render_fallback_on_empty_extraction)
                             || (local_low_signal && render_fallback_on_low_signal);
                         if !wants_render {
                             None
                         } else if matches!(privacy_mode_from_env(), PrivacyMode::Offline) {
-                            local_extracted_obj.warnings.push("render_fallback_not_supported");
+                            local_extracted_obj
+                                .warnings
+                                .push("render_fallback_not_supported");
                             None
                         } else if matches!(
                             std::env::var("WEBPIPE_RENDER_DISABLE")
@@ -12157,7 +13468,9 @@ Rules:
                                 .as_str(),
                             "1" | "true" | "yes" | "on"
                         ) {
-                            local_extracted_obj.warnings.push("render_fallback_disabled");
+                            local_extracted_obj
+                                .warnings
+                                .push("render_fallback_disabled");
                             None
                         } else {
                             let pm = privacy_mode_from_env();
@@ -12193,73 +13506,74 @@ Rules:
                             } else {
                                 match webpipe_local::render_playwright::render_html_playwright(
                                     fetch_url0.as_str(),
-                                    timeout_ms,
+                                    timeout_ms_eff,
                                     proxy_for_render,
                                 )
                                 .await
                                 {
-                                Ok(pr) => {
-                                    let html = pr.html;
-                                    let bytes = html.as_bytes().to_vec();
-                                    let bytes_len = bytes.len();
-                                    let mut a = serde_json::Map::new();
-                                    a.insert(
-                                        "local".to_string(),
-                                        serde_json::json!({
-                                            "ok": true,
-                                            "final_url": local_final_url,
-                                            "status": local_status,
-                                            "content_type": local_content_type,
-                                            "bytes": local_bytes_len,
-                                            "truncated": local_truncated,
-                                            "source": local_source,
-                                            "empty_extraction": local_empty_extraction,
-                                            "low_signal": local_low_signal
-                                        }),
-                                    );
-                                    if let Some(obj) = local_retry_obj.take() {
-                                        a.insert("local_retry".to_string(), obj);
-                                    }
-                                    a.insert(
-                                        "render_fallback".to_string(),
-                                        serde_json::json!({
-                                            "ok": true,
-                                            "backend": "playwright",
-                                            "mode": pr.mode,
-                                            "elapsed_ms": pr.elapsed_ms,
-                                            "console_error_count": pr.console_error_count,
-                                            "bytes": bytes_len
-                                        }),
-                                    );
-                                    attempts = serde_json::Value::Object(a);
-
-                                    let mut extracted0 =
-                                        webpipe_local::extract::best_effort_text_from_bytes(
-                                            bytes.as_ref(),
-                                            Some("text/html"),
-                                            pr.final_url.as_str(),
-                                            width,
-                                            500,
+                                    Ok(pr) => {
+                                        let html = pr.html;
+                                        let bytes = html.as_bytes().to_vec();
+                                        let bytes_len = bytes.len();
+                                        let mut a = serde_json::Map::new();
+                                        a.insert(
+                                            "local".to_string(),
+                                            serde_json::json!({
+                                                "ok": true,
+                                                "final_url": local_final_url,
+                                                "status": local_status,
+                                                "content_type": local_content_type,
+                                                "bytes": local_bytes_len,
+                                                "truncated": local_truncated,
+                                                "source": local_source,
+                                                "empty_extraction": local_empty_extraction,
+                                                "low_signal": local_low_signal
+                                            }),
                                         );
-                                    extracted0.warnings.push(if local_empty_extraction {
-                                        "render_fallback_on_empty_extraction"
-                                    } else {
-                                        "render_fallback_on_low_signal"
-                                    });
-                                    Some((
-                                        html,
-                                        bytes,
-                                        pr.final_url,
-                                        pr.status.unwrap_or(200),
-                                        Some("text/html".to_string()),
-                                        bytes_len,
-                                        false,
-                                        "network",
-                                        true,
-                                        false,
-                                        extracted0,
-                                    ))
-                                }
+                                        if let Some(obj) = local_retry_obj.take() {
+                                            a.insert("local_retry".to_string(), obj);
+                                        }
+                                        a.insert(
+                                            "render_fallback".to_string(),
+                                            serde_json::json!({
+                                                "ok": true,
+                                                "backend": "playwright",
+                                                "mode": pr.mode,
+                                                "elapsed_ms": pr.elapsed_ms,
+                                                "console_error_count": pr.console_error_count,
+                                                "bytes": bytes_len
+                                            }),
+                                        );
+                                        attempts = serde_json::Value::Object(a);
+
+                                        let mut extracted0 =
+                                            webpipe_local::extract::best_effort_text_from_bytes(
+                                                bytes.as_ref(),
+                                                Some("text/html"),
+                                                pr.final_url.as_str(),
+                                                width,
+                                                500,
+                                            );
+                                        extracted0.warnings.push(if local_empty_extraction {
+                                            "render_fallback_on_empty_extraction"
+                                        } else {
+                                            "render_fallback_on_low_signal"
+                                        });
+                                        Some((
+                                            html,
+                                            bytes,
+                                            pr.final_url,
+                                            pr.status.unwrap_or(200),
+                                            Some("text/html".to_string()),
+                                            bytes_len,
+                                            false,
+                                            "network",
+                                            true,
+                                            false,
+                                            extracted0,
+                                            cache_io_timed_out,
+                                        ))
+                                    }
                                     Err(_) => {
                                         local_extracted_obj.warnings.push("render_fallback_failed");
                                         None
@@ -12330,6 +13644,7 @@ Rules:
                                                 "firecrawl_fallback_on_low_signal"
                                             }],
                                         },
+                                        cache_io_timed_out,
                                     )
                                 }
                                 Err(e) => {
@@ -12376,6 +13691,7 @@ Rules:
                                         false,
                                         false,
                                         local_extracted_obj,
+                                    cache_io_timed_out,
                                     )
                                 }
                             }
@@ -12423,6 +13739,7 @@ Rules:
                                 false,
                                 false,
                                 local_extracted_obj,
+                                cache_io_timed_out,
                             )
                         }
                     } else {
@@ -12457,6 +13774,7 @@ Rules:
                             false,
                             false,
                             local_extracted_obj,
+                            cache_io_timed_out,
                         )
                     }
                 };
@@ -12467,29 +13785,86 @@ Rules:
                     let ct = content_type.clone();
                     let final_url2 = final_url.clone();
                     let query2 = query.clone();
-                    tokio::task::spawn_blocking(move || {
-                        webpipe_local::extract::extract_pipeline_from_extracted(
-                            &bytes,
-                            ct.as_deref(),
-                            final_url2.as_str(),
-                            extracted_obj,
-                            webpipe_local::extract::ExtractPipelineCfg {
-                                query: Some(query2.as_str()),
-                                width,
-                                max_chars,
-                                top_chunks,
-                                max_chunk_chars,
-                                include_structure,
-                                max_outline_items,
-                                max_blocks,
-                                max_block_chars,
-                            },
+                    let extract_timeout_ms = std::env::var("WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        // Default: stay within the per-URL timeout, but don't preempt it too aggressively.
+                        // The pipeline timeout exists to prevent hangs in blocking extraction, not to clip
+                        // legitimate slow parses (notably large PDFs) when the caller already allowed more time.
+                        .unwrap_or(timeout_ms_eff.saturating_sub(1_000).clamp(4_000, 45_000));
+                    if extract_timeout_ms == 0 {
+                        // Deterministic: 0ms means “skip extraction immediately”.
+                        let cfg = webpipe_local::extract::ExtractPipelineCfg {
+                            query: Some(query.as_str()),
+                            width,
+                            max_chars,
+                            top_chunks,
+                            max_chunk_chars,
+                            include_structure: false,
+                            max_outline_items: 0,
+                            max_blocks: 0,
+                            max_block_chars: 0,
+                        };
+                        let mut p =
+                            webpipe_local::extract::extract_pipeline_from_bytes(&[], None, "", cfg);
+                        p.extracted.warnings.push("extract_pipeline_timeout");
+                        p
+                    } else {
+                        let handle = tokio::task::spawn_blocking(move || {
+                            webpipe_local::extract::extract_pipeline_from_extracted(
+                                &bytes,
+                                ct.as_deref(),
+                                final_url2.as_str(),
+                                extracted_obj,
+                                webpipe_local::extract::ExtractPipelineCfg {
+                                    query: Some(query2.as_str()),
+                                    width,
+                                    max_chars,
+                                    top_chunks,
+                                    max_chunk_chars,
+                                    include_structure,
+                                    max_outline_items,
+                                    max_blocks,
+                                    max_block_chars,
+                                },
+                            )
+                        });
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(extract_timeout_ms),
+                            handle,
                         )
-                    })
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error(format!("extract pipeline join failed: {e}"), None)
-                    })?
+                        .await
+                        {
+                            Ok(join) => join.map_err(|e| {
+                                McpError::internal_error(
+                                    format!("extract pipeline join failed: {e}"),
+                                    None,
+                                )
+                            })?,
+                            Err(_) => {
+                                // Fail open: return a minimal empty pipeline rather than hanging.
+                                let cfg = webpipe_local::extract::ExtractPipelineCfg {
+                                    query: Some(query.as_str()),
+                                    width,
+                                    max_chars,
+                                    top_chunks,
+                                    max_chunk_chars,
+                                    include_structure: false,
+                                    max_outline_items: 0,
+                                    max_blocks: 0,
+                                    max_block_chars: 0,
+                                };
+                                let mut p = webpipe_local::extract::extract_pipeline_from_bytes(
+                                    &[],
+                                    None,
+                                    "",
+                                    cfg,
+                                );
+                                p.extracted.warnings.push("extract_pipeline_timeout");
+                                p
+                            }
+                        }
+                    }
                 };
                 #[cfg(feature = "vision-gemini")]
                 let mut pipeline = pipeline0;
@@ -12588,7 +13963,13 @@ Rules:
                     || webpipe_local::extract::bytes_look_like_pdf(&raw_bytes)
                     || extracted_obj.engine.starts_with("pdf-");
 
-                let links = if include_links && fetch_backend == "local" && !is_pdf_like {
+                let mut links_timed_out = false;
+                let links = if include_links
+                    && fetch_backend == "local"
+                    && !is_pdf_like
+                    && !used_firecrawl_fallback
+                    && !used_firecrawl_agentic
+                {
                     // Link extraction should be based on the raw document (not the chosen text-extraction
                     // engine). Otherwise, pages that select `html_main`/`html_hint` would incorrectly show
                     // `links: []` even though the HTML contains lots of links.
@@ -12609,15 +13990,34 @@ Rules:
                     if text_like {
                         let raw_text2 = raw_text.clone();
                         let base_url = final_url.clone();
-                        tokio::task::spawn_blocking(move || {
+                        let links_timeout_ms = std::env::var("WEBPIPE_LINKS_TIMEOUT_MS")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                            .unwrap_or(1_500);
+                        if links_timeout_ms == 0 {
+                            links_timed_out = true;
+                            Vec::new()
+                        } else {
+                            let handle = tokio::task::spawn_blocking(move || {
                             webpipe_local::links::extract_links(
                                 &raw_text2,
                                 Some(base_url.as_str()),
                                 max_links,
                             )
-                        })
-                        .await
-                        .unwrap_or_else(|_| Vec::new())
+                            });
+                            match tokio::time::timeout(
+                                std::time::Duration::from_millis(links_timeout_ms),
+                                handle,
+                            )
+                            .await
+                            {
+                                Ok(join) => join.unwrap_or_else(|_| Vec::new()),
+                                Err(_) => {
+                                    links_timed_out = true;
+                                    Vec::new()
+                                }
+                            }
+                        }
                     } else {
                         Vec::new()
                     }
@@ -12628,6 +14028,18 @@ Rules:
                 let mut warnings: Vec<&'static str> = Vec::new();
                 if truncated {
                     warnings.push("body_truncated_by_max_bytes");
+                }
+                let cache_io_disabled = std::env::var("WEBPIPE_CACHE_IO_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(2_000)
+                    == 0;
+                if cache_io_timed_out || cache_io_disabled {
+                    warnings.push("cache_io_timeout");
+                }
+                let status_bad = status >= 400;
+                if status_bad {
+                    warnings.push("http_status_error");
                 }
                 if let Some(o) = attempts.as_object() {
                     if let Some(lr) = o.get("local_retry") {
@@ -12660,7 +14072,10 @@ Rules:
                 if include_links && is_pdf_like {
                     warnings.push("links_unavailable_for_pdf");
                 }
-                if no_network {
+                if include_links && links_timed_out {
+                    warnings.push("links_timeout");
+                }
+                if no_network && !url_is_localhost(url) {
                     warnings.push("cache_only");
                 }
                 // Surface “JS wall / auth wall” in a stable way so the agent can choose a different URL.
@@ -12679,6 +14094,7 @@ Rules:
                     && structure_opt
                         .as_ref()
                         .is_some_and(structure_looks_like_ui_shell)
+                    && extracted_text_looks_like_nav_shell(&extracted_obj.text)
                 {
                     warnings.push("main_content_low_signal");
                 }
@@ -12736,16 +14152,18 @@ Rules:
                 // Collect chunk candidates with per-URL provenance signals for selection.
                 let warning_penalty = Self::warning_penalty(&warnings);
                 let cache_hit = fetch_source == "cache";
-                for c in &chunks {
-                    all_chunks.push(ChunkCandidate {
-                        url: url.clone(),
-                        score: c.score,
-                        start_char: c.start_char,
-                        end_char: c.end_char,
-                        text: c.text.clone(),
-                        warning_penalty,
-                        cache_hit,
-                    });
+                if !status_bad {
+                    for c in &chunks {
+                        all_chunks.push(ChunkCandidate {
+                            url: url.clone(),
+                            score: c.score,
+                            start_char: c.start_char,
+                            end_char: c.end_char,
+                            text: c.text.clone(),
+                            warning_penalty,
+                            cache_hit,
+                        });
+                    }
                 }
 
                 // Always include a small preview so query-mode returns “actual content”
@@ -12753,9 +14171,29 @@ Rules:
                 //
                 // Keep this single-line and bounded to stay Cursor-friendly.
                 let cap = 700usize;
-                let mut text_preview: String = text.chars().take(cap).collect();
-                text_preview = text_preview.split_whitespace().collect::<Vec<_>>().join(" ");
-                let text_preview_truncated = text.chars().count() > cap;
+                let mut text_preview_source = "prefix";
+                let mut preview_base: &str = &text;
+                // In query-mode, prefer previewing the best matching chunk rather than the
+                // beginning of the page (which is often nav/chrome).
+                if !query.trim().is_empty() {
+                    if let Some(best) = chunks.iter().find(|c| !c.text.trim().is_empty()) {
+                        // `best_chunks_default` uses score=1. Treat that as a fallback indicator so
+                        // consumers can distinguish “query matched” vs “contentful preview”.
+                        text_preview_source = if best.score >= 2 {
+                            "top_chunk"
+                        } else {
+                            "top_chunk_fallback"
+                        };
+                        preview_base = best.text.as_str();
+                    }
+                }
+
+                let mut text_preview: String = preview_base.chars().take(cap).collect();
+                text_preview = text_preview
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let text_preview_truncated = preview_base.chars().count() > cap;
 
                 let mut one = serde_json::json!({
                     "url": url,
@@ -12782,6 +14220,7 @@ Rules:
                         "text_chars": text_chars,
                         "text_truncated": text_clipped,
                         "text_preview": text_preview,
+                        "text_preview_source": text_preview_source,
                         "text_preview_truncated": text_preview_truncated,
                         "top_chunks": top_chunks,
                         "max_chunk_chars": max_chunk_chars,
@@ -12875,10 +14314,11 @@ Rules:
                 //   the user is already curating sources, and link-walking can drift to login/CTA pages.
                 // - When `urls` were not provided (search-mode), or exactly one URL was provided
                 //   (portal->article), expansion is allowed (bounded by frontier_max).
-                let allow_agentic_expansion =
-                    agentic && fetch_backend == "local" && !is_pdf_like && (!user_urls_provided || user_urls_len <= 1);
+                let allow_agentic_expansion = agentic
+                    && fetch_backend == "local"
+                    && !is_pdf_like
+                    && (!user_urls_provided || user_urls_len <= 1);
                 if allow_agentic_expansion {
-                    let base = Some(final_url.as_str());
                     let ct0 = content_type
                         .as_deref()
                         .unwrap_or("")
@@ -12892,20 +14332,48 @@ Rules:
                         || extracted_obj.engine == "markdown"
                         || ct0 == "text/markdown"
                         || ct0 == "text/x-markdown";
-                    let discovered = if markdown_like {
-                        // Markdown-ish: recover discovery via markdown link parsing.
-                        webpipe_local::links::extract_markdown_link_candidates(
-                            &raw_text,
-                            base,
-                            max_links.min(50),
-                        )
+                    let links_timeout_ms = std::env::var("WEBPIPE_LINKS_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(1_500);
+                    let mut links_timed_out = false;
+                    let discovered = if links_timeout_ms == 0 {
+                        links_timed_out = true;
+                        Vec::new()
                     } else {
-                        webpipe_local::links::extract_link_candidates(
-                            &raw_text,
-                            base,
-                            max_links.min(50),
+                        // Offload parsing to the blocking pool; link extraction can get expensive on some pages.
+                        let raw = raw_text.clone();
+                        let base_url = final_url.clone();
+                        let markdown_like2 = markdown_like;
+                        let max_links2 = max_links.min(50);
+                        let handle = tokio::task::spawn_blocking(move || {
+                            let base = Some(base_url.as_str());
+                            if markdown_like2 {
+                                webpipe_local::links::extract_markdown_link_candidates(
+                                    &raw,
+                                    base,
+                                    max_links2,
+                                )
+                            } else {
+                                webpipe_local::links::extract_link_candidates(&raw, base, max_links2)
+                            }
+                        });
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(links_timeout_ms),
+                            handle,
                         )
+                        .await
+                        {
+                            Ok(join) => join.unwrap_or_else(|_| Vec::new()),
+                            Err(_) => {
+                                links_timed_out = true;
+                                Vec::new()
+                            }
+                        }
                     };
+                    if links_timed_out {
+                        warnings.push("links_timeout");
+                    }
                     // Propagate content relevance to discovered links. This is the “loop”:
                     // good pages contribute candidate URLs more strongly than weak pages.
                     let parent_relevance = chunks.iter().map(|c| c.score).max().unwrap_or(0);
@@ -12920,6 +14388,9 @@ Rules:
                             || url_looks_like_promo_or_tracking(&u)
                             || url_looks_like_low_value_homepage(&u)
                         {
+                            continue;
+                        }
+                        if !url_allowed_by_domain_filters(&u, &domains_allow, &domains_deny) {
                             continue;
                         }
                         if let Some(ref hs) = url_scope_hosts {
@@ -13013,7 +14484,63 @@ Rules:
                 }
             }
 
+            // Filter out redirect sources if their target was also fetched.
+            // This reduces noise in the output (e.g. "Click here to be redirected" pages).
+            let mut successful_targets = std::collections::HashSet::new();
+            for r in &per_url {
+                if r.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                    if let Some(u) = r.get("final_url").and_then(|v| v.as_str()) {
+                        successful_targets.insert(u.to_string());
+                    }
+                }
+            }
+
+            let mut redirect_urls_to_drop = std::collections::HashSet::new();
+            for r in &per_url {
+                let is_redirect_engine = r
+                    .get("extract")
+                    .and_then(|e| e.get("engine"))
+                    .and_then(|s| s.as_str())
+                    == Some("redirect");
+
+                if is_redirect_engine {
+                    if let Some(target) = r
+                        .get("extract")
+                        .and_then(|e| e.get("text"))
+                        .and_then(|t| t.as_str())
+                    {
+                        // Check exact match or relative resolution
+                        let hit = successful_targets.contains(target);
+                        let hit_abs = if !hit {
+                            r.get("final_url")
+                                .and_then(|b| b.as_str())
+                                .and_then(|b| reqwest::Url::parse(b).ok())
+                                .and_then(|base| base.join(target).ok())
+                                .map(|u| successful_targets.contains(u.as_str()))
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+
+                        if hit || hit_abs {
+                            if let Some(u) = r.get("url").and_then(|v| v.as_str()) {
+                                redirect_urls_to_drop.insert(u.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !redirect_urls_to_drop.is_empty() {
+                per_url.retain(|r| {
+                    let u = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    !redirect_urls_to_drop.contains(u)
+                });
+                all_chunks.retain(|c| !redirect_urls_to_drop.contains(&c.url));
+            }
+
             let selected = Self::select_top_chunks(all_chunks, top_chunks, selection_mode.as_str());
+            let max_selected_score = selected.iter().map(|c| c.score).max().unwrap_or(0);
             let top_chunks_out: Vec<serde_json::Value> = selected
                 .into_iter()
                 .map(|c| {
@@ -13027,7 +14554,11 @@ Rules:
                 })
                 .collect();
 
-            let mode = if search_steps.is_empty() { "urls" } else { "search" };
+            let mode = if search_steps.is_empty() {
+                "urls"
+            } else {
+                "search"
+            };
             let provider_out = if mode == "urls" {
                 "urls".to_string()
             } else {
@@ -13047,8 +14578,10 @@ Rules:
                     "fetch_backend": fetch_backend,
                     "max_results": max_results,
                     "max_urls": max_urls,
+                    "max_parallel_urls": max_parallel_urls,
                     "url_selection_mode": url_selection_mode,
                     "timeout_ms": timeout_ms,
+                    "deadline_ms": deadline_ms,
                     "max_bytes": max_bytes,
                     "retry_on_truncation": retry_on_truncation,
                     "truncation_retry_max_bytes": truncation_retry_max_bytes,
@@ -13059,6 +14592,8 @@ Rules:
                     "include_links": include_links,
                     "max_links": max_links,
                     "include_text": include_text,
+                    "domains_allow": domains_allow,
+                    "domains_deny": domains_deny,
                     "agentic": agentic,
                     "agentic_max_search_rounds": max_search_rounds,
                     "agentic_frontier_max": frontier_max,
@@ -13084,7 +14619,11 @@ Rules:
             }
             // If fetch_backend="render" is requested but nothing succeeded, fail closed with a
             // clear top-level error. This avoids confusing "ok=true but empty results" outcomes.
-            if fetch_backend == "render" && per_url.iter().all(|v| v.get("ok").and_then(|b| b.as_bool()) != Some(true)) {
+            if fetch_backend == "render"
+                && per_url
+                    .iter()
+                    .all(|v| v.get("ok").and_then(|b| b.as_bool()) != Some(true))
+            {
                 payload["ok"] = serde_json::json!(false);
                 payload["error"] = error_obj(
                     ErrorCode::NotConfigured,
@@ -13131,6 +14670,42 @@ Rules:
                         "trace": agentic_trace
                     });
                 }
+            }
+
+            // Tool-level warning: none of the selected chunks appears to match the query (beyond
+            // the query-less fallback chunks, which carry score=1).
+            //
+            // This most often means:
+            // - URLs don't actually contain the query, or
+            // - the relevant section lies beyond max_chars, or
+            // - the page is still dominated by nav/app-shell (try render/firecrawl).
+            if !query.trim().is_empty() && max_selected_score <= 1 {
+                payload["warning_codes"] = serde_json::json!(["no_query_overlap_any_url"]);
+                payload["warning_hints"] = warning_hints_from(&["no_query_overlap_any_url"]);
+            }
+
+            if deadline_exceeded_partial {
+                // Tool-level warning (not tied to a specific URL). Keep it compact; merge logic later
+                // will combine this with per-URL warnings.
+                // Merge with any existing tool-level warning codes.
+                let mut merged = std::collections::BTreeSet::<String>::new();
+                if let Some(arr) = payload.get("warning_codes").and_then(|v| v.as_array()) {
+                    for x in arr.iter().filter_map(|v| v.as_str()) {
+                        let s = normalize_warning_code(x).to_string();
+                        if !s.is_empty() {
+                            merged.insert(s);
+                        }
+                    }
+                }
+                merged.insert("deadline_exceeded_partial".to_string());
+                let merged_vec = merged.into_iter().collect::<Vec<_>>();
+                payload["warning_codes"] = serde_json::json!(merged_vec.clone());
+                let codes_ref = merged_vec
+                    .iter()
+                    .take(12)
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>();
+                payload["warning_hints"] = warning_hints_from(&codes_ref);
             }
 
             if let Some(p) = search_backend_provider.as_deref() {
@@ -13239,10 +14814,12 @@ Rules:
                 }
 
                 let merged_vec = merged.into_iter().collect::<Vec<_>>();
-                payload["warning_codes"] = serde_json::json!(merged_vec);
+                payload["warning_codes"] = serde_json::json!(merged_vec.clone());
 
-                let codes_ref = actionable_codes
+                // Hints should cover merged codes (including tool-level warnings), but stay bounded.
+                let codes_ref = merged_vec
                     .iter()
+                    .filter(|c| is_actionable_warning_code(c.as_str()))
                     .take(12)
                     .map(|s| s.as_str())
                     .collect::<Vec<_>>();
@@ -13339,7 +14916,45 @@ Rules:
             let cache_dir_s = cache_dir.to_string_lossy().to_string();
             let query_s = query.clone();
             let cache_dir2 = cache_dir.clone();
-            let r = tokio::task::spawn_blocking(move || {
+            let cache_timeout_ms = std::env::var("WEBPIPE_CACHE_SEARCH_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(20_000)
+                .clamp(0, 300_000);
+            if cache_timeout_ms == 0 {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "query": query,
+                    "cache_dir": cache_dir_s,
+                    "error": error_obj(
+                        ErrorCode::CacheError,
+                        "cache search timed out after 0ms",
+                        "Increase WEBPIPE_CACHE_SEARCH_TIMEOUT_MS (or reduce max_scan_entries/max_docs)."
+                    ),
+                    "warnings": ["cache_search_timeout"],
+                    "warning_codes": ["cache_search_timeout"],
+                    "warning_hints": warning_hints_from(&["cache_search_timeout"]),
+                    "request": {
+                        "max_docs": max_docs,
+                        "max_scan_entries": max_scan_entries,
+                        "max_chars": max_chars,
+                        "max_bytes": max_bytes,
+                        "width": width,
+                        "top_chunks": top_chunks,
+                        "max_chunk_chars": max_chunk_chars,
+                        "include_structure": include_structure,
+                        "include_text": include_text,
+                        "semantic_rerank": semantic_rerank,
+                        "semantic_top_k": semantic_top_k,
+                        "compact": compact,
+                        "cache_search_timeout_ms": cache_timeout_ms
+                    }
+                });
+                add_envelope_fields(&mut payload, "web_cache_search_extract", t0.elapsed().as_millis());
+                let md = web_cache_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
+            }
+            let handle = tokio::task::spawn_blocking(move || {
                 webpipe_local::cache_search::cache_search_extract(
                     &cache_dir2,
                     &query_s,
@@ -13356,11 +14971,54 @@ Rules:
                     include_text,
                     max_scan_entries,
                 )
-            })
+            });
+            let r = match tokio::time::timeout(
+                std::time::Duration::from_millis(cache_timeout_ms),
+                handle,
+            )
             .await
-            .map_err(|e| {
-                McpError::internal_error(format!("cache search task failed: {e}"), None)
-            })?;
+            {
+                Ok(join) => join.map_err(|e| {
+                    McpError::internal_error(format!("cache search task failed: {e}"), None)
+                })?,
+                Err(_) => {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "query": query,
+                        "cache_dir": cache_dir_s,
+                        "error": error_obj(
+                            ErrorCode::CacheError,
+                            format!("cache search timed out after {cache_timeout_ms}ms"),
+                            "Increase WEBPIPE_CACHE_SEARCH_TIMEOUT_MS (or reduce max_scan_entries/max_docs)."
+                        ),
+                        "warnings": ["cache_search_timeout"],
+                        "warning_codes": ["cache_search_timeout"],
+                        "warning_hints": warning_hints_from(&["cache_search_timeout"]),
+                        "request": {
+                            "max_docs": max_docs,
+                            "max_scan_entries": max_scan_entries,
+                            "max_chars": max_chars,
+                            "max_bytes": max_bytes,
+                            "width": width,
+                            "top_chunks": top_chunks,
+                            "max_chunk_chars": max_chunk_chars,
+                            "include_structure": include_structure,
+                            "include_text": include_text,
+                            "semantic_rerank": semantic_rerank,
+                            "semantic_top_k": semantic_top_k,
+                            "compact": compact,
+                            "cache_search_timeout_ms": cache_timeout_ms
+                        }
+                    });
+                    add_envelope_fields(
+                        &mut payload,
+                        "web_cache_search_extract",
+                        t0.elapsed().as_millis(),
+                    );
+                    let md = web_cache_search_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
+            };
 
             let mut results_json =
                 serde_json::to_value(&r.results).unwrap_or_else(|_| serde_json::json!([]));
@@ -13396,8 +15054,12 @@ Rules:
                 }
 
                 fn merge_str_array(dst: &mut serde_json::Value, src: &serde_json::Value) {
-                    let Some(dst_arr) = dst.as_array_mut() else { return };
-                    let Some(src_arr) = src.as_array() else { return };
+                    let Some(dst_arr) = dst.as_array_mut() else {
+                        return;
+                    };
+                    let Some(src_arr) = src.as_array() else {
+                        return;
+                    };
                     let mut seen = std::collections::BTreeSet::<String>::new();
                     for v in dst_arr.iter() {
                         if let Some(s) = v.as_str() {
@@ -13430,8 +15092,9 @@ Rules:
                         let prev_score = prev.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                         let one_score = one.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                         if one_score > prev_score {
-                            prev.as_object_mut()
-                                .map(|m| m.insert("score".to_string(), serde_json::json!(one_score)));
+                            prev.as_object_mut().map(|m| {
+                                m.insert("score".to_string(), serde_json::json!(one_score))
+                            });
                         }
                         let prev_ts = prev
                             .get("fetched_at_epoch_s")
@@ -13455,7 +15118,10 @@ Rules:
                                 .get("warnings")
                                 .cloned()
                                 .unwrap_or_else(|| serde_json::json!([]));
-                            let src = one.get("warnings").cloned().unwrap_or_else(|| serde_json::json!([]));
+                            let src = one
+                                .get("warnings")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!([]));
                             merge_str_array(&mut dst, &src);
                             prev.as_object_mut()
                                 .map(|m| m.insert("warnings".to_string(), dst));
@@ -13467,8 +15133,12 @@ Rules:
                                 .get("chunks")
                                 .cloned()
                                 .unwrap_or_else(|| serde_json::json!([]));
-                            let src = one.get("chunks").cloned().unwrap_or_else(|| serde_json::json!([]));
-                            if let (Some(dst_arr), Some(src_arr)) = (dst.as_array_mut(), src.as_array())
+                            let src = one
+                                .get("chunks")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!([]));
+                            if let (Some(dst_arr), Some(src_arr)) =
+                                (dst.as_array_mut(), src.as_array())
                             {
                                 let mut seen = std::collections::BTreeSet::<String>::new();
                                 for c in dst_arr.iter() {
@@ -13998,6 +15668,7 @@ Rules:
                     // The web_deep_research tool builds its own compact evidence pack below; keep
                     // the upstream evidence call compact by default to avoid huge payloads.
                     compact: Some(true),
+                    ..Default::default()
                 }))
                 .await?;
 
@@ -15247,7 +16918,7 @@ Rules:
                 ..req
             };
 
-            if no_network {
+            if no_network && !url_is_localhost(&req.url) {
                 match self.fetcher.cache_get(&req) {
                     Ok(Some(resp)) => {
                         let is_pdf_like = Self::content_type_is_pdf(resp.content_type.as_deref())
@@ -15264,13 +16935,19 @@ Rules:
                         if resp.truncated {
                             warnings.push("body_truncated_by_max_bytes");
                         }
+                        let status_bad = resp.status >= 400;
+                        if status_bad {
+                            warnings.push("http_status_error");
+                        }
                         if text_clipped {
                             warnings.push("text_truncated_by_max_text_chars");
                         }
                         if is_pdf_like && include_text {
                             warnings.push("text_unavailable_for_pdf_use_web_extract");
                         }
-                        warnings.push("cache_only");
+                        if !url_is_localhost(&req.url) {
+                            warnings.push("cache_only");
+                        }
                         if !dropped_request_headers.is_empty() {
                             warnings.push("unsafe_request_headers_dropped");
                         }
@@ -15304,6 +16981,12 @@ Rules:
                         if !dropped_request_headers.is_empty() {
                             payload["request"]["dropped_request_headers"] =
                                 serde_json::json!(dropped_request_headers);
+                        }
+                        if !warnings.is_empty() {
+                            let codes = warning_codes_from(&warnings);
+                            payload["warning_codes"] = serde_json::json!(codes.clone());
+                            payload["warning_hints"] = warning_hints_from(&codes);
+                            self.stats_record_warnings(&warnings);
                         }
                         if include_text {
                             payload["body_text"] = serde_json::json!(text);
@@ -15420,6 +17103,15 @@ Rules:
             if resp.truncated {
                 warnings.push("body_truncated_by_max_bytes");
             }
+            if resp.timings_ms.contains_key("cache_get_timeout")
+                || resp.timings_ms.contains_key("cache_put_timeout")
+            {
+                warnings.push("cache_io_timeout");
+            }
+            let status_bad = resp.status >= 400;
+            if status_bad {
+                warnings.push("http_status_error");
+            }
             if text_clipped {
                 warnings.push("text_truncated_by_max_text_chars");
             }
@@ -15448,8 +17140,10 @@ Rules:
                 "timings_ms": {
                     "total": t0.elapsed().as_millis(),
                     "cache_get": resp.timings_ms.get("cache_get").copied().unwrap_or(0),
+                    "cache_get_timeout": resp.timings_ms.get("cache_get_timeout").copied().unwrap_or(0),
                     "network_fetch": resp.timings_ms.get("network_fetch").copied().unwrap_or(0),
                     "cache_put": resp.timings_ms.get("cache_put").copied().unwrap_or(0),
+                    "cache_put_timeout": resp.timings_ms.get("cache_put_timeout").copied().unwrap_or(0),
                 }
             });
             add_envelope_fields(&mut payload, "web_fetch", t0.elapsed().as_millis());
@@ -15512,11 +17206,9 @@ Rules:
         ) -> Result<CallToolResult, McpError> {
             let args = params.0.unwrap_or_default();
             let max_results = args.max_results.unwrap_or(10).clamp(1, 20);
+            let timeout_ms = args.timeout_ms.unwrap_or(20_000).min(60_000);
 
-            let provider_name = args
-                .provider
-                .clone()
-                .unwrap_or_else(|| "brave".to_string());
+            let provider_name = args.provider.clone().unwrap_or_else(|| "brave".to_string());
             let auto_mode = args.auto_mode.unwrap_or_else(|| "fallback".to_string());
             let client = self.http.clone();
 
@@ -15529,25 +17221,25 @@ Rules:
             self.stats_inc_tool("web_search");
             match privacy_mode_from_env() {
                 PrivacyMode::Offline => {
-                let query = query.clone();
-                let mut payload = serde_json::json!({
-                    "ok": false,
-                    "provider": provider_name,
-                    "query": query,
-                    "query_key": Self::query_key(&query),
-                    "max_results": max_results,
-                    "request": {
-                        "offline_only": true
-                    },
-                    "error": error_obj(
-                        ErrorCode::NotSupported,
-                        "offline-only mode disables web_search",
-                        "Use urls=[...] + no_network=true workflows (web_search_extract with urls, or web_cache_search_extract) or set WEBPIPE_OFFLINE_ONLY=0."
-                    )
-                });
-                add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
-                let md = web_search_markdown(&payload);
-                return Ok(tool_result_markdown_with_json(payload, md));
+                    let query = query.clone();
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "provider": provider_name,
+                        "query": query,
+                        "query_key": Self::query_key(&query),
+                        "max_results": max_results,
+                        "request": {
+                            "offline_only": true
+                        },
+                        "error": error_obj(
+                            ErrorCode::NotSupported,
+                            "offline-only mode disables web_search",
+                            "Use urls=[...] + no_network=true workflows (web_search_extract with urls, or web_cache_search_extract) or set WEBPIPE_OFFLINE_ONLY=0."
+                        )
+                    });
+                    add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
+                    let md = web_search_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
                 PrivacyMode::Anonymous => {
                     let query = query.clone();
@@ -15604,6 +17296,7 @@ Rules:
                 max_results: Some(max_results),
                 language: language.clone(),
                 country: country.clone(),
+                timeout_ms: Some(timeout_ms),
             };
             let qk = Self::query_key(&query);
 
@@ -15709,221 +17402,182 @@ Rules:
                             return Ok(tool_result_markdown_with_json(payload, md));
                         }
 
-                        let mut providers = Vec::new();
-                        let mut merged: Vec<webpipe_core::SearchResult> = Vec::new();
-                        let mut seen = std::collections::BTreeSet::<String>::new();
-                        let mut cost_units_total: u64 = 0;
+                        #[derive(Debug)]
+                        struct ProviderOutcome {
+                            name: &'static str,
+                            ok: bool,
+                            cost_units: u64,
+                            elapsed_ms: u64,
+                            results: Vec<webpipe_core::SearchResult>,
+                            error: Option<String>,
+                        }
 
-                        if brave_env {
+                        let brave_fut = async {
+                            if !brave_env {
+                                return None;
+                            }
                             let pt0 = std::time::Instant::now();
                             match webpipe_local::search::BraveSearchProvider::from_env(
                                 client.clone(),
                             ) {
                                 Ok(p) => match p.search(&q).await {
-                                    Ok(r) => {
-                                        cost_units_total =
-                                            cost_units_total.saturating_add(r.cost_units);
-                                        for rr in r.results {
-                                            let key = canonicalize_url(&rr.url);
-                                            if seen.insert(key) {
-                                                merged.push(rr);
-                                            }
-                                            if merged.len() >= max_results {
-                                                break;
-                                            }
-                                        }
-                                        providers.push(serde_json::json!({
-                                            "name": "brave",
-                                            "ok": true,
-                                            "cost_units": r.cost_units,
-                                            "elapsed_ms": pt0.elapsed().as_millis()
-                                        }));
-                                        self.stats_record_search_provider_qk(
-                                            "brave",
-                                            true,
-                                            r.cost_units,
-                                            pt0.elapsed().as_millis() as u64,
-                                            None,
-                                            qk.as_deref(),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        providers.push(serde_json::json!({
-                                            "name": "brave",
-                                            "ok": false,
-                                            "error": msg.clone(),
-                                            "elapsed_ms": pt0.elapsed().as_millis()
-                                        }));
-                                        self.stats_record_search_provider_qk(
-                                            "brave",
-                                            false,
-                                            0,
-                                            pt0.elapsed().as_millis() as u64,
-                                            Some(&msg),
-                                            qk.as_deref(),
-                                        );
-                                    }
+                                    Ok(r) => Some(ProviderOutcome {
+                                        name: "brave",
+                                        ok: true,
+                                        cost_units: r.cost_units,
+                                        elapsed_ms: pt0.elapsed().as_millis() as u64,
+                                        results: r.results,
+                                        error: None,
+                                    }),
+                                    Err(e) => Some(ProviderOutcome {
+                                        name: "brave",
+                                        ok: false,
+                                        cost_units: 0,
+                                        elapsed_ms: pt0.elapsed().as_millis() as u64,
+                                        results: Vec::new(),
+                                        error: Some(e.to_string()),
+                                    }),
                                 },
-                                Err(e) => {
-                                    let msg = e.to_string();
-                                    providers.push(serde_json::json!({
-                                        "name": "brave",
-                                        "ok": false,
-                                        "error": msg.clone(),
-                                        "elapsed_ms": pt0.elapsed().as_millis()
-                                    }));
-                                    self.stats_record_search_provider_qk(
-                                        "brave",
-                                        false,
-                                        0,
-                                        pt0.elapsed().as_millis() as u64,
-                                        Some(&msg),
-                                        qk.as_deref(),
-                                    );
-                                }
+                                Err(e) => Some(ProviderOutcome {
+                                    name: "brave",
+                                    ok: false,
+                                    cost_units: 0,
+                                    elapsed_ms: pt0.elapsed().as_millis() as u64,
+                                    results: Vec::new(),
+                                    error: Some(e.to_string()),
+                                }),
                             }
-                        }
+                        };
 
-                        if searxng_env && merged.len() < max_results {
+                        let searxng_fut = async {
+                            if !searxng_env {
+                                return None;
+                            }
                             let pt0 = std::time::Instant::now();
                             match webpipe_local::search::SearxngSearchProvider::from_env(
                                 client.clone(),
                             ) {
                                 Ok(p) => match p.search(&q).await {
-                                    Ok(r) => {
-                                        cost_units_total =
-                                            cost_units_total.saturating_add(r.cost_units);
-                                        for rr in r.results {
-                                            let key = canonicalize_url(&rr.url);
-                                            if seen.insert(key) {
-                                                merged.push(rr);
-                                            }
-                                            if merged.len() >= max_results {
-                                                break;
-                                            }
-                                        }
-                                        providers.push(serde_json::json!({
-                                            "name": "searxng",
-                                            "ok": true,
-                                            "cost_units": r.cost_units,
-                                            "elapsed_ms": pt0.elapsed().as_millis()
-                                        }));
-                                        self.stats_record_search_provider_qk(
-                                            "searxng",
-                                            true,
-                                            r.cost_units,
-                                            pt0.elapsed().as_millis() as u64,
-                                            None,
-                                            qk.as_deref(),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        providers.push(serde_json::json!({
-                                            "name": "searxng",
-                                            "ok": false,
-                                            "error": msg.clone(),
-                                            "elapsed_ms": pt0.elapsed().as_millis()
-                                        }));
-                                        self.stats_record_search_provider_qk(
-                                            "searxng",
-                                            false,
-                                            0,
-                                            pt0.elapsed().as_millis() as u64,
-                                            Some(&msg),
-                                            qk.as_deref(),
-                                        );
-                                    }
+                                    Ok(r) => Some(ProviderOutcome {
+                                        name: "searxng",
+                                        ok: true,
+                                        cost_units: r.cost_units,
+                                        elapsed_ms: pt0.elapsed().as_millis() as u64,
+                                        results: r.results,
+                                        error: None,
+                                    }),
+                                    Err(e) => Some(ProviderOutcome {
+                                        name: "searxng",
+                                        ok: false,
+                                        cost_units: 0,
+                                        elapsed_ms: pt0.elapsed().as_millis() as u64,
+                                        results: Vec::new(),
+                                        error: Some(e.to_string()),
+                                    }),
                                 },
-                                Err(e) => {
-                                    let msg = e.to_string();
-                                    providers.push(serde_json::json!({
-                                        "name": "searxng",
-                                        "ok": false,
-                                        "error": msg.clone(),
-                                        "elapsed_ms": pt0.elapsed().as_millis()
-                                    }));
-                                    self.stats_record_search_provider_qk(
-                                        "searxng",
-                                        false,
-                                        0,
-                                        pt0.elapsed().as_millis() as u64,
-                                        Some(&msg),
-                                        qk.as_deref(),
-                                    );
-                                }
+                                Err(e) => Some(ProviderOutcome {
+                                    name: "searxng",
+                                    ok: false,
+                                    cost_units: 0,
+                                    elapsed_ms: pt0.elapsed().as_millis() as u64,
+                                    results: Vec::new(),
+                                    error: Some(e.to_string()),
+                                }),
                             }
-                        }
+                        };
 
-                        if tavily_env && merged.len() < max_results {
+                        let tavily_fut = async {
+                            if !tavily_env {
+                                return None;
+                            }
                             let pt0 = std::time::Instant::now();
                             match webpipe_local::search::TavilySearchProvider::from_env(
                                 client.clone(),
                             ) {
                                 Ok(p) => match p.search(&q).await {
-                                    Ok(r) => {
-                                        cost_units_total =
-                                            cost_units_total.saturating_add(r.cost_units);
-                                        for rr in r.results {
-                                            let key = canonicalize_url(&rr.url);
-                                            if seen.insert(key) {
-                                                merged.push(rr);
-                                            }
-                                            if merged.len() >= max_results {
-                                                break;
-                                            }
-                                        }
-                                        providers.push(serde_json::json!({
-                                            "name": "tavily",
-                                            "ok": true,
-                                            "cost_units": r.cost_units,
-                                            "elapsed_ms": pt0.elapsed().as_millis()
-                                        }));
-                                        self.stats_record_search_provider_qk(
-                                            "tavily",
-                                            true,
-                                            r.cost_units,
-                                            pt0.elapsed().as_millis() as u64,
-                                            None,
-                                            qk.as_deref(),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        providers.push(serde_json::json!({
-                                            "name": "tavily",
-                                            "ok": false,
-                                            "error": msg.clone(),
-                                            "elapsed_ms": pt0.elapsed().as_millis()
-                                        }));
-                                        self.stats_record_search_provider_qk(
-                                            "tavily",
-                                            false,
-                                            0,
-                                            pt0.elapsed().as_millis() as u64,
-                                            Some(&msg),
-                                            qk.as_deref(),
-                                        );
-                                    }
+                                    Ok(r) => Some(ProviderOutcome {
+                                        name: "tavily",
+                                        ok: true,
+                                        cost_units: r.cost_units,
+                                        elapsed_ms: pt0.elapsed().as_millis() as u64,
+                                        results: r.results,
+                                        error: None,
+                                    }),
+                                    Err(e) => Some(ProviderOutcome {
+                                        name: "tavily",
+                                        ok: false,
+                                        cost_units: 0,
+                                        elapsed_ms: pt0.elapsed().as_millis() as u64,
+                                        results: Vec::new(),
+                                        error: Some(e.to_string()),
+                                    }),
                                 },
-                                Err(e) => {
-                                    let msg = e.to_string();
-                                    providers.push(serde_json::json!({
-                                        "name": "tavily",
-                                        "ok": false,
-                                        "error": msg.clone(),
-                                        "elapsed_ms": pt0.elapsed().as_millis()
-                                    }));
-                                    self.stats_record_search_provider_qk(
-                                        "tavily",
-                                        false,
-                                        0,
-                                        pt0.elapsed().as_millis() as u64,
-                                        Some(&msg),
-                                        qk.as_deref(),
-                                    );
+                                Err(e) => Some(ProviderOutcome {
+                                    name: "tavily",
+                                    ok: false,
+                                    cost_units: 0,
+                                    elapsed_ms: pt0.elapsed().as_millis() as u64,
+                                    results: Vec::new(),
+                                    error: Some(e.to_string()),
+                                }),
+                            }
+                        };
+
+                        let (brave_out, searxng_out, tavily_out) =
+                            tokio::join!(brave_fut, searxng_fut, tavily_fut);
+
+                        let mut providers = Vec::new();
+                        let mut merged: Vec<webpipe_core::SearchResult> = Vec::new();
+                        let mut seen = std::collections::BTreeSet::<String>::new();
+                        let mut cost_units_total: u64 = 0;
+
+                        // Stable provider ordering for deterministic JSON.
+                        let outs: Vec<ProviderOutcome> = vec![brave_out, searxng_out, tavily_out]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        for o in &outs {
+                            if o.ok {
+                                cost_units_total = cost_units_total.saturating_add(o.cost_units);
+                            }
+                            let mut row = serde_json::json!({
+                                "name": o.name,
+                                "ok": o.ok,
+                                "elapsed_ms": o.elapsed_ms
+                            });
+                            if o.ok {
+                                row["cost_units"] = serde_json::json!(o.cost_units);
+                            } else if let Some(e) = o.error.as_ref() {
+                                row["error"] = serde_json::json!(e);
+                            }
+                            providers.push(row);
+
+                            self.stats_record_search_provider_qk(
+                                o.name,
+                                o.ok,
+                                if o.ok { o.cost_units } else { 0 },
+                                o.elapsed_ms,
+                                o.error.as_deref(),
+                                qk.as_deref(),
+                            );
+                        }
+
+                        // Merge results from all providers, bounded by max_results.
+                        for o in outs {
+                            if !o.ok {
+                                continue;
+                            }
+                            for rr in o.results {
+                                let key = canonicalize_url(&rr.url);
+                                if seen.insert(key) {
+                                    merged.push(rr);
                                 }
+                                if merged.len() >= max_results {
+                                    break;
+                                }
+                            }
+                            if merged.len() >= max_results {
+                                break;
                             }
                         }
 
@@ -17277,6 +18931,158 @@ Rules:
         }
 
         #[tool(
+            description = "Ask Perplexity directly and return a bounded answer + citations (JSON output)",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebPerplexityArgs>()),
+            annotations(title = "Perplexity (answer + citations)", read_only_hint = true, open_world_hint = true)
+        )]
+        async fn web_perplexity(
+            &self,
+            params: Parameters<Option<WebPerplexityArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            let args = params.0.unwrap_or_default();
+            self.stats_inc_tool("web_perplexity");
+            let t0 = std::time::Instant::now();
+
+            let query = args.query.unwrap_or_default();
+            let model = args.model.unwrap_or_else(|| "sonar".to_string());
+            let timeout_ms = args.timeout_ms.unwrap_or(20_000).min(60_000);
+            let no_network = args.no_network.unwrap_or(false);
+            let max_tokens = args.max_tokens.unwrap_or(800).min(4_000);
+            let max_answer_chars = args.max_answer_chars.unwrap_or(4_000).min(20_000);
+
+            if query.trim().is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "query": query,
+                    "model": model,
+                    "error": error_obj(
+                        ErrorCode::InvalidParams,
+                        "query must be non-empty",
+                        "Pass a non-empty question/prompt."
+                    ),
+                    "request": { "timeout_ms": timeout_ms, "no_network": no_network }
+                });
+                add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
+                return Ok(tool_result(payload));
+            }
+
+            let pplx = match webpipe_local::perplexity::PerplexityClient::from_env(
+                self.http.clone(),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "query": query,
+                        "model": model,
+                        "error": error_obj(
+                            ErrorCode::NotConfigured,
+                            e.to_string(),
+                            "Set WEBPIPE_PERPLEXITY_API_KEY (or PERPLEXITY_API_KEY) in the webpipe MCP server environment."
+                        ),
+                        "request": { "timeout_ms": timeout_ms, "no_network": no_network }
+                    });
+                    add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
+                    return Ok(tool_result(payload));
+                }
+            };
+
+            let mut search_mode = args.search_mode.clone();
+            if no_network {
+                search_mode = Some("off".to_string());
+            } else if search_mode.is_none() {
+                search_mode = Some("web".to_string());
+            }
+
+            let sys = "Answer the user's question concisely. Include citations for any factual claims when available.";
+            let req = webpipe_local::perplexity::ChatCompletionsRequest {
+                model: model.clone(),
+                messages: vec![
+                    webpipe_local::perplexity::Message {
+                        role: "system".to_string(),
+                        content: sys.to_string(),
+                    },
+                    webpipe_local::perplexity::Message {
+                        role: "user".to_string(),
+                        content: query.clone(),
+                    },
+                ],
+                max_tokens: Some(max_tokens),
+                temperature: args.temperature,
+                top_p: args.top_p,
+                search_mode: search_mode.clone(),
+                reasoning_effort: None,
+            };
+
+            // Apply timeout at the call site too (defense-in-depth).
+            let resp = match tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                pplx.chat_completions(req.clone()),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "query": query,
+                        "model": model,
+                        "error": error_obj(ErrorCode::ProviderUnavailable, e.to_string(), "Perplexity request failed."),
+                        "request": { "timeout_ms": timeout_ms, "no_network": no_network, "search_mode": search_mode }
+                    });
+                    add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
+                    return Ok(tool_result(payload));
+                }
+                Err(_) => {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "query": query,
+                        "model": model,
+                        "error": error_obj(ErrorCode::ProviderUnavailable, "perplexity request timed out", "Increase timeout_ms or try again."),
+                        "request": { "timeout_ms": timeout_ms, "no_network": no_network, "search_mode": search_mode }
+                    });
+                    add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
+                    return Ok(tool_result(payload));
+                }
+            };
+
+            let answer0 = resp
+                .choices
+                .first()
+                .map(|c| c.message.content.clone())
+                .unwrap_or_default();
+            let citations = resp.citations.clone().unwrap_or_default();
+            let (answer, _n, clipped) = Self::truncate_to_chars(&answer0, max_answer_chars);
+
+            let mut payload = serde_json::json!({
+                "ok": true,
+                "provider": "perplexity",
+                "query": query,
+                "model": model,
+                "request": { "timeout_ms": timeout_ms, "no_network": no_network, "search_mode": search_mode },
+                "answer": { "text": answer, "truncated": clipped, "citations": citations },
+                "usage": resp.usage,
+                "timings_ms": resp.timings_ms
+            });
+            add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
+
+            let mut md = String::new();
+            md.push_str("## Answer\n\n");
+            md.push_str(payload["answer"]["text"].as_str().unwrap_or(""));
+            if let Some(cs) = payload["answer"]["citations"].as_array() {
+                if !cs.is_empty() {
+                    md.push_str("\n\n## Citations\n");
+                    for c in cs.iter().filter_map(|v| v.as_str()).take(12) {
+                        md.push_str("- ");
+                        md.push_str(c);
+                        md.push('\n');
+                    }
+                }
+            }
+            Ok(tool_result_markdown_with_json(payload, md))
+        }
+
+        #[tool(
             description = "Fetch + extract readable text/chunks (and optional links/structure) from a URL (bounded; cache-aware; JSON output)",
             input_schema = Arc::new(tool_input_schema_draft07::<WebExtractArgs>()),
             annotations(title = "Extract URL", read_only_hint = true, open_world_hint = true)
@@ -17609,11 +19415,16 @@ Rules:
                         .map(|c| (c.start_char, c.end_char, c.text.clone()))
                         .collect();
                     let q0 = args.query.clone().unwrap_or_default();
-                    let sem = tokio::task::spawn_blocking(move || {
-                        webpipe_local::semantic::semantic_rerank_chunks(&q0, &cands, semantic_top_k)
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
+                    let semantic_timeout_ms = std::env::var("WEBPIPE_SEMANTIC_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(
+                            args.timeout_ms
+                                .unwrap_or(20_000)
+                                .saturating_div(2)
+                                .clamp(2_000, 8_000),
+                        );
+                    let sem = if semantic_timeout_ms == 0 {
                         webpipe_local::semantic::SemanticRerankResult {
                             ok: false,
                             backend: "unknown".to_string(),
@@ -17621,9 +19432,41 @@ Rules:
                             cache_hits: 0,
                             cache_misses: 0,
                             chunks: Vec::new(),
-                            warnings: vec!["semantic_rerank_task_failed"],
+                            warnings: vec!["semantic_rerank_timeout"],
                         }
-                    });
+                    } else {
+                        let handle = tokio::task::spawn_blocking(move || {
+                            webpipe_local::semantic::semantic_rerank_chunks(&q0, &cands, semantic_top_k)
+                        });
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(semantic_timeout_ms),
+                            handle,
+                        )
+                        .await
+                        {
+                            Ok(join) => join.unwrap_or_else(|_| webpipe_local::semantic::SemanticRerankResult {
+                                ok: false,
+                                backend: "unknown".to_string(),
+                                model_id: None,
+                                cache_hits: 0,
+                                cache_misses: 0,
+                                chunks: Vec::new(),
+                                warnings: vec!["semantic_rerank_task_failed"],
+                            }),
+                            Err(_) => webpipe_local::semantic::SemanticRerankResult {
+                                ok: false,
+                                backend: "unknown".to_string(),
+                                model_id: None,
+                                cache_hits: 0,
+                                cache_misses: 0,
+                                chunks: Vec::new(),
+                                warnings: vec!["semantic_rerank_timeout"],
+                            },
+                        }
+                    };
+                    for w in &sem.warnings {
+                        warnings.push(*w);
+                    }
                     payload["extract"]["semantic"] = serde_json::json!(sem);
                 }
                 if include_links {
@@ -17846,8 +19689,8 @@ Rules:
                         m
                     },
                 }
-            } else if no_network {
-            // Cache-only mode (no network): return ok=false on cache miss.
+            } else if no_network && !url_is_localhost(&req.url) {
+                // Cache-only mode (no network): return ok=false on cache miss.
                 match self.fetcher.cache_get(&req) {
                     Ok(Some(r)) => r,
                     Ok(None) => {
@@ -18020,7 +19863,7 @@ Rules:
                 bytes: resp_bytes0,
                 truncated: resp_body_truncated,
                 source: _resp_source,
-                timings_ms: _resp_timings_ms,
+                timings_ms: resp_timings_ms,
             } = resp;
             let resp_bytes = std::sync::Arc::new(resp_bytes0);
 
@@ -18029,7 +19872,54 @@ Rules:
                 let ct = resp_content_type.clone();
                 let final_url = resp_final_url.clone();
                 let query = args.query.clone();
-                tokio::task::spawn_blocking(move || {
+                let extract_timeout_ms = std::env::var("WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    // Default: stay within the per-call timeout, but don't preempt it too aggressively.
+                    // The pipeline timeout exists to prevent hangs in blocking extraction, not to clip
+                    // legitimate slow parses (notably large PDFs) when the caller already allowed more time.
+                    .unwrap_or(
+                        args.timeout_ms
+                            .unwrap_or(20_000)
+                            .saturating_sub(1_000)
+                            .clamp(4_000, 45_000),
+                    );
+                if extract_timeout_ms == 0 {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "kind": "web_extract",
+                        "url": url,
+                        "final_url": resp_final_url,
+                        "status": resp_status,
+                        "content_type": resp_content_type,
+                        "error": error_obj(
+                            ErrorCode::FetchFailed,
+                            "extract pipeline timed out after 0ms".to_string(),
+                            "Extraction hit a bounded timeout. Increase WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS or reduce max_bytes/max_chars."
+                        ),
+                        "request": {
+                            "fetch_backend": fetch_backend,
+                            "no_network": no_network,
+                            "timeout_ms": req.timeout_ms,
+                            "max_bytes": req.max_bytes,
+                            "cache": { "read": req.cache.read, "write": req.cache.write, "ttl_s": req.cache.ttl_s },
+                            "width": width,
+                            "max_chars": max_chars,
+                            "query": args.query,
+                            "include_text": include_text,
+                            "include_links": include_links,
+                            "max_links": max_links,
+                            "include_structure": include_structure
+                        },
+                        "warnings": ["extract_pipeline_timeout"],
+                        "warning_codes": ["extract_pipeline_timeout"],
+                        "warning_hints": warning_hints_from(&["extract_pipeline_timeout"])
+                    });
+                    add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
+                    let md = web_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
+                let handle = tokio::task::spawn_blocking(move || {
                     let extracted0 = webpipe_local::extract::best_effort_text_from_bytes(
                         &bytes,
                         ct.as_deref(),
@@ -18054,11 +19944,52 @@ Rules:
                             max_block_chars,
                         },
                     )
-                })
+                });
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(extract_timeout_ms),
+                    handle,
+                )
                 .await
-                .map_err(|e| {
-                    McpError::internal_error(format!("extract pipeline join failed: {e}"), None)
-                })?
+                {
+                    Ok(join) => join.map_err(|e| {
+                        McpError::internal_error(format!("extract pipeline join failed: {e}"), None)
+                    })?,
+                    Err(_) => {
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "kind": "web_extract",
+                            "url": url,
+                            "final_url": resp_final_url,
+                            "status": resp_status,
+                            "content_type": resp_content_type,
+                            "error": error_obj(
+                                ErrorCode::FetchFailed,
+                                format!("extract pipeline timed out after {extract_timeout_ms}ms"),
+                                "Extraction hit a bounded timeout (likely pathological HTML). Try reducing max_bytes/max_chars, or switching fetch_backend."
+                            ),
+                            "request": {
+                                "fetch_backend": fetch_backend,
+                                "no_network": no_network,
+                                "timeout_ms": req.timeout_ms,
+                                "max_bytes": req.max_bytes,
+                                "cache": { "read": req.cache.read, "write": req.cache.write, "ttl_s": req.cache.ttl_s },
+                                "width": width,
+                                "max_chars": max_chars,
+                                "query": args.query,
+                                "include_text": include_text,
+                                "include_links": include_links,
+                                "max_links": max_links,
+                                "include_structure": include_structure
+                            },
+                            "warnings": ["extract_pipeline_timeout"],
+                            "warning_codes": ["extract_pipeline_timeout"],
+                            "warning_hints": warning_hints_from(&["extract_pipeline_timeout"])
+                        });
+                        add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
+                    }
+                }
             };
             #[cfg(feature = "vision-gemini")]
             let mut pipeline = pipeline0;
@@ -18162,6 +20093,11 @@ Rules:
             if resp_body_truncated {
                 warnings.push("body_truncated_by_max_bytes");
             }
+            if resp_timings_ms.contains_key("cache_get_timeout")
+                || resp_timings_ms.contains_key("cache_put_timeout")
+            {
+                warnings.push("cache_io_timeout");
+            }
             if attempts_map.contains_key("truncation_retry") {
                 // Additive: indicates we attempted a tail-recovery fetch.
                 // (The attempts_map entry contains details.)
@@ -18186,7 +20122,22 @@ Rules:
                 warnings.push(*w);
             }
             if no_network {
-                warnings.push("cache_only");
+                if !url_is_localhost(&req.url) {
+                    warnings.push("cache_only");
+                }
+            }
+            let status_bad = resp_status >= 400;
+            if status_bad && !warnings.contains(&"http_status_error") {
+                warnings.push("http_status_error");
+            }
+            let title_opt = pipeline
+                .structure
+                .as_ref()
+                .and_then(|s| s.title.as_deref());
+            if looks_like_js_challenge(resp_status, &text, title_opt)
+                && !warnings.contains(&"blocked_by_js_challenge")
+            {
+                warnings.push("blocked_by_js_challenge");
             }
             if extracted.engine == "html_main"
                 && resp_bytes.len() >= 50_000
@@ -18194,12 +20145,27 @@ Rules:
                     .structure
                     .as_ref()
                     .is_some_and(structure_looks_like_ui_shell)
+                && extracted_text_looks_like_nav_shell(&text)
             {
                 warnings.push("main_content_low_signal");
             }
             // Treat “script-only / no-semantic-tags” HTML as low-signal even when it yields a tiny
             // amount of text (e.g., inline JS).
-            if (extracted.engine.starts_with("html_") || extracted.engine == "html2text")
+            let ct0 = resp_content_type
+                .as_deref()
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let html_like = ct0 == "text/html"
+                || ct0 == "application/xhtml+xml"
+                || webpipe_local::extract::bytes_look_like_html(resp_bytes.as_ref());
+            if html_like
+                && (extracted.engine.starts_with("html_")
+                    || extracted.engine == "html2text"
+                    || extracted.engine == "unknown")
                 && n <= 200
                 && pipeline
                     .structure
@@ -18336,11 +20302,11 @@ Rules:
                         .map(|c| (c.start_char, c.end_char, c.text.clone()))
                         .collect();
                     let q0 = q.clone();
-                    let sem = tokio::task::spawn_blocking(move || {
-                        webpipe_local::semantic::semantic_rerank_chunks(&q0, &cands, semantic_top_k)
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
+                    let semantic_timeout_ms = std::env::var("WEBPIPE_SEMANTIC_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(args.timeout_ms.unwrap_or(20_000).saturating_div(2).clamp(2_000, 8_000));
+                    let sem = if semantic_timeout_ms == 0 {
                         webpipe_local::semantic::SemanticRerankResult {
                             ok: false,
                             backend: "unknown".to_string(),
@@ -18348,9 +20314,41 @@ Rules:
                             cache_hits: 0,
                             cache_misses: 0,
                             chunks: Vec::new(),
-                            warnings: vec!["semantic_rerank_task_failed"],
+                            warnings: vec!["semantic_rerank_timeout"],
                         }
-                    });
+                    } else {
+                        let handle = tokio::task::spawn_blocking(move || {
+                            webpipe_local::semantic::semantic_rerank_chunks(&q0, &cands, semantic_top_k)
+                        });
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(semantic_timeout_ms),
+                            handle,
+                        )
+                        .await
+                        {
+                            Ok(join) => join.unwrap_or_else(|_| webpipe_local::semantic::SemanticRerankResult {
+                                ok: false,
+                                backend: "unknown".to_string(),
+                                model_id: None,
+                                cache_hits: 0,
+                                cache_misses: 0,
+                                chunks: Vec::new(),
+                                warnings: vec!["semantic_rerank_task_failed"],
+                            }),
+                            Err(_) => webpipe_local::semantic::SemanticRerankResult {
+                                ok: false,
+                                backend: "unknown".to_string(),
+                                model_id: None,
+                                cache_hits: 0,
+                                cache_misses: 0,
+                                chunks: Vec::new(),
+                                warnings: vec!["semantic_rerank_timeout"],
+                            },
+                        }
+                    };
+                    for w in &sem.warnings {
+                        warnings.push(*w);
+                    }
                     payload["extract"]["semantic"] = serde_json::json!(sem);
                 } else if auto_ok
                     && Self::openrouter_api_key_from_env().is_some()
@@ -18369,6 +20367,9 @@ Rules:
                     let sem = self
                         .semantic_rerank_chunks_best(&q, &cands, semantic_top_k)
                         .await;
+                    for w in &sem.warnings {
+                        warnings.push(*w);
+                    }
                     if sem.ok {
                         warnings.push("semantic_auto_fallback_used");
                         payload["warnings"] = serde_json::json!(warnings);
@@ -18387,22 +20388,54 @@ Rules:
                 } else {
                     let bytes = resp_bytes.clone();
                     let base_url = payload["final_url"].as_str().unwrap_or("").to_string();
-                    let links = tokio::task::spawn_blocking(move || {
-                        let html = String::from_utf8_lossy(bytes.as_ref()).to_string();
-                        webpipe_local::links::extract_links(
-                            &html,
-                            Some(base_url.as_str()),
-                            max_links,
+                    let links_timeout_ms = std::env::var("WEBPIPE_LINKS_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(1_500);
+                    let links = if links_timeout_ms == 0 {
+                        warnings.push("links_timeout");
+                        Vec::new()
+                    } else {
+                        let handle = tokio::task::spawn_blocking(move || {
+                            let html = String::from_utf8_lossy(bytes.as_ref()).to_string();
+                            webpipe_local::links::extract_links(
+                                &html,
+                                Some(base_url.as_str()),
+                                max_links,
+                            )
+                        });
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(links_timeout_ms),
+                            handle,
                         )
-                    })
-                    .await
-                    .unwrap_or_else(|_| Vec::new());
+                        .await
+                        {
+                            Ok(join) => join.unwrap_or_else(|_| Vec::new()),
+                            Err(_) => {
+                                warnings.push("links_timeout");
+                                Vec::new()
+                            }
+                        }
+                    };
                     payload["extract"]["links"] = serde_json::json!(links);
                     payload["extract"]["max_links"] = serde_json::json!(max_links);
                 }
             }
 
-            self.stats_record_fetch_backend(fetch_backend.as_str(), true, t0.elapsed().as_millis() as u64, None);
+            // Include any late-added warnings (e.g. links_timeout) in the final envelope.
+            if !warnings.is_empty() {
+                payload["warnings"] = serde_json::json!(warnings);
+                let codes = warning_codes_from(&warnings);
+                payload["warning_codes"] = serde_json::json!(codes.clone());
+                payload["warning_hints"] = warning_hints_from(&codes);
+            }
+
+            self.stats_record_fetch_backend(
+                fetch_backend.as_str(),
+                true,
+                t0.elapsed().as_millis() as u64,
+                None,
+            );
             payload["attempts"] = if attempts_map.is_empty() {
                 serde_json::Value::Null
             } else {
@@ -18564,7 +20597,8 @@ Rules:
             &self,
             _request: Option<PaginatedRequestParam>,
             _context: RequestContext<RoleServer>,
-        ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_
+        {
             let toolset = mcp_toolset_from_env();
             let tools = self
                 .tool_router
@@ -18579,14 +20613,18 @@ Rules:
             &self,
             request: rmcp::model::CallToolRequestParam,
             context: RequestContext<RoleServer>,
-        ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_
+        {
             use rmcp::handler::server::tool::ToolCallContext;
             let toolset = mcp_toolset_from_env();
             let name = request.name.to_string();
             async move {
                 if !mcp_tool_allowed(name.as_str(), toolset) {
                     return Err(McpError::invalid_params(
-                        format!("tool is not enabled in WEBPIPE_MCP_TOOLSET={}", mcp_toolset_name(toolset)),
+                        format!(
+                            "tool is not enabled in WEBPIPE_MCP_TOOLSET={}",
+                            mcp_toolset_name(toolset)
+                        ),
                         Some(serde_json::json!({
                             "code":"tool_not_enabled",
                             "tool": name,
@@ -18604,7 +20642,8 @@ Rules:
             &self,
             _request: Option<PaginatedRequestParam>,
             _context: RequestContext<RoleServer>,
-        ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
+        ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_
+        {
             std::future::ready(Ok(ListPromptsResult::with_all_items(
                 self.prompt_router.list_all(),
             )))
@@ -18614,7 +20653,8 @@ Rules:
             &self,
             request: GetPromptRequestParam,
             context: RequestContext<RoleServer>,
-        ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + Send + '_ {
+        ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + Send + '_
+        {
             use rmcp::handler::server::prompt::PromptContext;
             async move {
                 self.prompt_router
@@ -19275,6 +21315,7 @@ Rules:
                     max_results: Some(3),
                     language: None,
                     country: None,
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -19309,6 +21350,7 @@ Rules:
                     max_results: Some(1),
                     language: None,
                     country: None,
+                    ..Default::default()
                 }))
                 .await
                 .expect("call brave");
@@ -19331,6 +21373,7 @@ Rules:
                     max_results: Some(1),
                     language: None,
                     country: None,
+                    ..Default::default()
                 }))
                 .await
                 .expect("call tavily");
@@ -20076,6 +22119,7 @@ Rules:
                     country: None,
                     language: None,
                     max_results: Some(1),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -20154,6 +22198,7 @@ Rules:
                     country: None,
                     language: None,
                     max_results: Some(1),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -20591,6 +22636,7 @@ Rules:
                     retry_on_truncation: None,
                     truncation_retry_max_bytes: None,
                     compact: None,
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -20688,6 +22734,7 @@ Rules:
                     retry_on_truncation: None,
                     truncation_retry_max_bytes: None,
                     compact: Some(true),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -20778,6 +22825,7 @@ Rules:
                     retry_on_truncation: None,
                     truncation_retry_max_bytes: None,
                     compact: Some(true),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -20864,6 +22912,7 @@ Rules:
                     planner_max_calls: None,
                     // This test asserts per-URL diagnostics ("attempts") which are omitted in compact mode.
                     compact: Some(false),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -20955,6 +23004,7 @@ Rules:
                     agentic_frontier_max: None,
                     planner_max_calls: None,
                     compact: Some(true),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -21103,6 +23153,7 @@ Rules:
                     agentic_frontier_max: Some(200),
                     planner_max_calls: Some(0),
                     compact: Some(true),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -21266,6 +23317,7 @@ Rules:
                     agentic_frontier_max: Some(200),
                     planner_max_calls: Some(0),
                     compact: Some(true),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -21528,6 +23580,7 @@ Rules:
                     truncation_retry_max_bytes: None,
                     // This test asserts debug-ish per-URL fields that are omitted in compact mode.
                     compact: Some(false),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -22051,6 +24104,7 @@ Rules:
                     max_results: Some(5),
                     language: None,
                     country: None,
+                    ..Default::default()
                 })))
                 .await
                 .expect("call");
@@ -22076,6 +24130,7 @@ Rules:
                     max_results: Some(1),
                     language: None,
                     country: None,
+                    ..Default::default()
                 })))
                 .await
                 .expect("call");
@@ -22254,6 +24309,7 @@ Rules:
                     agentic_frontier_max: Some(0),
                     planner_max_calls: Some(0),
                     compact: Some(true),
+                    ..Default::default()
                 }))
                 .await
                 .expect("call");
@@ -22319,7 +24375,8 @@ Rules:
         }
 
         #[tokio::test]
-        async fn web_extract_render_rejects_both_cdp_and_user_data_dir_without_needing_playwright() {
+        async fn web_extract_render_rejects_both_cdp_and_user_data_dir_without_needing_playwright()
+        {
             let env = EnvGuard::new(&[
                 "WEBPIPE_CACHE_DIR",
                 "WEBPIPE_PRIVACY_MODE",
@@ -22733,6 +24790,8 @@ async fn main() -> Result<()> {
                                     args.firecrawl_fallback_on_empty_extraction,
                                 ),
                                 firecrawl_fallback_on_low_signal: Some(false),
+                                render_fallback_on_empty_extraction: Some(false),
+                                render_fallback_on_low_signal: Some(false),
                                 max_results: args.max_results,
                                 max_urls: args.max_urls,
                                 timeout_ms: Some(args.timeout_ms),
@@ -22860,6 +24919,8 @@ async fn main() -> Result<()> {
                                     args.firecrawl_fallback_on_empty_extraction,
                                 ),
                                 firecrawl_fallback_on_low_signal: Some(false),
+                                render_fallback_on_empty_extraction: Some(false),
+                                render_fallback_on_low_signal: Some(false),
                                 max_results: args.max_results,
                                 max_urls: args.max_urls,
                                 timeout_ms: Some(args.timeout_ms),
@@ -22894,13 +24955,24 @@ async fn main() -> Result<()> {
                             .await
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-                        let s = r
-                            .content
-                            .first()
-                            .and_then(|c| c.as_text())
-                            .map(|t| t.text.clone())
-                            .unwrap_or_default();
-                        let v: serde_json::Value = serde_json::from_str(&s)?;
+                        let v: serde_json::Value = if let Some(sc) = r.structured_content.clone() {
+                            sc
+                        } else {
+                            // Back-compat: older tool results echoed JSON as the first `content` item.
+                            // Newer tools may put Markdown first; scan for any parseable JSON text.
+                            let mut parsed: Option<serde_json::Value> = None;
+                            for c in &r.content {
+                                let s = c.as_text().map(|t| t.text.as_str()).unwrap_or("").trim();
+                                if s.is_empty() {
+                                    continue;
+                                }
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                                    parsed = Some(v);
+                                    break;
+                                }
+                            }
+                            parsed.ok_or_else(|| anyhow::anyhow!("web_search_extract tool result had no structured_content and no JSON text payload"))?
+                        };
                         per_mode.push(serde_json::json!({ "selection_mode": m, "result": v }));
                     }
 
@@ -26839,7 +28911,7 @@ Rules:
             let t0 = std::time::Instant::now();
             let resp = service
                 .call_tool(CallToolRequestParam {
-                    name: "web_search_extract".into(),
+                    name: "search_evidence".into(),
                     arguments: Some(args_json.as_object().cloned().unwrap_or_default()),
                 })
                 .await?;
@@ -27197,9 +29269,11 @@ Rules:
                 });
 
                 let t0 = std::time::Instant::now();
+                // Use the stable Cursor-facing tool name. (The underlying payload `kind` remains
+                // `web_search_extract`, so the critic checks stay aligned.)
                 let resp = service
                     .call_tool(CallToolRequestParam {
-                        name: "web_search_extract".into(),
+                        name: "search_evidence".into(),
                         arguments: Some(args_json.as_object().cloned().unwrap_or_default()),
                     })
                     .await?;
@@ -27707,8 +29781,388 @@ Rules:
                         }
                     }
                 }
-                _ => println!("{payload}"),
+                "json" => println!("{payload}"),
+                _ => println!("{}", serde_json::to_string_pretty(&payload)?),
             }
+        }
+        #[cfg(feature = "stdio")]
+        Commands::McpListTools(args) => {
+            use rmcp::model::PaginatedRequestParam;
+            use rmcp::service::ServiceExt;
+            use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+            use tokio::process::Command;
+
+            let bin =
+                std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("webpipe"));
+            let child = TokioChildProcess::new(Command::new(bin).configure(|cmd| {
+                cmd.args(["mcp-stdio"]);
+                // Keep stdout reserved for MCP frames (child must not print logs to stdout).
+                cmd.env("RUST_LOG", "error");
+            }))?;
+            let service = ().serve(child).await?;
+
+            let tools = tokio::time::timeout(
+                std::time::Duration::from_millis(args.timeout_ms),
+                service.list_tools(Some(PaginatedRequestParam::default())),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("mcp list_tools timed out after {}ms", args.timeout_ms)
+            })??;
+
+            let mut out_tools: Vec<serde_json::Value> = Vec::new();
+            for t in tools.tools.iter() {
+                let mut o = serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                });
+                if args.include_schema {
+                    o["input_schema"] = serde_json::Value::Object((*t.input_schema).clone());
+                } else {
+                    let keys: Vec<String> = t.input_schema.keys().take(50).cloned().collect();
+                    o["input_schema_keys"] = serde_json::Value::Array(
+                        keys.into_iter().map(serde_json::Value::String).collect(),
+                    );
+                }
+                out_tools.push(o);
+            }
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "mcp_list_tools",
+                "tool_count": out_tools.len(),
+                "tools": out_tools,
+            });
+
+            match args.output.to_ascii_lowercase().as_str() {
+                "json" => println!("{payload}"),
+                _ => println!("{}", serde_json::to_string_pretty(&payload)?),
+            }
+
+            let _ = service.cancel().await;
+        }
+        #[cfg(feature = "stdio")]
+        Commands::McpCall(args) => {
+            use rmcp::model::CallToolRequestParam;
+            use rmcp::service::ServiceExt;
+            use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+            use tokio::process::Command;
+
+            let bin =
+                std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("webpipe"));
+            let child = TokioChildProcess::new(Command::new(bin).configure(|cmd| {
+                cmd.args(["mcp-stdio"]);
+                // Keep stdout reserved for MCP frames (child must not print logs to stdout).
+                cmd.env("RUST_LOG", "error");
+            }))?;
+
+            let service = ().serve(child).await?;
+
+            let mut arg_objs: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+            match (&args.args_json, &args.args_json_file) {
+                (Some(s), None) => {
+                    let args_v: serde_json::Value = serde_json::from_str(s)
+                        .map_err(|e| anyhow::anyhow!("invalid --args-json: {e}"))?;
+                    let Some(obj) = args_v.as_object().cloned() else {
+                        anyhow::bail!("--args-json must be a JSON object (top-level {{...}})");
+                    };
+                    arg_objs.push(obj);
+                }
+                (None, Some(p)) => {
+                    let bytes = std::fs::read(p).map_err(|e| {
+                        anyhow::anyhow!("failed to read --args-json-file {}: {e}", p.display())
+                    })?;
+                    let s = String::from_utf8(bytes)
+                        .map_err(|e| anyhow::anyhow!("--args-json-file is not valid UTF-8: {e}"))?;
+                    let v: serde_json::Value = serde_json::from_str(&s)
+                        .map_err(|e| anyhow::anyhow!("invalid JSON in --args-json-file: {e}"))?;
+                    match v {
+                        serde_json::Value::Object(o) => arg_objs.push(o),
+                        serde_json::Value::Array(arr) => {
+                            for (i, it) in arr.into_iter().enumerate() {
+                                let Some(o) = it.as_object().cloned() else {
+                                    anyhow::bail!(
+                                        "--args-json-file array entries must be objects; entry {i} was not an object"
+                                    );
+                                };
+                                arg_objs.push(o);
+                            }
+                        }
+                        _ => anyhow::bail!(
+                            "--args-json-file must contain a JSON object or array of objects"
+                        ),
+                    }
+                }
+                _ => anyhow::bail!("Pass exactly one of --args-json or --args-json-file"),
+            }
+
+            let reps = args.repeat.max(1).min(1000);
+            let mut call_durations_ms: Vec<u128> = Vec::new();
+            let mut tool_elapsed_ms: Vec<Option<u64>> = Vec::new();
+
+            for rep in 0..reps {
+                for (i, obj) in arg_objs.iter().cloned().enumerate() {
+                    let call_t0 = std::time::Instant::now();
+                    let resp = tokio::time::timeout(
+                        std::time::Duration::from_millis(args.timeout_ms),
+                        service.call_tool(CallToolRequestParam {
+                            name: args.tool.clone().into(),
+                            arguments: Some(obj),
+                        }),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("mcp call timed out after {}ms", args.timeout_ms)
+                    })??;
+                    let dur = call_t0.elapsed().as_millis();
+                    call_durations_ms.push(dur);
+
+                    let tool_ms = resp
+                        .structured_content
+                        .as_ref()
+                        .and_then(|sc| sc.get("elapsed_ms"))
+                        .and_then(|v| v.as_u64());
+                    tool_elapsed_ms.push(tool_ms);
+
+                    let should_print = args.print_each || (rep == 0 && i == 0);
+                    if should_print {
+                        // Print Markdown content first (scan-first for humans).
+                        let mut printed_any = false;
+                        for c in &resp.content {
+                            if let Some(t) = c.as_text() {
+                                let s = t.text.trim_end();
+                                if !s.is_empty() {
+                                    println!("{s}");
+                                    printed_any = true;
+                                }
+                            }
+                        }
+                        if !printed_any {
+                            println!("(no markdown content returned)");
+                        }
+
+                        if args.print_structured {
+                            if let Some(sc) = resp.structured_content.clone() {
+                                println!("\n## structured_content\n");
+                                println!("{}", serde_json::to_string_pretty(&sc)?);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Timing summary (printed once, even if print_each=false).
+            if reps > 1 || arg_objs.len() > 1 {
+                println!("\n## Timing\n");
+                println!(
+                    "- calls: {}; repeats: {}; per-call timeout_ms: {}",
+                    call_durations_ms.len(),
+                    reps,
+                    args.timeout_ms
+                );
+                let sum: u128 = call_durations_ms.iter().sum();
+                let min = call_durations_ms.iter().min().copied().unwrap_or(0);
+                let max = call_durations_ms.iter().max().copied().unwrap_or(0);
+                let mean = if call_durations_ms.is_empty() {
+                    0
+                } else {
+                    sum / (call_durations_ms.len() as u128)
+                };
+                println!("- client_call_ms: min={min}, mean={mean}, max={max}");
+                let tool_vals: Vec<u64> = tool_elapsed_ms.iter().copied().flatten().collect();
+                if !tool_vals.is_empty() {
+                    let sum2: u64 = tool_vals.iter().sum();
+                    let min2 = tool_vals.iter().min().copied().unwrap_or(0);
+                    let max2 = tool_vals.iter().max().copied().unwrap_or(0);
+                    let mean2 = sum2 / (tool_vals.len() as u64);
+                    println!("- tool_elapsed_ms: min={min2}, mean={mean2}, max={max2} (from structured_content.elapsed_ms)");
+                }
+            }
+
+            let _ = service.cancel().await;
+        }
+        #[cfg(feature = "stdio")]
+        Commands::McpSweep(args) => {
+            use rmcp::model::{CallToolRequestParam, PaginatedRequestParam};
+            use rmcp::service::ServiceExt;
+            use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+            use tokio::process::Command;
+
+            let bin =
+                std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("webpipe"));
+            let child = TokioChildProcess::new(Command::new(bin).configure(|cmd| {
+                cmd.args(["mcp-stdio"]);
+                // Keep stdout reserved for MCP frames (child must not print logs to stdout).
+                cmd.env("RUST_LOG", "error");
+            }))?;
+            let service = ().serve(child).await?;
+
+            // Discover tool list as the client sees it.
+            let tools = tokio::time::timeout(
+                std::time::Duration::from_millis(args.timeout_ms),
+                service.list_tools(Some(PaginatedRequestParam::default())),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("mcp list_tools timed out after {}ms", args.timeout_ms)
+            })??;
+
+            let mut runs: Vec<serde_json::Value> = Vec::new();
+
+            // Run each MCP-visible tool with a bounded, tool-agnostic example payload.
+            // (This is a smoke test, not a benchmark.)
+            for t in &tools.tools {
+                let name = t.name.to_string();
+                let args_json = match name.as_str() {
+                    "webpipe_meta" => serde_json::json!({}),
+                    "webpipe_usage" => serde_json::json!({}),
+                    "arxiv_search" => serde_json::json!({
+                        "query": "transformer attention",
+                        "max_results": 3
+                    }),
+                    "arxiv_enrich" => serde_json::json!({
+                        "id_or_url": "1706.03762",
+                        "include_discussions": false,
+                        "timeout_ms": 20_000
+                    }),
+                    "paper_search" => serde_json::json!({
+                        "query": "transformer attention",
+                        "backends": ["semantic_scholar", "openalex"],
+                        "limit": 5,
+                        "timeout_ms": 20_000,
+                        "include_abstract": false
+                    }),
+                    "web_fetch" => serde_json::json!({
+                        "url": "https://example.com",
+                        "include_text": false,
+                        "timeout_ms": 15_000,
+                        "max_bytes": 200_000
+                    }),
+                    "web_extract" => serde_json::json!({
+                        "url": "https://example.com",
+                        "include_text": false,
+                        "include_structure": true,
+                        "top_chunks": 3,
+                        "max_chars": args.max_chars,
+                        "max_chunk_chars": 400,
+                        "timeout_ms": 20_000
+                    }),
+                    "search_evidence" => serde_json::json!({
+                        "query": "what is a red-black tree",
+                        "provider": "auto",
+                        "auto_mode": "fallback",
+                        "exploration": "balanced",
+                        "agentic": true,
+                        "max_results": 6,
+                        "max_urls": args.max_urls,
+                        "max_chars": args.max_chars,
+                        "top_chunks": 6,
+                        "max_chunk_chars": 500,
+                        "include_structure": true,
+                        "include_text": false,
+                        "include_links": false,
+                        "compact": false,
+                        "timeout_ms": 20_000
+                    }),
+                    _ => serde_json::json!({}),
+                };
+
+                let t0 = std::time::Instant::now();
+                let mut ok = true;
+                let mut err: Option<String> = None;
+                let mut markdown_present = false;
+                let mut structured_present = false;
+                let mut kind: Option<String> = None;
+
+                let resp = (|| async {
+                    let Some(obj) = args_json.as_object().cloned() else {
+                        anyhow::bail!("internal: args must be a JSON object");
+                    };
+                    let resp = tokio::time::timeout(
+                        std::time::Duration::from_millis(args.timeout_ms),
+                        service.call_tool(CallToolRequestParam {
+                            name: name.clone().into(),
+                            arguments: Some(obj),
+                        }),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("mcp call timed out after {}ms", args.timeout_ms)
+                    })??;
+                    Ok::<_, anyhow::Error>(resp)
+                })()
+                .await;
+
+                match resp {
+                    Ok(resp) => {
+                        markdown_present = resp
+                            .content
+                            .first()
+                            .and_then(|c| c.as_text())
+                            .is_some_and(|t| !t.text.trim().is_empty());
+                        structured_present = resp.structured_content.is_some();
+                        if let Some(sc) = resp.structured_content.as_ref() {
+                            kind = sc
+                                .get("kind")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            ok = sc.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+                        }
+                    }
+                    Err(e) => {
+                        ok = false;
+                        err = Some(e.to_string());
+                    }
+                }
+
+                runs.push(serde_json::json!({
+                    "tool": name,
+                    "ok": ok,
+                    "elapsed_ms": t0.elapsed().as_millis(),
+                    "markdown_present": markdown_present,
+                    "structured_present": structured_present,
+                    "kind": kind,
+                    "args": args_json,
+                    "error": err,
+                }));
+            }
+
+            // Finally, query usage within the same long-lived child server so counts are meaningful.
+            let usage = (|| async {
+                let resp = tokio::time::timeout(
+                    std::time::Duration::from_millis(args.timeout_ms),
+                    service.call_tool(CallToolRequestParam {
+                        name: "webpipe_usage".into(),
+                        arguments: Some(
+                            serde_json::json!({})
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    }),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                resp.structured_content
+            })()
+            .await;
+
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "kind": "mcp_sweep",
+                "ok": runs.iter().all(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)),
+                "tool_count": tools.tools.len(),
+                "runs": runs,
+                "usage": usage,
+            });
+
+            match args.output.to_ascii_lowercase().as_str() {
+                "json" => println!("{payload}"),
+                _ => println!("{}", serde_json::to_string_pretty(&payload)?),
+            }
+
+            let _ = service.cancel().await;
         }
         #[cfg(feature = "eval")]
         Commands::EvalTranscriptSummarize(args) => {
@@ -27965,7 +30419,7 @@ Rules:
             std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
             println!("{}", out.display());
         }
-        #[cfg(feature = "eval")]
+        #[cfg(all(feature = "eval", feature = "vlm"))]
         Commands::EvalVlmSummarize(args) => {
             let now = args.now_epoch_s.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -28197,7 +30651,7 @@ Rules:
             std::fs::write(&out, serde_json::to_string_pretty(&payload)? + "\n")?;
             println!("{}", out.display());
         }
-        #[cfg(feature = "eval")]
+        #[cfg(all(feature = "eval", feature = "vlm"))]
         Commands::EvalVlmRun(args) => {
             let t0 = std::time::Instant::now();
             let transcript_seq0: u64 = 0;
@@ -29265,7 +31719,7 @@ Rules:
             std::fs::write(&out_summary, serde_json::to_string_pretty(&summary)? + "\n")?;
             println!("{}", out_summary.display());
         }
-        #[cfg(feature = "eval")]
+        #[cfg(all(feature = "eval", feature = "vlm"))]
         Commands::EvalVlmBundle(args) => {
             let now = args.now_epoch_s.unwrap_or_else(|| {
                 std::time::SystemTime::now()

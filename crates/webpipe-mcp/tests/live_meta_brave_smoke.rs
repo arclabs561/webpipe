@@ -5,8 +5,10 @@ fn webpipe_live_meta_reports_brave_configured_opt_in() {
     // This test does NOT call Brave, but it does validate that the MCP server
     // sees the env key and reports it in webpipe_meta. Opt-in to avoid
     // surprising behavior in environments without the key.
-    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1") {
-        eprintln!("skipping: set WEBPIPE_LIVE=1 to run live meta smoke");
+    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1")
+        || std::env::var("WEBPIPE_LIVE_PAID").ok().as_deref() != Some("1")
+    {
+        eprintln!("skipping: set WEBPIPE_LIVE=1 WEBPIPE_LIVE_PAID=1 to run live meta smoke");
         return;
     }
 
@@ -17,8 +19,7 @@ fn webpipe_live_meta_reports_brave_configured_opt_in() {
     {
         Some(v) if !v.trim().is_empty() => v,
         _ => {
-            eprintln!("skipping: missing WEBPIPE_BRAVE_API_KEY (or BRAVE_SEARCH_API_KEY)");
-            return;
+            panic!("missing WEBPIPE_BRAVE_API_KEY (or BRAVE_SEARCH_API_KEY)");
         }
     };
 

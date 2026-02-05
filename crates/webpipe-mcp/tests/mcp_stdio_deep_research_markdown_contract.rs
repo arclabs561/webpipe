@@ -65,6 +65,8 @@ fn webpipe_mcp_stdio_deep_research_markdown_default_contract_openai_compat_local
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
                     cmd.env("WEBPIPE_DOTENV", "0");
+                    // Deep research tool is not exposed in the normal Cursor-facing toolset.
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env("WEBPIPE_CACHE_DIR", cache_dir.path());
                     cmd.env("WEBPIPE_OPENAI_COMPAT_BASE_URL", &base);
                     cmd.env("WEBPIPE_OPENAI_COMPAT_MODEL", "stub-model");
@@ -155,6 +157,8 @@ fn webpipe_mcp_stdio_deep_research_markdown_on_error_contract() {
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
                     cmd.env("WEBPIPE_DOTENV", "0");
+                    // Deep research tool is not exposed in the normal Cursor-facing toolset.
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env("WEBPIPE_CACHE_DIR", cache_dir.path());
                     cmd.env("WEBPIPE_MCP_INCLUDE_JSON_TEXT", "0");
                     // Ensure we don't accidentally use real keys.

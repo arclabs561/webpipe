@@ -93,6 +93,8 @@ fn web_explore_extract_crawls_and_finds_linked_page() {
             .serve(TokioChildProcess::new(
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
+                    // Explore tools are intentionally not in the normal Cursor-facing toolset.
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env(
                         "WEBPIPE_CACHE_DIR",
                         std::env::temp_dir().join("webpipe-explore-cache"),

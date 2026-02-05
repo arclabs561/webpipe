@@ -104,6 +104,8 @@ fn repo_ingest_fetches_bounded_files_and_combines_text() {
             .serve(TokioChildProcess::new(
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
+                    // repo_ingest is a debug-only tool; enable full surface for contract tests.
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env(
                         "WEBPIPE_CACHE_DIR",
                         std::env::temp_dir().join("webpipe-repo-ingest-cache"),
@@ -258,6 +260,8 @@ fn repo_ingest_private_like_succeeds_with_token_and_api_contents_fallback() {
             .serve(TokioChildProcess::new(
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
+                    // repo_ingest is a debug-only tool; enable full surface for contract tests.
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env(
                         "WEBPIPE_CACHE_DIR",
                         std::env::temp_dir().join("webpipe-repo-ingest-cache-private"),

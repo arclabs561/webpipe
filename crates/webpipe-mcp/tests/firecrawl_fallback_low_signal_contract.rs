@@ -92,7 +92,7 @@ async fn web_search_extract_firecrawl_fallback_on_low_signal_is_bounded_and_mark
     let url = format!("http://{}/page", addr);
     let v = call(
         &service,
-        "web_search_extract",
+        "search_evidence",
         json!({
             "query": "hello",
             "urls": [url],
@@ -108,7 +108,9 @@ async fn web_search_extract_firecrawl_fallback_on_low_signal_is_bounded_and_mark
             "agentic": false,
             "compact": false,
             "firecrawl_fallback_on_empty_extraction": false,
-            "firecrawl_fallback_on_low_signal": true
+            "firecrawl_fallback_on_low_signal": true,
+            "render_fallback_on_empty_extraction": false,
+            "render_fallback_on_low_signal": false
         }),
     )
     .await;

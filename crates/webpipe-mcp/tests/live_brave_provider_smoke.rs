@@ -13,8 +13,12 @@ fn payload_from_result(result: &rmcp::model::CallToolResult) -> Option<serde_jso
 #[test]
 fn webpipe_live_brave_search_smoke_opt_in() {
     // This test makes a real paid network call. Opt-in only.
-    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1") {
-        eprintln!("skipping: set WEBPIPE_LIVE=1 to run live brave provider smoke");
+    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1")
+        || std::env::var("WEBPIPE_LIVE_PAID").ok().as_deref() != Some("1")
+    {
+        eprintln!(
+            "skipping: set WEBPIPE_LIVE=1 WEBPIPE_LIVE_PAID=1 to run live brave provider smoke"
+        );
         return;
     }
 
@@ -25,8 +29,7 @@ fn webpipe_live_brave_search_smoke_opt_in() {
     {
         Some(k) if !k.trim().is_empty() => k,
         _ => {
-            eprintln!("skipping: missing WEBPIPE_BRAVE_API_KEY (or BRAVE_SEARCH_API_KEY)");
-            return;
+            panic!("missing WEBPIPE_BRAVE_API_KEY (or BRAVE_SEARCH_API_KEY)");
         }
     };
 

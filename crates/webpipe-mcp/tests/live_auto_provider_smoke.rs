@@ -24,8 +24,12 @@ fn payload_from_result(result: &rmcp::model::CallToolResult) -> Option<serde_jso
 #[test]
 fn webpipe_live_auto_search_smoke_opt_in() {
     // This test makes a real paid network call. Opt-in only.
-    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1") {
-        eprintln!("skipping: set WEBPIPE_LIVE=1 to run live auto provider smoke");
+    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1")
+        || std::env::var("WEBPIPE_LIVE_PAID").ok().as_deref() != Some("1")
+    {
+        eprintln!(
+            "skipping: set WEBPIPE_LIVE=1 WEBPIPE_LIVE_PAID=1 to run live auto provider smoke"
+        );
         return;
     }
 
@@ -33,8 +37,7 @@ fn webpipe_live_auto_search_smoke_opt_in() {
     let brave_key = get_env_any(&["WEBPIPE_BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"]);
     let tavily_key = get_env_any(&["WEBPIPE_TAVILY_API_KEY", "TAVILY_API_KEY"]);
     if brave_key.is_none() && tavily_key.is_none() {
-        eprintln!("skipping: need WEBPIPE_BRAVE_API_KEY/BRAVE_SEARCH_API_KEY and/or WEBPIPE_TAVILY_API_KEY/TAVILY_API_KEY");
-        return;
+        panic!("need WEBPIPE_BRAVE_API_KEY/BRAVE_SEARCH_API_KEY and/or WEBPIPE_TAVILY_API_KEY/TAVILY_API_KEY");
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");

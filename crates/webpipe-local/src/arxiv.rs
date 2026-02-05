@@ -73,12 +73,22 @@ fn build_search_query(query: &str, categories: &[String]) -> String {
     // - all:term
     // - cat:cs.LG
     //
-    // We'll approximate phrase search by quoting when the query has spaces.
-    let q = query.trim();
-    let q_part = if q.contains(' ') {
-        format!("all:\"{}\"", q.replace('"', ""))
+    // In practice, arXiv's phrase behavior is brittle for multi-word queries and can return
+    // very broad recent matches when combined with submittedDate sorting.
+    //
+    // For multi-word queries, prefer a conservative AND over tokens:
+    //   all:fenchel AND all:young AND all:losses
+    // This tends to surface the intended paper set (e.g. "Fenchel-Young losses") more reliably.
+    let cleaned = query.trim().replace('"', "").replace('-', " ");
+    let q = cleaned.split_whitespace().collect::<Vec<_>>();
+    let q_part = if q.len() <= 1 {
+        let one = q.first().copied().unwrap_or("").trim();
+        format!("all:{}", one)
     } else {
-        format!("all:{}", q)
+        q.iter()
+            .map(|t| format!("all:{t}"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
     };
     if categories.is_empty() {
         return q_part;
@@ -99,6 +109,91 @@ fn year_from_rfc3339(s: &str) -> Option<u32> {
     // ArXiv returns RFC3339-ish timestamps (e.g. 2024-09-08T00:00:00Z).
     let y = s.get(0..4)?.parse::<u32>().ok()?;
     Some(y)
+}
+
+fn looks_like_new_arxiv_id(id: &str) -> bool {
+    // New-style IDs:
+    // - 1706.03762
+    // - 1706.03762v5
+    let s = id.trim();
+    if s.len() < 10 {
+        return false;
+    }
+    let a = &s[0..4];
+    if !a.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if s.as_bytes().get(4).copied() != Some(b'.') {
+        return false;
+    }
+    let b = &s[5..10];
+    if !b.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let rest = &s[10..];
+    if rest.is_empty() {
+        return true;
+    }
+    if let Some(v) = rest.strip_prefix('v') {
+        return !v.is_empty() && v.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+fn looks_like_old_arxiv_id(id: &str) -> bool {
+    // Old-style IDs:
+    // - cs/9901001
+    // - cs/9901001v1
+    let s = id.trim();
+    let Some((cat, num)) = s.split_once('/') else {
+        return false;
+    };
+    if cat.is_empty() || num.len() < 7 {
+        return false;
+    }
+    if !cat
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
+        return false;
+    }
+    let (digits, rest) = num.split_at(7);
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if rest.is_empty() {
+        return true;
+    }
+    if let Some(v) = rest.strip_prefix('v') {
+        return !v.is_empty() && v.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+fn arxiv_id_from_query_like(q: &str) -> Option<String> {
+    // Accept:
+    // - raw ids (new/old style)
+    // - abs urls
+    // - pdf urls (with optional .pdf)
+    let s0 = q.trim();
+    if s0.is_empty() {
+        return None;
+    }
+    if s0.contains("/abs/") {
+        return arxiv_id_from_url(s0);
+    }
+    if let Some(i) = s0.rfind("/pdf/") {
+        let tail = &s0[i + "/pdf/".len()..];
+        let id = tail.trim_matches('/').trim().trim_end_matches(".pdf");
+        if looks_like_new_arxiv_id(id) || looks_like_old_arxiv_id(id) {
+            return Some(id.to_string());
+        }
+    }
+    let s = s0.trim_end_matches(".pdf").trim();
+    if looks_like_new_arxiv_id(s) || looks_like_old_arxiv_id(s) {
+        return Some(s.to_string());
+    }
+    None
 }
 
 fn parse_atom(body: &str) -> (Option<u64>, Vec<ArxivPaper>, Vec<&'static str>) {
@@ -329,6 +424,43 @@ pub async fn arxiv_search(
         return Err(Error::InvalidUrl("query must be non-empty".to_string()));
     }
 
+    // UX: if the query looks like an arXiv id (or a direct arXiv URL), treat it as an exact lookup.
+    // This avoids surprising behavior like `query="1706.03762"` returning papers that merely cite it.
+    if let Some(id) = arxiv_id_from_query_like(&q) {
+        let mut warnings: Vec<&'static str> = Vec::new();
+        let paper = arxiv_lookup_by_id(http, id, timeout_ms).await?;
+        let mut papers = Vec::new();
+        if let Some(p) = paper {
+            if years.is_empty() {
+                papers.push(p);
+            } else {
+                let ys: std::collections::HashSet<u32> = years.iter().copied().collect();
+                let keep = p
+                    .published
+                    .as_deref()
+                    .and_then(year_from_rfc3339)
+                    .map(|y| ys.contains(&y))
+                    .unwrap_or(false);
+                if keep {
+                    papers.push(p);
+                } else {
+                    warnings.push("arxiv_year_filter_excluded_exact_id");
+                }
+            }
+        } else {
+            warnings.push("arxiv_id_not_found");
+        }
+        return Ok(ArxivSearchResponse {
+            ok: true,
+            query: q,
+            page: 1,
+            per_page,
+            total_results: None,
+            papers,
+            warnings,
+        });
+    }
+
     let search_query = build_search_query(&q, &categories);
     let mut url = arxiv_api_endpoint()?;
     url.query_pairs_mut()
@@ -336,8 +468,8 @@ pub async fn arxiv_search(
         .append_pair("start", &start.to_string())
         .append_pair("max_results", &per_page.to_string());
 
-    // Keep ordering deterministic.
-    url.query_pairs_mut().append_pair("sortBy", "submittedDate");
+    // Prefer relevance ordering; keep deterministic tie-breaking.
+    url.query_pairs_mut().append_pair("sortBy", "relevance");
     url.query_pairs_mut().append_pair("sortOrder", "descending");
 
     let resp = http
@@ -454,5 +586,17 @@ mod tests {
             .contains("0805.3415v1"));
         assert_eq!(papers[0].authors.len(), 2);
         assert!(papers[0].categories.iter().any(|c| c == "cs.LG"));
+    }
+
+    #[test]
+    fn build_search_query_multiword_prefers_and_tokens() {
+        assert_eq!(
+            build_search_query("Fenchel-Young losses", &[]),
+            "all:Fenchel AND all:Young AND all:losses"
+        );
+        assert_eq!(
+            build_search_query("  \"Fenchel Young\"  ", &[]),
+            "all:Fenchel AND all:Young"
+        );
     }
 }

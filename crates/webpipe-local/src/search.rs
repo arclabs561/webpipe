@@ -3,6 +3,12 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 use webpipe_core::{Error, Result, SearchProvider, SearchQuery, SearchResponse, SearchResult};
 
+fn timeout_ms_from_query(q: &SearchQuery) -> u64 {
+    // Provider requests can hang indefinitely without an explicit timeout.
+    // Keep a conservative cap even if callers pass something huge.
+    q.timeout_ms.unwrap_or(20_000).clamp(1_000, 60_000)
+}
+
 fn brave_api_key_from_env() -> Option<String> {
     std::env::var("WEBPIPE_BRAVE_API_KEY")
         .ok()
@@ -175,6 +181,7 @@ pub async fn searxng_search_at_endpoint(
 ) -> Result<SearchResponse> {
     let t0 = Instant::now();
     let max_results = q.max_results.unwrap_or(10).min(20);
+    let timeout_ms = timeout_ms_from_query(q);
 
     let endpoint_search = SearxngSearchProvider::endpoint_search_for(base_endpoint);
     let mut req = client
@@ -186,7 +193,11 @@ pub async fn searxng_search_at_endpoint(
         req = req.query(&[("language", lang)]);
     }
 
-    let resp = req.send().await.map_err(|e| Error::Search(e.to_string()))?;
+    let resp = req
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .send()
+        .await
+        .map_err(|e| Error::Search(e.to_string()))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(Error::Search(format!("searxng search HTTP {status}")));
@@ -249,6 +260,7 @@ impl SearchProvider for BraveSearchProvider {
 
     async fn search(&self, q: &SearchQuery) -> Result<SearchResponse> {
         let t0 = Instant::now();
+        let timeout_ms = timeout_ms_from_query(q);
 
         let mut req = self
             .client
@@ -268,7 +280,11 @@ impl SearchProvider for BraveSearchProvider {
             req = req.query(&[("country", country)]);
         }
 
-        let resp = req.send().await.map_err(|e| Error::Search(e.to_string()))?;
+        let resp = req
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .send()
+            .await
+            .map_err(|e| Error::Search(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::Search(format!("brave search HTTP {status}")));
@@ -331,6 +347,7 @@ impl SearchProvider for TavilySearchProvider {
     async fn search(&self, q: &SearchQuery) -> Result<SearchResponse> {
         let t0 = Instant::now();
         let max_results = q.max_results.unwrap_or(5).min(20);
+        let timeout_ms = timeout_ms_from_query(q);
 
         let body = serde_json::json!({
             "query": q.query,
@@ -352,6 +369,7 @@ impl SearchProvider for TavilySearchProvider {
                 format!("Bearer {}", self.api_key),
             )
             .json(&body)
+            .timeout(std::time::Duration::from_millis(timeout_ms))
             .send()
             .await
             .map_err(|e| Error::Search(e.to_string()))?;
@@ -521,6 +539,7 @@ mod tests {
             max_results: None,
             language: Some("en".to_string()),
             country: Some("us".to_string()),
+            timeout_ms: None,
         };
         let i1 = p.pick_endpoint_index(&q);
         let i2 = p.pick_endpoint_index(&q);

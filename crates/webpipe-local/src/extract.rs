@@ -1,5 +1,6 @@
 use crate::shellout;
 use crate::textprep;
+use slabs_crate::Chunker;
 use serde::Serialize;
 use std::io::Cursor;
 use std::process::Command;
@@ -117,7 +118,54 @@ pub struct ExtractedStructure {
 pub fn pdf_to_text(bytes: &[u8]) -> Result<String, String> {
     // `pdf-extract` is pure-Rust and works from memory; keep errors as strings
     // so callers can surface them as warnings without adding new error enums.
-    pdf_extract::extract_text_from_mem(bytes).map_err(|e| e.to_string())
+    //
+    // Important: `pdf-extract` has had panics on some malformed PDFs. Since webpipe
+    // treats “offline cache corpus scanning” as a best-effort workflow, we must
+    // not let one bad cached PDF take down the whole scan.
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+
+    thread_local! {
+        static SUPPRESS_PDF_PANIC_HOOK: Cell<bool> = const { Cell::new(false) };
+    }
+    static HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+    HOOK_INSTALLED.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let suppressed = SUPPRESS_PDF_PANIC_HOOK.with(|c| c.get());
+            if suppressed {
+                return;
+            }
+            prev(info);
+        }));
+    });
+
+    struct SuppressGuard;
+    impl Drop for SuppressGuard {
+        fn drop(&mut self) {
+            SUPPRESS_PDF_PANIC_HOOK.with(|c| c.set(false));
+        }
+    }
+
+    let r = std::panic::catch_unwind(|| {
+        // Ensure any panic from the PDF parser does not spam stderr.
+        SUPPRESS_PDF_PANIC_HOOK.with(|c| c.set(true));
+        let _g = SuppressGuard;
+
+        // Deterministic test hook: simulate a pdf-extract panic without relying on
+        // crate-internal failure modes (kept under cfg(test)).
+        #[cfg(test)]
+        {
+            if bytes.starts_with(b"WEBPIPE_TEST_PDF_EXTRACT_PANIC") {
+                panic!("simulated pdf-extract panic");
+            }
+        }
+        pdf_extract::extract_text_from_mem(bytes)
+    });
+    match r {
+        Ok(inner) => inner.map_err(|e| e.to_string()),
+        Err(_) => Err("pdf_extract_panicked".to_string()),
+    }
 }
 
 fn env(key: &str) -> Option<String> {
@@ -352,6 +400,12 @@ fn is_generic_boilerplate_container(el: &html_scraper::ElementRef) -> bool {
         "promo",
         "subscribe",
         "newsletter",
+        "share",
+        "social",
+        "actions",
+        "related",
+        "listen",
+        "speech",
     ] {
         if s.contains(bad) {
             return true;
@@ -560,6 +614,84 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> (String, usize, bool) {
     (out, n, clipped)
 }
 
+fn smart_truncate_to_chars_for_query(
+    text: &str,
+    query: &str,
+    max_chars: usize,
+    max_chunk_chars: usize,
+) -> (String, usize, bool, bool) {
+    // Return a contiguous window of `text` sized to max_chars.
+    //
+    // Default truncation is prefix-based, which can be bad for JS-heavy docs where the extracted
+    // text starts with navigation chrome and the actual content is further down. When we have a
+    // query, we prefer to keep a window around the best-matching chunk.
+    //
+    // Returns: (window_text, window_chars, clipped, used_query_window)
+    if max_chars == 0 {
+        return (
+            String::new(),
+            0,
+            text.chars().any(|c| !c.is_whitespace()),
+            false,
+        );
+    }
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return (text.to_string(), total_chars, false, false);
+    }
+    let q = query.trim();
+    if q.is_empty() {
+        let (out, n, clipped) = truncate_to_chars(text, max_chars);
+        return (out, n, clipped, false);
+    }
+
+    // Best-effort: pick the single best chunk (query token overlap + nav penalties).
+    // If we can't find a chunk, fall back to prefix truncation.
+    let best = best_chunks_for_query(text, q, 1, max_chunk_chars);
+    let Some(c) = best.first() else {
+        let (out, n, clipped) = truncate_to_chars(text, max_chars);
+        return (out, n, clipped, false);
+    };
+
+    // Center-ish window around the best chunk.
+    let _chunk_len = c.end_char.saturating_sub(c.start_char).max(1);
+    let pre = (max_chars / 3).min(max_chars.saturating_sub(1));
+    let mut start = c.start_char.saturating_sub(pre);
+    let mut end = start.saturating_add(max_chars);
+
+    // Ensure the whole chunk fits.
+    if end < c.end_char {
+        let need = c.end_char.saturating_sub(end);
+        start = start.saturating_add(need);
+        end = end.saturating_add(need);
+    }
+
+    // Clamp to document bounds.
+    if end > total_chars {
+        let over = end.saturating_sub(total_chars);
+        end = total_chars;
+        start = start.saturating_sub(over);
+    }
+    start = start.min(total_chars);
+    end = end.min(total_chars);
+    if end <= start {
+        let (out, n, clipped) = truncate_to_chars(text, max_chars);
+        return (out, n, clipped, false);
+    }
+
+    let window = slice_chars(text, start, end);
+    let window_chars = window.chars().count();
+    let clipped = true;
+    let used_query_window = start > 0;
+
+    // If we somehow produced an empty/whitespace-only window, fall back.
+    if !has_any_text(&window) {
+        let (out, n, clipped2) = truncate_to_chars(text, max_chars);
+        return (out, n, clipped2, false);
+    }
+    (window, window_chars, clipped, used_query_window)
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtractPipelineResult {
     pub extracted: ExtractedText,
@@ -594,11 +726,17 @@ pub fn extract_pipeline_from_extracted(
     extracted0: ExtractedText,
     cfg: ExtractPipelineCfg<'_>,
 ) -> ExtractPipelineResult {
-    let (text, text_chars, text_truncated) = truncate_to_chars(&extracted0.text, cfg.max_chars);
+    let query = cfg.query.unwrap_or("").trim();
+    let (text, text_chars, text_truncated, used_query_window) =
+        smart_truncate_to_chars_for_query(&extracted0.text, query, cfg.max_chars, cfg.max_chunk_chars);
+    let mut warnings = extracted0.warnings;
+    if used_query_window {
+        warnings.push("text_windowed_for_query");
+    }
     let extracted = ExtractedText {
         engine: extracted0.engine,
         text,
-        warnings: extracted0.warnings,
+        warnings,
     };
 
     let structure = if cfg.include_structure {
@@ -615,7 +753,6 @@ pub fn extract_pipeline_from_extracted(
         None
     };
 
-    let query = cfg.query.unwrap_or("").trim();
     let chunks = if query.is_empty() {
         best_chunks_default(&extracted.text, cfg.top_chunks, cfg.max_chunk_chars)
     } else if let Some(s) = structure.as_ref() {
@@ -651,7 +788,7 @@ fn best_chunks_default(text: &str, top_k: usize, max_chunk_chars: usize) -> Vec<
     let top_k = top_k.clamp(1, 50);
     let max_chunk_chars = max_chunk_chars.clamp(50, 5_000);
 
-    let spans = find_paragraph_spans(text);
+    let spans = find_candidate_spans(text, max_chunk_chars);
     let mut out: Vec<ScoredChunk> = Vec::new();
     for (sb, eb) in spans {
         if out.len() >= top_k {
@@ -667,6 +804,11 @@ fn best_chunks_default(text: &str, top_k: usize, max_chunk_chars: usize) -> Vec<
             continue;
         }
         let (snippet, _clipped) = truncate_chars(slice_trim, max_chunk_chars);
+        // Avoid returning obvious portal/nav/metadata chunks as “default” evidence.
+        // This is best-effort; callers can still force include_text=true if needed.
+        if chunk_penalty(&snippet) >= 120 {
+            continue;
+        }
         let start_char = byte_to_char_index(text, sb);
         let end_char = byte_to_char_index(text, eb);
         out.push(ScoredChunk {
@@ -678,13 +820,47 @@ fn best_chunks_default(text: &str, top_k: usize, max_chunk_chars: usize) -> Vec<
         });
     }
     if out.is_empty() && !text.trim().is_empty() {
-        let (snippet, _clipped) = truncate_chars(text.trim(), max_chunk_chars);
-        out.push(ScoredChunk {
-            start_char: 0,
-            end_char: text.chars().count(),
-            score: 1,
-            text: snippet,
-        });
+        // Fall back to the least-nav-like paragraph rather than taking the whole document prefix.
+        // This avoids returning obvious portal/promotional chrome when paragraphs exist but were
+        // filtered out by the "early pick" loop above.
+        let spans = find_candidate_spans(text, max_chunk_chars);
+        let mut best: Option<(u64, ScoredChunk)> = None;
+        for (sb, eb) in spans {
+            let slice = text.get(sb..eb).unwrap_or("");
+            let slice_trim = slice.trim();
+            if slice_trim.is_empty() {
+                continue;
+            }
+            if slice_trim.chars().count() < 60 {
+                continue;
+            }
+            let (snippet, _clipped) = truncate_chars(slice_trim, max_chunk_chars);
+            let pen = chunk_penalty(&snippet);
+            let start_char = byte_to_char_index(text, sb);
+            let end_char = byte_to_char_index(text, eb);
+            let cand = ScoredChunk {
+                start_char,
+                end_char,
+                score: 1,
+                text: snippet,
+            };
+            match best {
+                None => best = Some((pen, cand)),
+                Some((bp, _)) if pen < bp => best = Some((pen, cand)),
+                _ => {}
+            }
+        }
+        if let Some((_p, c)) = best {
+            out.push(c);
+        } else {
+            let (snippet, _clipped) = truncate_chars(text.trim(), max_chunk_chars);
+            out.push(ScoredChunk {
+                start_char: 0,
+                end_char: text.chars().count(),
+                score: 1,
+                text: snippet,
+            });
+        }
     }
     out
 }
@@ -946,8 +1122,29 @@ pub fn best_effort_structure_from_bytes(
     max_block_chars: usize,
 ) -> ExtractedStructure {
     let _ = final_url;
-    // Prefer HTML structure if we actually have HTML-ish bytes.
-    if bytes_look_like_html(bytes) {
+    fn html_has_pathologically_long_token(bytes: &[u8]) -> bool {
+        // `html_scraper::Html::parse_document` can be surprisingly slow on documents that contain
+        // extremely long “words” (e.g. minified bundles, base64 blobs, or adversarial pages).
+        //
+        // If we detect a huge unbroken alnum run, skip HTML parsing for structure and fall back to
+        // text-based structure on the already-extracted text.
+        let mut run: usize = 0;
+        for &b in bytes.iter().take(500_000) {
+            if b.is_ascii_alphanumeric() {
+                run = run.saturating_add(1);
+                if run >= 20_000 {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
+    }
+
+    // Prefer HTML structure if we actually have HTML-ish bytes and it's not likely to be
+    // pathological for the parser.
+    if bytes_look_like_html(bytes) && !html_has_pathologically_long_token(bytes) {
         let html = String::from_utf8_lossy(bytes).to_string();
         return extract_structure_from_html(&html, max_outline, max_blocks, max_block_chars);
     }
@@ -989,13 +1186,17 @@ pub fn best_effort_structure_from_bytes(
         "html_main" | "html2text" | "html_hint" => "text",
         other => other,
     };
-    extract_structure_from_text(
+    let mut s = extract_structure_from_text(
         engine,
         &extracted.text,
         max_outline,
         max_blocks,
         max_block_chars,
-    )
+    );
+    if bytes_look_like_html(bytes) {
+        s.warnings.push("structure_html_skipped_long_token");
+    }
+    s
 }
 
 fn content_type_lc_prefix(ct: Option<&str>) -> String {
@@ -1034,6 +1235,55 @@ fn strip_tag_blocks(html: &str, tag: &str) -> String {
     }
     out.push_str(&html[i..]);
     out
+}
+
+fn detect_client_redirect(html: &str) -> Option<String> {
+    let doc = html_scraper::Html::parse_document(html);
+    // 1. Meta refresh: <meta http-equiv="refresh" content="0; url=..." />
+    if let Ok(sel) = html_scraper::Selector::parse("meta[http-equiv]") {
+        for el in doc.select(&sel) {
+            if let Some(equiv) = el.value().attr("http-equiv") {
+                if equiv.trim().to_ascii_lowercase() == "refresh" {
+                    if let Some(content) = el.value().attr("content") {
+                        // content="0; url=http://..."
+                        // We are loose with parsing: just look for url=...
+                        if let Some(url_part) = content
+                            .split(';')
+                            .map(|p| p.trim())
+                            .find(|p| p.to_ascii_lowercase().starts_with("url="))
+                        {
+                            let url = url_part
+                                .split_once('=')
+                                .map(|(_, u)| u.trim())
+                                .unwrap_or("");
+                            if !url.is_empty() {
+                                return Some(url.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. "Click here to be redirected" patterns (common on some static site generators).
+    // Only check if the body is very short to avoid false positives.
+    if html.len() < 4000 {
+        let text = html_to_text(html, 1000);
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("click here to be redirected") || lower.contains("moved permanently") {
+            // Try to find the first link in the doc.
+            if let Ok(sel_a) = html_scraper::Selector::parse("a[href]") {
+                if let Some(el) = doc.select(&sel_a).next() {
+                    if let Some(href) = el.value().attr("href") {
+                        return Some(href.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Extract best-effort readable text from a fetched body.
@@ -1087,8 +1337,11 @@ pub fn best_effort_text_from_bytes(
                     }
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 warnings.push("pdf_extract_failed");
+                if e == "pdf_extract_panicked" {
+                    warnings.push("pdf_extract_panicked");
+                }
                 match pdf_to_text_shellout(bytes) {
                     Ok((engine, text)) => {
                         warnings.push("pdf_shellout_used");
@@ -1263,6 +1516,17 @@ pub fn best_effort_text_from_bytes(
         bytes
     };
     let html0 = String::from_utf8_lossy(html_bytes).to_string();
+
+    // Check for client-side redirects before stripping tags.
+    if let Some(target) = detect_client_redirect(&html0) {
+        warnings.push("client_side_redirect");
+        return ExtractedText {
+            engine: "redirect",
+            text: target,
+            warnings,
+        };
+    }
+
     // Strip script/style/noscript blocks before html2text to avoid counting JS/CSS as “content”.
     // This keeps “script-only” pages as empty (so higher-level fallbacks can trigger).
     let html1 = strip_tag_blocks(&html0, "script");
@@ -1291,7 +1555,22 @@ pub fn best_effort_text_from_bytes(
         // Penalize common UI boilerplate tokens (kept small + generic).
         let sl = s.to_ascii_lowercase();
         for needle in [
-            "sign up", "log in", "login", "cookie", "consent", "privacy", "terms",
+            "sign up",
+            "log in",
+            "login",
+            "cookie",
+            "consent",
+            "privacy",
+            "terms",
+            // Generic docs UI chrome signals (helps JS-heavy doc sites).
+            "skip to content",
+            "search documentation",
+            "search docs",
+            "feedback",
+            "edit this page",
+            "listen",
+            "share",
+            "follow",
         ] {
             let hits = sl.matches(needle).count() as i64;
             score -= 250 * hits;
@@ -1327,7 +1606,16 @@ pub fn best_effort_text_from_bytes(
         };
         if (best_engine != "html_main" && read_ok) || main_ok {
             // Require a gap vs full (unless full is empty).
-            if !full_ok || best_score >= s_full + 300 {
+            // For nav-heavy docs pages, "full" is often dominated by chrome; use a smaller
+            // threshold when the full text has many short lines.
+            let short_lines = full
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .filter(|l| l.chars().count() <= 30)
+                .count() as i64;
+            let threshold = if short_lines >= 80 { 120 } else { 300 };
+            if !full_ok || best_score >= s_full + threshold {
                 warnings.push("boilerplate_reduced");
                 return ExtractedText {
                     engine: best_engine,
@@ -1437,23 +1725,352 @@ pub struct ScoredChunk {
     pub text: String,
 }
 
+fn is_query_stopword(t: &str) -> bool {
+    // Stopwords are high-recall across most pages and usually harm ranking quality
+    // when treated as evidence-bearing query tokens.
+    //
+    // Keep the list centralized (shared across the workspace) rather than duplicating
+    // bespoke sets in each consumer.
+    textprep_crate::stopwords::is_english_stopword(t)
+}
+
+fn is_query_noise_token(t: &str) -> bool {
+    let s = t.trim();
+    if s.is_empty() {
+        return true;
+    }
+    // Drop ultra-common URL noise tokens that match broadly in extracted link soup.
+    // This directly improves cache-corpus precision (and reduces false overlap).
+    //
+    // Note: keep tokens like "http2" / "httpsig" etc; only drop the bare scheme-ish tokens.
+    let sl = s.to_ascii_lowercase();
+    if matches!(sl.as_str(), "http" | "https" | "www") {
+        return true;
+    }
+    // Drop tiny numeric tokens (too broad).
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return s.len() <= 2;
+    }
+    // Drop small "vN" / "vN.N" version markers.
+    if s.len() <= 6 {
+        if let Some(rest) = sl.strip_prefix('v') {
+            let rest = rest.trim();
+            if !rest.is_empty()
+                && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+                && rest.chars().any(|c| c.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+        // Drop small "rcN" markers.
+        if let Some(rest) = sl.strip_prefix("rc") {
+            let rest = rest.trim();
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn tokenize_query_for_match(query: &str) -> Vec<String> {
-    // Use the same normalization as our agent-facing `query_key`:
-    // NFC + lowercase, then a conservative token split.
+    // Use the same core normalization as other webpipe matching paths:
+    // Unicode-aware scrub (case + diacritics) plus punctuation-as-separator,
+    // then a conservative token split.
     //
     // We intentionally avoid fancy stemming here; we just want to be resilient to
     // punctuation and case differences like "MCP-stdio" vs "mcp stdio".
+    // NOTE: This tokenization directly influences ranking and cache-corpus recall.
+    // We bias toward **precision**:
+    // - drop "version noise" tokens like v1/rc1 that match broadly across many pages
+    // - drop very short purely-numeric tokens (1/2/3) that also match broadly
     let q = textprep::scrub(query);
-    q.split(|ch: char| !ch.is_alphanumeric())
+    let mut toks: Vec<String> = q
+        .split(|ch: char| !ch.is_alphanumeric())
         .filter_map(|t| {
             let t = t.trim();
-            if t.len() >= 2 {
+            if t.len() >= 2 && !is_query_noise_token(t) && !is_query_stopword(t) {
+                Some(t.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // If the query contains any “meaningful” token (len>=3), drop short tokens (len<3).
+    // This reduces false overlaps like "to" -> "tokio" after prefix matching.
+    let has_meaningful = toks.iter().any(|t| t.len() >= 3);
+    if has_meaningful {
+        toks.retain(|t| t.len() >= 3);
+    }
+    toks
+}
+
+fn tokenize_query_for_phrases(query: &str) -> Vec<String> {
+    // Similar to `tokenize_query_for_match`, but preserve order for phrase extraction.
+    // This is intentionally conservative: phrases are a bonus signal, not a primary matcher.
+    let q = textprep::scrub(query);
+    q.split_whitespace()
+        .filter_map(|t| {
+            let t = t.trim();
+            if t.len() >= 3 && !is_query_noise_token(t) && !is_query_stopword(t) {
                 Some(t.to_string())
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn build_query_phrase_matcher(query: &str) -> Option<textprep_crate::FlashText> {
+    let toks = tokenize_query_for_phrases(query);
+    if toks.len() < 2 || toks.len() > 8 {
+        return None;
+    }
+
+    let mut phrases: Vec<String> = Vec::new();
+    for i in 0..toks.len().saturating_sub(1) {
+        phrases.push(format!(" {} {} ", toks[i], toks[i + 1]));
+    }
+    if toks.len() <= 6 {
+        for i in 0..toks.len().saturating_sub(2) {
+            phrases.push(format!(" {} {} {} ", toks[i], toks[i + 1], toks[i + 2]));
+        }
+    }
+    phrases.sort();
+    phrases.dedup();
+    phrases.truncate(16);
+
+    if phrases.is_empty() {
+        return None;
+    }
+
+    let mut ft = textprep_crate::FlashText::new();
+    for p in phrases {
+        // Keyword and value are identical; we only care about match spans/count.
+        ft.add_keyword(p.clone(), p);
+    }
+    Some(ft)
+}
+
+fn phrase_bonus_for_chunk(
+    phrase_matcher: &mut Option<textprep_crate::FlashText>,
+    padded_scrub_buf: &mut String,
+    matches_buf: &mut Vec<textprep_crate::KeywordMatch>,
+    chunk_scrub: &str,
+) -> u64 {
+    let Some(ft) = phrase_matcher.as_mut() else {
+        return 0;
+    };
+
+    // Matcher patterns include leading+trailing spaces to enforce whole-token phrase boundaries.
+    padded_scrub_buf.clear();
+    padded_scrub_buf.push(' ');
+    padded_scrub_buf.push_str(chunk_scrub);
+    padded_scrub_buf.push(' ');
+
+    ft.find_into(padded_scrub_buf, matches_buf);
+    if matches_buf.is_empty() {
+        return 0;
+    }
+
+    // Trigram matches are stronger than bigrams; keep the scale modest vs token weights.
+    let mut bonus = 0u64;
+    for m in matches_buf.iter().take(8) {
+        let n = m.keyword.trim().split_whitespace().count();
+        bonus = bonus.saturating_add(match n {
+            2 => 120,
+            3 => 200,
+            _ => 150,
+        });
+    }
+    bonus
+}
+
+fn query_tok_match_strength(qtok: &str, w: &str) -> u8 {
+    // Query tokens are scrubbed ASCII alnum runs.
+    //
+    // - Numeric tokens: exact match only (404 should not match 4040).
+    // - Very short tokens: exact match only to avoid prefix false positives ("go" vs "google").
+    // - Otherwise: exact match is strongest; prefix match is a weaker fallback (timeout -> timeouts).
+    if qtok.chars().all(|c| c.is_ascii_digit()) || qtok.len() < 3 {
+        if w == qtok { 2 } else { 0 }
+    } else if w == qtok {
+        2
+    } else if w.starts_with(qtok) {
+        1
+    } else {
+        0
+    }
+}
+
+fn query_tok_matches_word(qtok: &str, w: &str) -> bool {
+    query_tok_match_strength(qtok, w) > 0
+}
+
+fn chunk_penalty(text: &str) -> u64 {
+    // Penalize chunks that look like navigation / UI boilerplate.
+    //
+    // Design goals:
+    // - Keep it deterministic and generic (no site-specific CSS class heuristics here).
+    // - Prefer “real paragraphs” over menus (many short lines) even when they share query tokens.
+    // - Avoid over-penalizing legitimate docs content: only apply heavy penalties when multiple
+    //   signals agree (e.g. many short lines + multiple nav tokens).
+    let t = text.trim();
+    if t.is_empty() {
+        return 0;
+    }
+
+    let short_lines = t
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .filter(|l| l.chars().count() <= 30)
+        .count() as u64;
+
+    let lc = t.to_ascii_lowercase();
+
+    // Table-of-contents / navigation-chrome patterns (common on docs sites).
+    //
+    // These frequently contain many query tokens (section titles) but are not evidence.
+    let toc_like = lc.contains("table of contents") || lc.contains("table-of-contents");
+    let bracket_refs = t.matches('[').count() as u64;
+    let period_count = t.matches('.').count() as u64;
+    let bracket_nav_like = bracket_refs >= 10 && period_count < 2 && t.chars().count() >= 220;
+    let promo_like = lc.contains("buy your ticket")
+        || lc.contains("join us for")
+        || lc.contains("register now")
+        || lc.contains("limited time");
+    let nav_chrome_like = (lc.contains("navigation")
+        && (lc.contains("next") || lc.contains("previous")))
+        || (lc.contains("this page") && lc.contains("report a bug") && lc.contains("show source"))
+        || (lc.contains("index")
+            && lc.contains("modules")
+            && (lc.contains("next") || lc.contains("previous")));
+
+    // “Hard” UI words: strong indicators of chrome rather than content.
+    let mut hard_hits = 0u64;
+    for needle in [
+        "sign up", "log in", "login", "register", "cookie", "consent", "privacy", "terms",
+    ] {
+        if lc.contains(needle) {
+            hard_hits += 1;
+        }
+    }
+
+    // “Soft” nav tokens: only penalize heavily when the chunk is already nav-shaped.
+    let mut nav_hits = 0u64;
+    for needle in [
+        "models",
+        "datasets",
+        "spaces",
+        "pricing",
+        "docs",
+        "documentation",
+        "about",
+        "blog",
+        "download",
+        "dependencies",
+        "repository",
+        "crates.io",
+        "license",
+        "owners",
+        "builds",
+        "badges",
+        "metadata",
+        "permalink",
+    ] {
+        if lc.contains(needle) {
+            nav_hits += 1;
+        }
+    }
+
+    // Penalize link soup in a snippet (common on portals).
+    //
+    // Important: don't treat the plain token "HTTP" (as in "HTTP 404") as link soup.
+    // Only count explicit URL-ish patterns.
+    let url_hits = (lc.matches("http://").count()
+        + lc.matches("https://").count()
+        + lc.matches("www.").count()) as u64;
+
+    // Metadata-heavy portal signals (common on “crate pages”, app listings, etc.).
+    // This is intentionally conservative: we only apply a big penalty when multiple markers appear.
+    let mut meta_hits = 0u64;
+    for needle in [
+        "dependencies",
+        "repository",
+        "crates.io",
+        "owners",
+        "license",
+        "permalink",
+    ] {
+        if lc.contains(needle) {
+            meta_hits += 1;
+        }
+    }
+
+    // Penalize extremely repetitive chunks (common when extracted text loses layout/newlines and
+    // navigation becomes a long single-line “word salad”).
+    //
+    // Keep this bounded and conservative: only trigger on long snippets with *very* low lexical
+    // diversity or long runs of the same token.
+    let repetition_like = {
+        let scrub = textprep::scrub(t);
+        let mut unique = std::collections::BTreeSet::<&str>::new();
+        let mut total = 0u64;
+        let mut max_run = 0u64;
+        let mut cur_run = 0u64;
+        let mut prev: Option<&str> = None;
+        for w in scrub.split_whitespace().take(400) {
+            total += 1;
+            unique.insert(w);
+            if prev == Some(w) {
+                cur_run += 1;
+            } else {
+                cur_run = 1;
+                prev = Some(w);
+            }
+            if cur_run > max_run {
+                max_run = cur_run;
+            }
+        }
+        let unique_count = unique.len() as u64;
+        total >= 50
+            && (unique_count.saturating_mul(100) <= total.saturating_mul(12) || max_run >= 25)
+    };
+
+    let mut p = 0u64;
+    // Many short lines is the core nav-shape signal.
+    p = p.saturating_add(short_lines.saturating_mul(4));
+    // TOC / chrome is strongly non-evidentiary, even if it contains query tokens.
+    if toc_like {
+        p = p.saturating_add(260);
+    }
+    if bracket_nav_like {
+        p = p.saturating_add(160);
+    }
+    if promo_like {
+        p = p.saturating_add(140);
+    }
+    if nav_chrome_like {
+        p = p.saturating_add(160);
+    }
+    // Hard UI tokens are strong, even without short_lines.
+    p = p.saturating_add(hard_hits.saturating_mul(60));
+    // Nav tokens should mostly matter when the chunk looks like nav (many short lines).
+    if short_lines >= 10 && nav_hits >= 2 {
+        p = p.saturating_add(220);
+    } else {
+        p = p.saturating_add(nav_hits.saturating_mul(8));
+    }
+    p = p.saturating_add(url_hits.saturating_mul(40));
+    if meta_hits >= 3 {
+        p = p.saturating_add(180);
+    }
+    if repetition_like {
+        p = p.saturating_add(200);
+    }
+    p
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
@@ -1502,6 +2119,45 @@ fn find_paragraph_spans(text: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+fn avg_bytes_per_char(text: &str) -> usize {
+    let chars = text.chars().count().max(1);
+    // Bounded estimate: UTF-8 is at most 4 bytes per char.
+    ((text.len() + chars - 1) / chars).clamp(1, 4)
+}
+
+fn find_candidate_spans(text: &str, max_chunk_chars: usize) -> Vec<(usize, usize)> {
+    let spans = find_paragraph_spans(text);
+    if spans.len() >= 2 || text.trim().is_empty() {
+        return spans;
+    }
+
+    // Fallback: when we only got 0-1 “paragraph spans”, generate more candidate spans using a
+    // recursive separator hierarchy (via `slabs`). This helps with:
+    // - text/plain pages that use single newlines
+    // - extracted HTML where blank lines were lost
+    // - “nav word-salad” pages that become one huge line
+    let max_chunk_chars = max_chunk_chars.clamp(50, 5_000);
+    let bpc = avg_bytes_per_char(text);
+    let max_size_bytes = max_chunk_chars
+        .saturating_mul(bpc)
+        // Keep this bounded; we only need “reasonable chunks”, not a perfect segmentation.
+        .clamp(120, 50_000);
+
+    let chunker = slabs_crate::RecursiveChunker::prose(max_size_bytes);
+    let slabs = chunker.chunk(text);
+    if slabs.len() < 2 {
+        return spans;
+    }
+
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(slabs.len());
+    for s in slabs.into_iter().take(500) {
+        if s.end > s.start {
+            out.push((s.start, s.end));
+        }
+    }
+    if out.len() >= 2 { out } else { spans }
+}
+
 pub fn best_chunks_for_query(
     text: &str,
     query: &str,
@@ -1511,13 +2167,33 @@ pub fn best_chunks_for_query(
     let top_k = top_k.clamp(1, 50);
     let max_chunk_chars = max_chunk_chars.clamp(50, 5_000);
 
-    let q_toks = tokenize_query_for_match(query);
+    let mut q_toks = tokenize_query_for_match(query);
+    // Dedup for determinism and to avoid accidental over-weighting of repeated query words.
+    q_toks.sort();
+    q_toks.dedup();
     if q_toks.is_empty() {
         return Vec::new();
     }
 
-    let spans = find_paragraph_spans(text);
-    let mut scored = Vec::new();
+    let mut phrase_matcher = build_query_phrase_matcher(query);
+    let mut padded_scrub_buf = String::new();
+    let mut phrase_matches_buf: Vec<textprep_crate::KeywordMatch> = Vec::new();
+
+    let spans = find_candidate_spans(text, max_chunk_chars);
+    let use_masks = q_toks.len() <= 63;
+
+    struct Cand {
+        start_char: usize,
+        end_char: usize,
+        penalty: u64,
+        phrase_bonus: u64,
+        exact_mask: u64,
+        prefix_mask: u64,
+        hits: u64,
+        text: String,
+    }
+
+    let mut cands: Vec<Cand> = Vec::new();
     for (sb, eb) in spans {
         let slice = text.get(sb..eb).unwrap_or("");
         let slice_trim = slice.trim();
@@ -1526,13 +2202,40 @@ pub fn best_chunks_for_query(
         }
 
         let slice_scrub = textprep::scrub(slice_trim);
-        let mut score = 0u64;
-        for t in &q_toks {
-            if slice_scrub.contains(t) {
-                score += 1;
+        let toks = textprep_crate::tokenize::tokenize_refs_with_offsets(&slice_scrub);
+
+        let mut hits = 0u64;
+        let mut exact_mask = 0u64;
+        let mut prefix_mask = 0u64;
+        if use_masks {
+            for tok in toks.iter().take(1_000) {
+                let w = tok.text;
+                for (i, t) in q_toks.iter().enumerate() {
+                    // Prefix match within tokens:
+                    // - keeps light “stemming-ish” behavior (timeout -> timeouts)
+                    // - avoids infix matches (art should not match cart)
+                    let bit = 1u64 << i;
+                    let strength = query_tok_match_strength(t.as_str(), w);
+                    if strength == 2 {
+                        exact_mask |= bit;
+                        prefix_mask &= !bit;
+                    } else if strength == 1 && (exact_mask & bit) == 0 {
+                        prefix_mask |= bit;
+                    }
+                }
+                if (exact_mask | prefix_mask).count_ones() as usize == q_toks.len() {
+                    break;
+                }
+            }
+            hits = (exact_mask | prefix_mask).count_ones() as u64;
+        } else {
+            for t in &q_toks {
+                if toks.iter().any(|w| query_tok_matches_word(t.as_str(), w.text)) {
+                    hits += 1;
+                }
             }
         }
-        if score == 0 {
+        if hits == 0 {
             continue;
         }
 
@@ -1540,21 +2243,94 @@ pub fn best_chunks_for_query(
         let start_char = byte_to_char_index(text, sb);
         let end_char = byte_to_char_index(text, eb);
 
-        scored.push(ScoredChunk {
+        let penalty = chunk_penalty(&snippet);
+        let phrase_bonus = phrase_bonus_for_chunk(
+            &mut phrase_matcher,
+            &mut padded_scrub_buf,
+            &mut phrase_matches_buf,
+            &slice_scrub,
+        );
+
+        cands.push(Cand {
             start_char,
             end_char,
-            score,
+            penalty,
+            phrase_bonus,
+            exact_mask,
+            prefix_mask,
+            hits,
             text: snippet,
         });
     }
 
-    scored.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.start_char.cmp(&b.start_char))
-    });
-    scored.truncate(top_k);
-    scored
+    if cands.is_empty() {
+        return Vec::new();
+    }
+
+    // If the query token set is small enough, apply a lightweight within-page rarity weighting:
+    // tokens that appear in many candidate chunks contribute less than rare tokens.
+    let mut scored: Vec<ScoredChunk> = Vec::with_capacity(cands.len());
+    if use_masks {
+        let mut df = vec![0u64; q_toks.len()];
+        for c in &cands {
+            let mut m = c.exact_mask | c.prefix_mask;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                df[i] = df[i].saturating_add(1);
+                m &= m - 1;
+            }
+        }
+        let mut weights = vec![0u64; q_toks.len()];
+        for (i, t) in q_toks.iter().enumerate() {
+            let len = t.chars().count().clamp(2, 12) as u64;
+            let dfi = df[i].max(1);
+            weights[i] = len.saturating_mul(100) / dfi;
+        }
+
+        // Prefix matches contribute less than exact matches.
+        const PREFIX_SCALE_PCT: u64 = 70;
+
+        for c in cands {
+            let mut base = 0u64;
+            // Exact hits.
+            let mut m = c.exact_mask;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                base = base.saturating_add(weights[i]);
+                m &= m - 1;
+            }
+            // Prefix hits (not exact).
+            let mut pm = c.prefix_mask;
+            while pm != 0 {
+                let i = pm.trailing_zeros() as usize;
+                base = base.saturating_add(weights[i].saturating_mul(PREFIX_SCALE_PCT) / 100);
+                pm &= pm - 1;
+            }
+            base = base.saturating_add(c.phrase_bonus);
+            let score = base.saturating_sub(c.penalty);
+            scored.push(ScoredChunk {
+                start_char: c.start_char,
+                end_char: c.end_char,
+                score,
+                text: c.text,
+            });
+        }
+    } else {
+        // Fallback for very long queries: keep the older "hits * 100" scoring.
+        for c in cands {
+            let base = c.hits.saturating_mul(100).saturating_add(c.phrase_bonus);
+            let score = base.saturating_sub(c.penalty);
+            scored.push(ScoredChunk {
+                start_char: c.start_char,
+                end_char: c.end_char,
+                score,
+                text: c.text,
+            });
+        }
+    }
+
+    scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.start_char.cmp(&b.start_char)));
+    dedupe_and_truncate_chunks(scored, top_k)
 }
 
 fn slice_chars(s: &str, start_char: usize, end_char: usize) -> String {
@@ -1565,6 +2341,40 @@ fn slice_chars(s: &str, start_char: usize, end_char: usize) -> String {
         .skip(start_char)
         .take(end_char.saturating_sub(start_char))
         .collect()
+}
+
+fn chunk_dedupe_key(text: &str) -> String {
+    // Keep this cheap + stable: normalize whitespace, lowercase, and cap the key length.
+    // This helps collapse repeated “heading + paragraph” expansions that produce identical snippets.
+    let mut words = Vec::new();
+    for w in text.split_whitespace() {
+        words.push(w);
+        if words.len() >= 80 {
+            break;
+        }
+    }
+    words.join(" ").to_ascii_lowercase()
+}
+
+fn dedupe_and_truncate_chunks(chunks: Vec<ScoredChunk>, top_k: usize) -> Vec<ScoredChunk> {
+    let mut out = Vec::new();
+    let mut seen_ranges = std::collections::BTreeSet::<(usize, usize)>::new();
+    let mut seen_text = std::collections::BTreeSet::<String>::new();
+    for c in chunks {
+        if out.len() >= top_k {
+            break;
+        }
+        let r = (c.start_char, c.end_char);
+        if !seen_ranges.insert(r) {
+            continue;
+        }
+        let k = chunk_dedupe_key(&c.text);
+        if k.is_empty() || !seen_text.insert(k) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Structure-aware chunking: prefer blocks and keep heading context.
@@ -1579,7 +2389,9 @@ pub fn best_chunks_for_query_in_structure(
     let top_k = top_k.clamp(1, 50);
     let max_chunk_chars = max_chunk_chars.clamp(50, 5_000);
 
-    let q_toks = tokenize_query_for_match(query);
+    let mut q_toks = tokenize_query_for_match(query);
+    q_toks.sort();
+    q_toks.dedup();
     if q_toks.is_empty() {
         return Vec::new();
     }
@@ -1590,13 +2402,56 @@ pub fn best_chunks_for_query_in_structure(
         return Vec::new();
     }
 
-    let mut scored: Vec<ScoredChunk> = Vec::new();
+    let mut phrase_matcher = build_query_phrase_matcher(query);
+    let mut padded_scrub_buf = String::new();
+    let mut phrase_matches_buf: Vec<textprep_crate::KeywordMatch> = Vec::new();
+    let use_masks = q_toks.len() <= 63;
+
+    struct Cand {
+        start_char: usize,
+        end_char: usize,
+        penalty: u64,
+        phrase_bonus: u64,
+        block_exact_mask: u64,
+        block_prefix_mask: u64,
+        heading_exact_mask: u64,
+        heading_prefix_mask: u64,
+        hits: u64,
+        heading_bonus_hits: u64,
+        text: String,
+    }
+
+    let mut cands: Vec<Cand> = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
         let b_scrub = textprep::scrub(&b.text);
+        let btoks = textprep_crate::tokenize::tokenize_refs_with_offsets(&b_scrub);
+
         let mut hits = 0u64;
-        for t in &q_toks {
-            if b_scrub.contains(t) {
-                hits += 1;
+        let mut block_exact_mask = 0u64;
+        let mut block_prefix_mask = 0u64;
+        if use_masks {
+            for tok in btoks.iter().take(1_000) {
+                let w = tok.text;
+                for (qi, t) in q_toks.iter().enumerate() {
+                    let bit = 1u64 << qi;
+                    let strength = query_tok_match_strength(t.as_str(), w);
+                    if strength == 2 {
+                        block_exact_mask |= bit;
+                        block_prefix_mask &= !bit;
+                    } else if strength == 1 && (block_exact_mask & bit) == 0 {
+                        block_prefix_mask |= bit;
+                    }
+                }
+                if (block_exact_mask | block_prefix_mask).count_ones() as usize == q_toks.len() {
+                    break;
+                }
+            }
+            hits = (block_exact_mask | block_prefix_mask).count_ones() as u64;
+        } else {
+            for t in &q_toks {
+                if btoks.iter().any(|w| query_tok_matches_word(t.as_str(), w.text)) {
+                    hits += 1;
+                }
             }
         }
         if hits == 0 {
@@ -1605,7 +2460,9 @@ pub fn best_chunks_for_query_in_structure(
 
         // Find nearest preceding heading (bounded lookback).
         let mut j = i;
-        let mut heading_bonus = 0u64;
+        let mut heading_exact_mask = 0u64;
+        let mut heading_prefix_mask = 0u64;
+        let mut heading_bonus_hits = 0u64;
         for back in 0..=10usize {
             if i < back {
                 break;
@@ -1615,9 +2472,32 @@ pub fn best_chunks_for_query_in_structure(
                 j = k;
                 // If the heading itself matches tokens, reward it.
                 let h_scrub = textprep::scrub(&blocks[k].text);
-                for t in &q_toks {
-                    if h_scrub.contains(t) {
-                        heading_bonus += 2;
+                let htoks = textprep_crate::tokenize::tokenize_refs_with_offsets(&h_scrub);
+
+                if use_masks {
+                    for tok in htoks.iter().take(400) {
+                        let w = tok.text;
+                        for (qi, t) in q_toks.iter().enumerate() {
+                            let bit = 1u64 << qi;
+                            let strength = query_tok_match_strength(t.as_str(), w);
+                            if strength == 2 {
+                                heading_exact_mask |= bit;
+                                heading_prefix_mask &= !bit;
+                            } else if strength == 1 && (heading_exact_mask & bit) == 0 {
+                                heading_prefix_mask |= bit;
+                            }
+                        }
+                        if (heading_exact_mask | heading_prefix_mask).count_ones() as usize
+                            == q_toks.len()
+                        {
+                            break;
+                        }
+                    }
+                } else {
+                    for t in &q_toks {
+                        if htoks.iter().any(|w| query_tok_matches_word(t.as_str(), w.text)) {
+                            heading_bonus_hits = heading_bonus_hits.saturating_add(2);
+                        }
                     }
                 }
                 break;
@@ -1650,21 +2530,119 @@ pub fn best_chunks_for_query_in_structure(
         }
         let (snippet, _clipped) = truncate_chars(raw_trim, max_chunk_chars);
 
-        scored.push(ScoredChunk {
+        let penalty = chunk_penalty(&snippet);
+        let raw_scrub = textprep::scrub(raw_trim);
+        let phrase_bonus = phrase_bonus_for_chunk(
+            &mut phrase_matcher,
+            &mut padded_scrub_buf,
+            &mut phrase_matches_buf,
+            &raw_scrub,
+        );
+
+        cands.push(Cand {
             start_char,
             end_char,
-            score: hits + heading_bonus,
+            penalty,
+            phrase_bonus,
+            block_exact_mask,
+            block_prefix_mask,
+            heading_exact_mask,
+            heading_prefix_mask,
+            hits,
+            heading_bonus_hits,
             text: snippet,
         });
     }
 
-    scored.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.start_char.cmp(&b.start_char))
-    });
-    scored.truncate(top_k);
-    scored
+    if cands.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<ScoredChunk> = Vec::with_capacity(cands.len());
+    if use_masks {
+        let mut df = vec![0u64; q_toks.len()];
+        for c in &cands {
+            let mut m = c.block_exact_mask
+                | c.block_prefix_mask
+                | c.heading_exact_mask
+                | c.heading_prefix_mask;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                df[i] = df[i].saturating_add(1);
+                m &= m - 1;
+            }
+        }
+        let mut weights = vec![0u64; q_toks.len()];
+        for (i, t) in q_toks.iter().enumerate() {
+            let len = t.chars().count().clamp(2, 12) as u64;
+            let dfi = df[i].max(1);
+            weights[i] = len.saturating_mul(100) / dfi;
+        }
+
+        // Prefix matches contribute less than exact matches.
+        const PREFIX_SCALE_PCT: u64 = 70;
+
+        for c in cands {
+            let mut base = 0u64;
+            let mut m = c.block_exact_mask;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                base = base.saturating_add(weights[i]);
+                m &= m - 1;
+            }
+            let mut pm = c.block_prefix_mask;
+            while pm != 0 {
+                let i = pm.trailing_zeros() as usize;
+                base =
+                    base.saturating_add(weights[i].saturating_mul(PREFIX_SCALE_PCT) / 100);
+                pm &= pm - 1;
+            }
+            let mut hm = c.heading_exact_mask;
+            while hm != 0 {
+                let i = hm.trailing_zeros() as usize;
+                base = base.saturating_add(weights[i].saturating_mul(2));
+                hm &= hm - 1;
+            }
+            let mut hpm = c.heading_prefix_mask;
+            while hpm != 0 {
+                let i = hpm.trailing_zeros() as usize;
+                base = base.saturating_add(
+                    weights[i]
+                        .saturating_mul(2)
+                        .saturating_mul(PREFIX_SCALE_PCT)
+                        / 100,
+                );
+                hpm &= hpm - 1;
+            }
+            base = base.saturating_add(c.phrase_bonus);
+            let score = base.saturating_sub(c.penalty);
+            scored.push(ScoredChunk {
+                start_char: c.start_char,
+                end_char: c.end_char,
+                score,
+                text: c.text,
+            });
+        }
+    } else {
+        // Fallback for very long queries: keep older "hits * 100" scoring.
+        for c in cands {
+            let base = c
+                .hits
+                .saturating_add(c.heading_bonus_hits)
+                .saturating_mul(100)
+                .saturating_add(c.phrase_bonus);
+            let score = base.saturating_sub(c.penalty);
+            scored.push(ScoredChunk {
+                start_char: c.start_char,
+                end_char: c.end_char,
+                score,
+                text: c.text,
+            });
+        }
+    }
+
+    scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.start_char.cmp(&b.start_char)));
+    dedupe_and_truncate_chunks(scored, top_k)
 }
 
 #[cfg(test)]
@@ -1684,6 +2662,17 @@ mod tests {
         assert!(bytes_look_like_pdf(b"%PDF-1.7\n%..."));
         assert!(!bytes_look_like_pdf(b"<!doctype html><html>"));
         assert!(!bytes_look_like_pdf(b""));
+    }
+
+    #[test]
+    fn pdf_to_text_never_panics_on_malformed_pdf_bytes() {
+        // `pdf_extract::extract_text_from_mem` has had panics on some malformed PDFs.
+        // Our wrapper must convert panics into a normal error so higher-level flows
+        // (like cache-corpus scanning) can keep going.
+        let bad = b"WEBPIPE_TEST_PDF_EXTRACT_PANIC not actually a pdf";
+        let r = pdf_to_text(bad);
+        assert!(r.is_err());
+        assert_eq!(r.err().unwrap_or_default(), "pdf_extract_panicked");
     }
 
     #[test]
@@ -1727,6 +2716,170 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_text_from_bytes_prefers_main_when_full_is_nav_heavy() {
+        // This simulates JS-heavy docs pages where the "full page" text is mostly chrome.
+        let html = r#"
+        <!doctype html>
+        <html><body>
+          <nav>
+            <a href="/">Skip to content</a>
+            <div>Search documentation... ⌘K</div>
+            <ul>
+              <li>Getting Started</li>
+              <li>Installation</li>
+              <li>Project Structure</li>
+              <li>API Reference</li>
+            </ul>
+          </nav>
+          <main>
+            <h1>headers</h1>
+            <p>headers is an async function that allows you to read the HTTP incoming request headers.</p>
+            <pre><code>const h = await headers()</code></pre>
+          </main>
+          <footer>Privacy Terms</footer>
+        </body></html>
+        "#;
+        let ex = best_effort_text_from_bytes(
+            html.as_bytes(),
+            Some("text/html"),
+            "https://example.com/docs",
+            100,
+            20_000,
+        );
+        // We don't care whether it chooses readability vs html_main, but it should avoid "full page".
+        assert!(
+            ex.engine == "readability" || ex.engine == "html_main",
+            "expected main-like engine, got: {}",
+            ex.engine
+        );
+        assert!(ex
+            .text
+            .to_lowercase()
+            .contains("headers is an async function"));
+        assert!(!ex.text.to_lowercase().contains("getting started"));
+        assert!(ex.warnings.contains(&"boilerplate_reduced"));
+    }
+
+    #[test]
+    fn tokenize_query_for_match_drops_version_noise_tokens() {
+        // Version tokens like "v1"/"rc1" are extremely high-recall and degrade ranking
+        // (especially in cache-corpus mode).
+        let toks = tokenize_query_for_match("predicateType slsa provenance v1 rc1 2 2022");
+        assert!(toks.contains(&"predicatetype".to_string()) || toks.contains(&"predicate".to_string()));
+        assert!(toks.contains(&"slsa".to_string()));
+        assert!(toks.contains(&"provenance".to_string()));
+        assert!(!toks.contains(&"v1".to_string()), "toks={toks:?}");
+        assert!(!toks.contains(&"rc1".to_string()), "toks={toks:?}");
+        assert!(!toks.contains(&"2".to_string()), "toks={toks:?}");
+        // Keep year-like tokens (useful for papers).
+        assert!(toks.contains(&"2022".to_string()), "toks={toks:?}");
+    }
+
+    #[test]
+    fn tokenize_query_for_match_keeps_http_status_codes() {
+        // Three-digit numeric tokens are often meaningful (HTTP status codes, RFC numbers, etc.).
+        let toks = tokenize_query_for_match("HTTP status 404 403");
+        assert!(toks.contains(&"status".to_string()), "toks={toks:?}");
+        assert!(toks.contains(&"404".to_string()), "toks={toks:?}");
+        assert!(toks.contains(&"403".to_string()), "toks={toks:?}");
+    }
+
+    #[test]
+    fn tokenize_query_for_match_drops_url_noise_tokens() {
+        let toks = tokenize_query_for_match("http https www status code");
+        assert!(!toks.contains(&"http".to_string()), "toks={toks:?}");
+        assert!(!toks.contains(&"https".to_string()), "toks={toks:?}");
+        assert!(!toks.contains(&"www".to_string()), "toks={toks:?}");
+        assert!(toks.contains(&"status".to_string()), "toks={toks:?}");
+        assert!(toks.contains(&"code".to_string()), "toks={toks:?}");
+    }
+
+    #[test]
+    fn tokenize_query_for_match_drops_stopwords_when_other_tokens_exist() {
+        let toks = tokenize_query_for_match("How to use tokio timeout");
+        assert!(toks.contains(&"tokio".to_string()), "toks={toks:?}");
+        assert!(toks.contains(&"timeout".to_string()), "toks={toks:?}");
+        assert!(!toks.contains(&"how".to_string()), "toks={toks:?}");
+        assert!(!toks.contains(&"to".to_string()), "toks={toks:?}");
+    }
+
+    #[test]
+    fn query_aware_truncation_keeps_evidence_beyond_nav_prefix() {
+        // Simulate a JS-heavy docs page where extraction produces a long nav-ish prefix
+        // and the actual content (with query tokens) occurs later.
+        let mut s = String::new();
+        for _ in 0..600 {
+            s.push_str("Menu\nDocs\nAPI\nGuides\n");
+        }
+        s.push_str("\n\n");
+        s.push_str("Actual content starts here.\n\n");
+        s.push_str("The headers() function returns a read-only Headers object.\n");
+        s.push_str("It can be used in Server Components and Route Handlers.\n");
+
+        let extracted0 = ExtractedText {
+            engine: "html2text",
+            text: s,
+            warnings: vec![],
+        };
+        let cfg = ExtractPipelineCfg {
+            query: Some("headers function"),
+            width: 120,
+            max_chars: 400, // smaller than the nav prefix; forces truncation
+            top_chunks: 3,
+            max_chunk_chars: 200,
+            include_structure: false,
+            max_outline_items: 40,
+            max_blocks: 20,
+            max_block_chars: 200,
+        };
+        let r = extract_pipeline_from_extracted(b"", None, "https://nextjs.org/docs", extracted0, cfg);
+        assert!(r.text_truncated);
+        assert!(r.extracted.warnings.contains(&"text_windowed_for_query"));
+        assert!(
+            r.extracted.text.to_ascii_lowercase().contains("headers"),
+            "windowed text should include evidence: {}",
+            r.extracted.text
+        );
+        assert!(!r.chunks.is_empty(), "expected evidence chunks");
+        assert!(
+            r.chunks[0].text.to_ascii_lowercase().contains("headers"),
+            "expected top chunk to match query: {:?}",
+            r.chunks.get(0).map(|c| &c.text)
+        );
+    }
+
+    #[test]
+    fn structure_extraction_skips_html_parse_on_pathologically_long_tokens() {
+        // A single enormous alnum run can make HTML structure parsing slow; we should fall back to
+        // text-based structure in that case.
+        let html = format!(
+            "<html><body><main><h1>Doc</h1><p>{}</p></main></body></html>",
+            "x".repeat(25_000)
+        );
+        let extracted = ExtractedText {
+            engine: "html2text",
+            text: "Doc\n\nx".to_string(),
+            warnings: vec![],
+        };
+        let s = best_effort_structure_from_bytes(
+            html.as_bytes(),
+            Some("text/html"),
+            "https://example.com/",
+            &extracted,
+            25,
+            40,
+            400,
+        );
+        assert!(
+            s.warnings.contains(&"structure_html_skipped_long_token"),
+            "warnings={:?}",
+            s.warnings
+        );
+        // Should still produce some blocks from extracted text.
+        assert!(!s.blocks.is_empty());
+    }
+
+    #[test]
     fn best_chunks_for_query_prefers_matching_paragraphs() {
         let text = "alpha beta\n\nbravo CHARLIE delta\n\nzzz";
         let chunks = best_chunks_for_query(text, "charlie", 5, 200);
@@ -1741,6 +2894,128 @@ mod tests {
         let chunks = best_chunks_for_query(text, "MCP stdio transport", 5, 200);
         assert!(!chunks.is_empty());
         assert!(chunks[0].score >= 2);
+    }
+
+    #[test]
+    fn best_chunks_for_query_avoids_infix_false_positives() {
+        // `art` should not match `cartography` (infix), but should match a real `art` token.
+        let text = "cartography is a word\n\nart is evidence\n";
+        let chunks = best_chunks_for_query(text, "art", 3, 240);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks[0].text.to_ascii_lowercase().contains("art is evidence"),
+            "expected real art paragraph; got: {:?}",
+            chunks[0].text
+        );
+    }
+
+    #[test]
+    fn best_chunks_for_query_short_tokens_require_exact_match() {
+        // Short query tokens like "go" are ambiguous. We should avoid prefix false positives
+        // like "go" matching "google" when the query is only the short token.
+        let text = "google is a company\n\ngo is a language\n";
+        let chunks = best_chunks_for_query(text, "go", 3, 240);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks[0].text.to_ascii_lowercase().contains("go is a language"),
+            "expected real 'go' paragraph first; got: {:?}",
+            chunks[0].text
+        );
+    }
+
+    #[test]
+    fn best_chunks_for_query_prefers_rare_token_over_generic_tie() {
+        // Regression: when two chunks match the same number of query tokens, we should prefer
+        // the chunk containing the rarer/more-specific token (within-page), not just the earlier chunk.
+        //
+        // Here, paragraph 1 matches {install, timeout} and paragraph 4 matches {tokio, install}.
+        // Without rarity weighting, this can tie and pick paragraph 1 due to ordering.
+        let p1 = "Install steps are documented. Use a client-side deadline for requests.";
+        let p2 = "A timeout can be enforced at the transport layer for reliability.";
+        let p3 = "Timeout values should be chosen based on tail latency and retries.";
+        let p4 = "Tokio install is straightforward: add tokio to Cargo.toml and use tokio::time.";
+        let text = format!("{p1}\n\n{p2}\n\n{p3}\n\n{p4}\n");
+
+        let chunks = best_chunks_for_query(&text, "tokio install timeout", 3, 240);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks[0].text.to_ascii_lowercase().contains("tokio install"),
+            "expected tokio paragraph first; got: {:?}",
+            chunks[0].text
+        );
+    }
+
+    #[test]
+    fn best_chunks_for_query_prefers_exact_token_over_prefix_false_positive() {
+        // Regression: exact token matches should beat prefix-only matches when both chunks
+        // otherwise look comparable (common in docs where "art" vs "article", "net" vs "network", etc.).
+        let p1 = "This article covers tokio runtime basics.";
+        // Keep tokens non-adjacent so phrase bonus doesn't decide the test.
+        let p2 = "This art gallery mentions the tokio runtime too.";
+        let text = format!("{p1}\n\n{p2}\n");
+
+        let chunks = best_chunks_for_query(&text, "art tokio", 3, 240);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks[0].text.to_ascii_lowercase().contains("art gallery"),
+            "expected exact 'art' paragraph first; got: {:?}",
+            chunks[0].text
+        );
+    }
+
+    #[test]
+    fn best_chunks_for_query_downranks_nav_like_chunks() {
+        // Nav-shaped text often contains query tokens but should not beat a real paragraph.
+        let nav = [
+            "Docs", "Models", "Datasets", "Spaces", "Pricing", "Sign up", "Log in", "GLiNER",
+        ]
+        .join("\n");
+        let content =
+            "GLiNER is a span-based NER model. It takes text input and produces labeled spans.";
+        let text = format!("{nav}\n\n{content}\n");
+
+        let chunks = best_chunks_for_query(&text, "gliner model input", 3, 240);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks[0].text.contains("span-based NER model"),
+            "expected content paragraph first; got: {:?}",
+            chunks[0].text
+        );
+    }
+
+    #[test]
+    fn best_chunks_for_query_downranks_table_of_contents_like_chunks() {
+        // TOC chunks often contain query tokens (section titles) but are not evidence.
+        let toc = "Table of Contents Coroutines and Tasks Coroutines Awaitables Creating Tasks Task Cancellation Task Groups \
+Sleeping Running Tasks Concurrently Shielding From Cancellation Timeouts Waiting Primitives Scheduling From Other Threads";
+        let content = "Use asyncio.timeout() to apply a timeout to a block of async code. This section explains the semantics.";
+        let text = format!("{toc}\n\n{content}\n");
+
+        let chunks = best_chunks_for_query(&text, "timeout", 3, 240);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks[0].text.to_lowercase().contains("asyncio.timeout"),
+            "expected content paragraph first; got: {:?}",
+            chunks[0].text
+        );
+    }
+
+    #[test]
+    fn best_chunks_for_query_downranks_promo_like_chunks_even_with_token_hits() {
+        let promo = "Join us for four days of incredible opportunities. Buy your ticket now! Timeout Timeout Timeout";
+        let content = "Timeouts in distributed systems should be enforced at the client and server with clear semantics.";
+        let text = format!("{promo}\n\n{content}\n");
+
+        let chunks = best_chunks_for_query(&text, "timeout", 3, 240);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks[0]
+                .text
+                .to_lowercase()
+                .contains("distributed systems"),
+            "expected content paragraph first; got: {:?}",
+            chunks[0].text
+        );
     }
 
     #[test]
@@ -1778,6 +3053,37 @@ mod tests {
     }
 
     #[test]
+    fn chunk_penalty_counts_urls_but_not_plain_http_words() {
+        let http_words =
+            "HTTP 404 Not Found indicates the origin server did not find a current representation.";
+        let p_words = chunk_penalty(http_words);
+        assert!(
+            p_words < 40,
+            "expected low/no url penalty for plain HTTP words; p={p_words}"
+        );
+
+        let link_soup =
+            "See http://example.com and https://foo.invalid (also www.example.org for docs).";
+        let p_links = chunk_penalty(link_soup);
+        assert!(
+            p_links >= 120,
+            "expected url penalty for explicit URLs; p={p_links}"
+        );
+    }
+
+    #[test]
+    fn chunk_penalty_downranks_repetitive_nav_filler() {
+        // Keep this within typical chunk caps (e.g. max_chunk_chars=300).
+        let nav = "nav ".repeat(75);
+        let p = chunk_penalty(&nav);
+        assert!(
+            p >= 120,
+            "expected repetitive filler to be nav-like; p={p} text_len={}",
+            nav.len()
+        );
+    }
+
+    #[test]
     fn extract_pipeline_falls_back_when_query_has_no_overlap() {
         let text = r#"
 Intro paragraph with enough length to pass the chunk minimum.
@@ -1804,6 +3110,61 @@ Second paragraph also long enough to be a usable chunk for humans.
         assert!(
             !r.chunks.is_empty(),
             "expected fallback chunks when query matching yields none"
+        );
+    }
+
+    #[test]
+    fn extract_pipeline_fallback_prefers_non_promo_paragraph_over_prefix() {
+        let promo = "Join us for four days of incredible opportunities. Buy your ticket now!";
+        let content =
+            "This paragraph contains substantive documentation text and should be preferred.";
+        let text = format!("{promo}\n\n{content}\n");
+        let extracted0 = ExtractedText {
+            engine: "text",
+            text,
+            warnings: vec![],
+        };
+        let cfg = ExtractPipelineCfg {
+            query: Some("definitely-not-present"),
+            width: 80,
+            max_chars: 10_000,
+            top_chunks: 3,
+            max_chunk_chars: 240,
+            include_structure: false,
+            max_outline_items: 0,
+            max_blocks: 0,
+            max_block_chars: 0,
+        };
+        let r = extract_pipeline_from_extracted(
+            &[],
+            Some("text/plain"),
+            "https://example.com",
+            extracted0,
+            cfg,
+        );
+        assert!(!r.chunks.is_empty());
+        assert!(
+            r.chunks[0].text.contains("substantive documentation"),
+            "expected fallback to avoid promo prefix; got: {:?}",
+            r.chunks[0].text
+        );
+    }
+
+    #[test]
+    fn detect_client_redirect_finds_meta_refresh() {
+        let html = r#"<html><head><meta http-equiv="refresh" content="0; url=https://example.com/" /></head></html>"#;
+        assert_eq!(
+            detect_client_redirect(html),
+            Some("https://example.com/".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_client_redirect_finds_click_here() {
+        let html = r#"<html><body><p>Click here to be redirected.</p><a href="https://example.com/">Link</a></body></html>"#;
+        assert_eq!(
+            detect_client_redirect(html),
+            Some("https://example.com/".to_string())
         );
     }
 }

@@ -14,11 +14,28 @@ fn webpipe_live_url_seed_smoke_opt_in() {
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
+        use anyhow::anyhow;
         use rmcp::{
             model::CallToolRequestParam,
             service::ServiceExt,
             transport::{ConfigureCommandExt, TokioChildProcess},
         };
+
+        fn payload_from_result(
+            r: &rmcp::model::CallToolResult,
+        ) -> Result<serde_json::Value, anyhow::Error> {
+            if let Some(v) = r.structured_content.clone() {
+                return Ok(v);
+            }
+            for c in &r.content {
+                if let Some(t) = c.as_text() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t.text) {
+                        return Ok(v);
+                    }
+                }
+            }
+            Err(anyhow!("missing structured_content/JSON text content"))
+        }
 
         let bin = assert_cmd::cargo::cargo_bin!("webpipe");
         let service = ()
@@ -43,8 +60,7 @@ fn webpipe_live_url_seed_smoke_opt_in() {
             "webpipe_meta",
             "web_fetch",
             "web_extract",
-            "web_search_extract",
-            "web_deep_research",
+            "search_evidence",
         ] {
             assert!(names.contains(must_have), "missing tool {must_have}");
         }
@@ -78,13 +94,7 @@ fn webpipe_live_url_seed_smoke_opt_in() {
                     ),
                 })
                 .await?;
-            let text = r
-                .content
-                .first()
-                .and_then(|c| c.as_text())
-                .map(|t| t.text.clone())
-                .unwrap_or_default();
-            let v: serde_json::Value = serde_json::from_str(&text)?;
+            let v: serde_json::Value = payload_from_result(&r)?;
             assert_eq!(v["schema_version"].as_u64(), Some(2));
             assert_eq!(v["kind"].as_str(), Some("web_fetch"));
             assert_eq!(v["request"]["fetch_backend"].as_str(), Some("local"));
@@ -108,16 +118,50 @@ fn webpipe_live_url_seed_smoke_opt_in() {
                     ),
                 })
                 .await?;
-            let text = r
-                .content
-                .first()
-                .and_then(|c| c.as_text())
-                .map(|t| t.text.clone())
-                .unwrap_or_default();
-            let v: serde_json::Value = serde_json::from_str(&text)?;
+            let v: serde_json::Value = payload_from_result(&r)?;
             assert_eq!(v["schema_version"].as_u64(), Some(2));
             assert_eq!(v["kind"].as_str(), Some("web_extract"));
             assert_eq!(v["request"]["fetch_backend"].as_str(), Some("local"));
+
+            // Unified pipeline (urls-mode): ensure the primary workflow runs end-to-end.
+            let r = service
+                .call_tool(CallToolRequestParam {
+                    name: "search_evidence".into(),
+                    arguments: Some(
+                        serde_json::json!({
+                            "query": "seed smoke",
+                            "urls": [url],
+                            "url_selection_mode": "preserve",
+                            "fetch_backend": "local",
+                            "agentic": false,
+                            "max_urls": 1,
+                            "max_chars": 6000,
+                            "top_chunks": 3,
+                            "max_chunk_chars": 400,
+                            "include_text": false,
+                            "include_links": false,
+                            "compact": true,
+                            "timeout_ms": 20_000,
+                            "deadline_ms": 25_000
+                        })
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                    ),
+                })
+                .await?;
+            let v: serde_json::Value = payload_from_result(&r)?;
+            assert_eq!(v["schema_version"].as_u64(), Some(2));
+            assert!(
+                matches!(
+                    v["kind"].as_str(),
+                    Some("web_search_extract") | Some("search_evidence")
+                ),
+                "unexpected kind: {:?}",
+                v.get("kind").and_then(|k| k.as_str())
+            );
+            assert!(v["ok"].is_boolean());
+            assert!(v["top_chunks"].is_array(), "expected top_chunks array");
         }
 
         Ok::<(), anyhow::Error>(())

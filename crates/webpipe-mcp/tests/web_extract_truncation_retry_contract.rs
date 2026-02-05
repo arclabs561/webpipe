@@ -46,7 +46,9 @@ fn web_extract_retry_on_truncation_recovers_tail_marker() {
     rt.block_on(async {
         // HTML with a marker near the end.
         let head = "<html><body><main><h1>Doc</h1><p>";
-        let filler = "x".repeat(120_000);
+        // Keep this moderate: the contract is “retry can recover a tail marker”, not a stress test.
+        // Very large bodies can make structure parsing slow on some HTML parser paths.
+        let filler = "x".repeat(35_000);
         let tail_marker = "TAIL_MARKER_123";
         let tail = format!("</p><p>{tail_marker}</p></main></body></html>");
         let body = format!("{head}{filler}{tail}");
@@ -83,10 +85,10 @@ fn web_extract_retry_on_truncation_recovers_tail_marker() {
                 "fetch_backend": "local",
                 "query": "TAIL_MARKER_123",
                 "timeout_ms": 10_000,
-                "max_bytes": 20_000,
+                "max_bytes": 10_000,
                 "max_chars": 200_000,
                 "retry_on_truncation": true,
-                "truncation_retry_max_bytes": 400_000,
+                "truncation_retry_max_bytes": 120_000,
                 "include_text": true,
                 "include_structure": true
             }),

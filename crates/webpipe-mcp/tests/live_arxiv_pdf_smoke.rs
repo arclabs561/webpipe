@@ -97,9 +97,12 @@ fn webpipe_live_arxiv_pdf_smoke_opt_in() {
             engine.starts_with("pdf-"),
             "expected pdf engine, got {engine}"
         );
-        assert!(v["chunks"].is_array(), "expected chunks array");
         assert!(
-            !v["chunks"].as_array().unwrap().is_empty(),
+            v["extract"]["chunks"].is_array(),
+            "expected extract.chunks array"
+        );
+        assert!(
+            !v["extract"]["chunks"].as_array().unwrap().is_empty(),
             "expected at least one chunk"
         );
 

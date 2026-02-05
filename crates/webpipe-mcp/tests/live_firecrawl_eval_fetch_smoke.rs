@@ -12,16 +12,19 @@ fn get_env_any(keys: &[&str]) -> Option<String> {
 #[test]
 fn webpipe_live_firecrawl_eval_fetch_smoke_opt_in() {
     // This test makes real paid network calls. Opt-in only.
-    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1") {
-        eprintln!("skipping: set WEBPIPE_LIVE=1 to run live firecrawl eval-fetch smoke");
+    if std::env::var("WEBPIPE_LIVE").ok().as_deref() != Some("1")
+        || std::env::var("WEBPIPE_LIVE_PAID").ok().as_deref() != Some("1")
+    {
+        eprintln!(
+            "skipping: set WEBPIPE_LIVE=1 WEBPIPE_LIVE_PAID=1 to run live firecrawl eval-fetch smoke"
+        );
         return;
     }
 
     let firecrawl_key = match get_env_any(&["WEBPIPE_FIRECRAWL_API_KEY", "FIRECRAWL_API_KEY"]) {
         Some(k) => k,
         None => {
-            eprintln!("skipping: missing WEBPIPE_FIRECRAWL_API_KEY (or FIRECRAWL_API_KEY)");
-            return;
+            panic!("missing WEBPIPE_FIRECRAWL_API_KEY (or FIRECRAWL_API_KEY)");
         }
     };
 
