@@ -186,6 +186,9 @@ pub(crate) fn warning_hint(code: &str) -> Option<&'static str> {
         "openreview_pdf_fallback_to_api" => Some(
             "PDF extraction for this OpenReview paper was degraded, so webpipe fell back to the OpenReview notes API (api.openreview.net) to extract higher-signal metadata (title/abstract) as evidence.",
         ),
+        "paper_backend_failed" => Some(
+            "All paper search backends failed (Semantic Scholar / OpenAlex are free-tier and may rate-limit). Try again after a brief wait, narrow the query, or use arxiv_search instead (uses arXiv Atom API, more stable). For Google Scholar coverage, set WEBPIPE_SERPAPI_API_KEY.",
+        ),
         _ => None,
     }
 }

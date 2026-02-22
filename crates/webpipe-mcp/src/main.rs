@@ -5172,11 +5172,40 @@ mod mcp {
             md.push('\n');
         }
 
+        // Config-aware "Next" section: guide the user based on what's actually available.
+        let available_providers = payload
+            .get("available")
+            .and_then(|a| a.get("providers"))
+            .and_then(|p| p.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let perplexity_available = payload
+            .get("available")
+            .and_then(|a| a.get("tools"))
+            .and_then(|t| t.get("web_perplexity"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         md.push_str("## Next\n\n");
         md.push_str("- Use `search_evidence` for any question requiring web evidence (search + extract + ranked chunks).\n");
         md.push_str("- Use `web_extract` when you already have a URL and need readable text.\n");
         md.push_str("- Use `arxiv_search` for academic papers; `arxiv_enrich` for metadata on a specific paper.\n");
         md.push_str("- Pass `minimal_output=true` to `search_evidence` for a compact response (top_chunks + warning_codes only, ~10x smaller). Default is full response.\n");
+
+        // Show search setup hint only when no providers are configured.
+        if available_providers == 0 {
+            md.push_str("\n**Search not configured** — `search_evidence` works in urls=[...] mode without keys, ");
+            md.push_str("but query-mode requires a search provider. Set one of:\n");
+            md.push_str("- `WEBPIPE_BRAVE_API_KEY` (Brave Search — recommended)\n");
+            md.push_str("- `WEBPIPE_TAVILY_API_KEY` (Tavily)\n");
+            md.push_str("- `WEBPIPE_SEARXNG_ENDPOINT` (self-hosted SearXNG)\n");
+        }
+
+        // Show Perplexity tip only when it is available.
+        if perplexity_available {
+            md.push_str("- Use `web_perplexity` for fast single-turn synthesis with live citations (Perplexity Sonar).\n");
+        }
+
         md
     }
 
@@ -9318,7 +9347,7 @@ mod mcp {
         }
 
         #[tool(
-            description = "Best for: searching academic papers across Semantic Scholar, OpenAlex, and optionally Google Scholar (via SerpAPI). Broader than arxiv_search — covers non-arXiv venues and richer citation metadata. Not this when you want arXiv-specific fields or PDF links — use arxiv_search instead. Output: papers[] with title, abstract, authors, venue, citation counts.",
+            description = "Best for: searching academic papers across Semantic Scholar and OpenAlex (free, no key required) or Google Scholar (requires WEBPIPE_SERPAPI_API_KEY). Broader venue coverage than arxiv_search. Caution: Semantic Scholar / OpenAlex are free-tier and may rate-limit; if you get paper_backend_failed, retry or use arxiv_search (more reliable). Output: papers[] with title, abstract, authors, venue, citation counts.",
             input_schema = Arc::new(tool_input_schema_draft07::<PaperSearchArgs>()),
             annotations(title = "Paper search", read_only_hint = true, open_world_hint = true)
         )]
@@ -11158,7 +11187,7 @@ mod mcp {
         }
 
         #[tool(
-            description = "Best for: any question requiring web evidence — research, current info, library docs, papers, or any query where you don't know the exact URL. Not this when you already have the URL — use web_extract. Not this for raw bytes/status — use web_fetch.\n\nOutput (full by default): top_chunks[] + results[] + request + search.steps + warning_codes. Set minimal_output=true for a compact response (~10x smaller): top_chunks + warning_codes only.\n\nModes:\n- search-mode (default): pass query=... to search then extract\n- urls-mode: pass urls=[...] to skip search and extract directly (deterministic)\n- cache-corpus: pass query=... + no_network=true to search local cache only\n\nPresets (exploration param): balanced (default) | deep (agentic discovery) | smart (balanced+agentic).\nFor full page text: set include_text=true (bounded by max_chars).\nFor JS-heavy pages: set fetch_backend=render (requires Playwright) or fetch_backend=firecrawl.",
+            description = "Best for: any question requiring web evidence — research, current info, library docs, papers, or any query where you don't know the exact URL. Not this when you already have the URL — use web_extract. Not this for raw bytes/status — use web_fetch.\n\nOutput (full by default): top_chunks[] + results[] + request + search.steps + warning_codes. Set minimal_output=true for a compact response (~10x smaller): top_chunks + warning_codes only.\n\nModes:\n- urls-mode: pass urls=[...] — NO API KEY REQUIRED, works out of the box\n- search-mode: pass query=... — requires a search provider key (WEBPIPE_BRAVE_API_KEY etc.)\n- cache-corpus: pass query=... + no_network=true to search local cache only\n\nPresets (exploration param): balanced (default) | deep (agentic discovery) | smart (balanced+agentic).\nFor full page text: set include_text=true (bounded by max_chars).\nFor JS-heavy pages: set fetch_backend=render (requires Playwright) or fetch_backend=firecrawl.",
             input_schema = Arc::new(tool_input_schema_draft07::<WebSearchExtractArgs>()),
             annotations(title = "Evidence pack", read_only_hint = true, open_world_hint = true)
         )]
@@ -12005,7 +12034,7 @@ mod mcp {
                         "error": error_obj(
                             ErrorCode::SearchFailed,
                             "search failed",
-                            "Fix the search error above (keys/config), or provide urls=[...] to run in offline mode."
+                            "No search provider is configured or all providers failed. Either: (1) set a key — WEBPIPE_BRAVE_API_KEY, WEBPIPE_TAVILY_API_KEY, or WEBPIPE_SEARXNG_ENDPOINT — or (2) skip search entirely by passing urls=[...] directly."
                         )
                     });
                     add_envelope_fields(
