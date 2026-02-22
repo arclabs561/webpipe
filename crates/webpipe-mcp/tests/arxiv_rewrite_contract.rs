@@ -50,10 +50,16 @@ fn web_extract_rewrites_arxiv_abs_to_pdf_on_same_host() {
         // Some environments have slow or flaky PDF backends (shellouts like `pdftotext`), which
         // can make this test *look* hung while it is actually waiting on PDF parsing/extraction.
         // Serving non-PDF bytes avoids that whole class of nondeterminism.
-        let app = Router::new().route(
-            "/pdf/1234.5678.pdf",
-            get(|| async { ([("content-type", "text/plain; charset=utf-8")], "ok") }),
-        );
+        let app = Router::new()
+            .route(
+                "/pdf/1234.5678.pdf",
+                get(|| async { ([("content-type", "text/plain; charset=utf-8")], "ok") }),
+            )
+            // Legacy arXiv IDs include a category prefix.
+            .route(
+                "/pdf/hep-th/9901001.pdf",
+                get(|| async { ([("content-type", "text/plain; charset=utf-8")], "ok") }),
+            );
         let addr = serve(app).await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -123,6 +129,33 @@ fn web_extract_rewrites_arxiv_abs_to_pdf_on_same_host() {
         assert!(
             codes.contains(&"arxiv_abs_rewritten_to_pdf"),
             "expected arxiv rewrite warning; got {codes:?}"
+        );
+
+        // Legacy IDs should preserve the full path segment after /abs/.
+        let abs_url2 = format!("http://{addr}/abs/hep-th/9901001");
+        let v2 = call(
+            &service,
+            "web_extract",
+            serde_json::json!({
+                "url": abs_url2,
+                "fetch_backend": "local",
+                "timeout_ms": 10_000,
+                "max_bytes": 200_000,
+                "max_chars": 10_000,
+                "include_text": false,
+                "include_links": false,
+                "include_structure": false
+            }),
+        )
+        .await;
+        assert_eq!(v2["ok"].as_bool(), Some(true));
+        assert!(
+            v2["final_url"]
+                .as_str()
+                .unwrap_or("")
+                .contains("/pdf/hep-th/9901001.pdf"),
+            "expected final_url to be legacy pdf: {}",
+            v2["final_url"]
         );
 
         service.cancel().await?;

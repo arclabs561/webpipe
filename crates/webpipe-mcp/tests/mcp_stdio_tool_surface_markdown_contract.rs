@@ -136,11 +136,16 @@ fn webpipe_mcp_stdio_tool_surface_markdown_contract_offlineish() {
         let meta_v = meta.structured_content.clone().unwrap();
         assert_eq!(meta_v["kind"].as_str(), Some("webpipe_meta"));
 
-        // webpipe_usage
+        // webpipe_meta method=usage (canonical way to access usage stats in Normal mode)
         let usage = service
             .call_tool(CallToolRequestParam {
-                name: "webpipe_usage".into(),
-                arguments: Some(serde_json::json!({}).as_object().cloned().unwrap()),
+                name: "webpipe_meta".into(),
+                arguments: Some(
+                    serde_json::json!({"method": "usage"})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                ),
             })
             .await?;
         assert_markdown_view(&usage);

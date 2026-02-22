@@ -113,14 +113,17 @@ Performance &amp; security by Cloudflare
     assert_eq!(v["status"].as_u64(), Some(403), "payload={v}");
     let codes = v["warning_codes"].as_array().cloned().unwrap_or_default();
     assert!(
-        codes.iter().any(|c| c.as_str() == Some("http_status_error")),
+        codes
+            .iter()
+            .any(|c| c.as_str() == Some("http_status_error")),
         "warning_codes={codes:?} payload={v}"
     );
     assert!(
-        codes.iter().any(|c| c.as_str() == Some("blocked_by_js_challenge")),
+        codes
+            .iter()
+            .any(|c| c.as_str() == Some("blocked_by_js_challenge")),
         "warning_codes={codes:?} payload={v}"
     );
 
     service.cancel().await.expect("cancel");
 }
-

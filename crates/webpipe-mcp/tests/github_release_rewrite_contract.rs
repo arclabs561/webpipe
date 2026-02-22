@@ -117,9 +117,7 @@ fn web_extract_rewrites_github_release_to_api_json() {
             .filter_map(|x| x.as_str())
             .collect();
         assert!(
-            codes
-                .iter()
-                .any(|c| *c == "github_release_rewritten_to_api"),
+            codes.contains(&"github_release_rewritten_to_api"),
             "expected github release rewrite warning; got {codes:?}"
         );
         assert!(v["extract"]["text"]

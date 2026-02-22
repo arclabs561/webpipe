@@ -26,6 +26,9 @@ pub(crate) fn warning_hint(code: &str) -> Option<&'static str> {
         "empty_extraction" => Some(
             "The response had bytes but extracted text was empty. Consider switching fetch_backend (local vs firecrawl) or increasing max_bytes.",
         ),
+        "body_truncated_by_max_bytes" => Some(
+            "The response body was truncated by max_bytes. Increase max_bytes, or enable retry_on_truncation=true (and optionally truncation_retry_max_bytes) to recover tail content.",
+        ),
         "image_no_text_extraction" => Some(
             "This is an image and no text/OCR backend is available in this environment (tesseract/vision).",
         ),
@@ -54,6 +57,9 @@ pub(crate) fn warning_hint(code: &str) -> Option<&'static str> {
         "silently_throttled" => Some(
             "This looks like a throttling/interstitial page even though the HTTP status was OK. Try a different source URL, reduce request rate, or switch fetch_backend (render/firecrawl).",
         ),
+        "http_rate_limited" => Some(
+            "HTTP 429 (Too Many Requests): you are being rate-limited. Wait and retry (respect Retry-After when present), reduce request rate (e.g. set WEBPIPE_RATE_LIMIT), and prefer cache-first workflows once you have candidate URLs.",
+        ),
         "http_status_error" => Some(
             "HTTP status was >= 400 (likely an error/challenge page). The result is shown for auditability, but its chunks should not be treated as high-quality evidence.",
         ),
@@ -76,6 +82,9 @@ pub(crate) fn warning_hint(code: &str) -> Option<&'static str> {
             "Extraction exceeded its bounded pipeline timeout and returned a minimal empty result. Try reducing max_bytes/max_chars, switching fetch_backend, or increasing WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS.",
         ),
         "truncation_retry_used" => Some(
+            "The initial fetch was truncated by max_bytes, so we retried once with a larger max_bytes (bounded) to recover tail content.",
+        ),
+        "retried_due_to_truncation" => Some(
             "The initial fetch was truncated by max_bytes, so we retried once with a larger max_bytes (bounded) to recover tail content.",
         ),
         "truncation_retry_failed" => Some(
@@ -130,7 +139,7 @@ pub(crate) fn warning_hint(code: &str) -> Option<&'static str> {
             "Some request headers were dropped by default for safety (Authorization/Cookie/Proxy-Authorization). To allow forwarding them, set WEBPIPE_ALLOW_UNSAFE_HEADERS=true (only for trusted endpoints).",
         ),
         "github_repo_rewritten_to_raw_readme" => Some(
-            "This looks like a GitHub repo root page (often low-signal). We rewrote to fetch the repo README from raw.githubusercontent.com. If you need richer docs, pass a docs URL (or set urls=[...] to specific pages).",
+            "This looks like a GitHub repo root page (often low-signal). We rewrote to fetch the repo README from raw.githubusercontent.com. If you need more than the README (e.g. API surface), use repo_ingest (GitHub API, bounded) or pass urls=[...] that point to specific docs/code pages.",
         ),
         "github_blob_rewritten_to_raw" => Some(
             "This looks like a GitHub file view URL (/blob/...). We rewrote to fetch the raw file from raw.githubusercontent.com.",
@@ -162,8 +171,20 @@ pub(crate) fn warning_hint(code: &str) -> Option<&'static str> {
         "pdf_shellout_unavailable" => Some(
             "PDF shellout tools are unavailable here. Install `pdftotext` (poppler) or `mutool` (MuPDF), and set WEBPIPE_PDF_SHELLOUT=auto (or a specific tool) to enable higher-robustness PDF extraction.",
         ),
+        "pdf_strings_fallback_used" => Some(
+            "PDF text extraction failed, so webpipe used a low-fidelity fallback that scans raw PDF bytes for ASCII strings. Expect lower quality evidence; for best results, install `pdftotext`/`mutool` or use a different PDF source/URL.",
+        ),
         "arxiv_abs_rewritten_to_pdf" => Some(
             "This looks like an arXiv abstract page (/abs/...). We rewrote to fetch the corresponding PDF (/pdf/...pdf) for better full-text extraction.",
+        ),
+        "arxiv_pdf_fallback_to_html" => Some(
+            "PDF extraction for this arXiv paper was degraded, so webpipe fell back to ar5iv HTML (arXiv Labs) to extract higher-signal text evidence.",
+        ),
+        "openreview_pdf_fallback_to_forum" => Some(
+            "PDF extraction for this OpenReview paper was degraded, so webpipe fell back to the OpenReview forum page (/forum?id=...) to extract higher-signal metadata (title/abstract) as evidence.",
+        ),
+        "openreview_pdf_fallback_to_api" => Some(
+            "PDF extraction for this OpenReview paper was degraded, so webpipe fell back to the OpenReview notes API (api.openreview.net) to extract higher-signal metadata (title/abstract) as evidence.",
         ),
         _ => None,
     }
@@ -218,6 +239,29 @@ impl ErrorCode {
             | Self::ProviderUnavailable
             | Self::UnexpectedError => false,
         }
+    }
+}
+
+/// Retain only the minimal signal set needed by agent loops, stripping verbose fields
+/// (per-URL results[], request echo, search.steps, backend_provider, agentic trace, etc.).
+///
+/// Keeps: ok, top_chunks, warning_codes, warning_hints, schema_version, kind, elapsed_ms,
+/// error (when ok=false). All other fields are removed.
+///
+/// Call after add_envelope_fields when minimal_output=true.
+pub(crate) fn strip_minimal_output(payload: &mut serde_json::Value) {
+    const KEEP: &[&str] = &[
+        "ok",
+        "top_chunks",
+        "warning_codes",
+        "warning_hints",
+        "schema_version",
+        "kind",
+        "elapsed_ms",
+        "error",
+    ];
+    if let Some(obj) = payload.as_object_mut() {
+        obj.retain(|k, _| KEEP.contains(&k.as_str()));
     }
 }
 

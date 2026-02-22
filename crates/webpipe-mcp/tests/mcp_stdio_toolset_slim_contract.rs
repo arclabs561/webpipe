@@ -21,6 +21,9 @@ fn webpipe_mcp_stdio_toolset_slim_contract() {
                     cmd.env("WEBPIPE_DOTENV", "0");
                     cmd.env("WEBPIPE_CACHE_DIR", cache_dir.path());
                     cmd.env("WEBPIPE_MCP_TOOLSET", "normal");
+                    // Ensure API-key-gated tools are not visible.
+                    cmd.env_remove("WEBPIPE_PERPLEXITY_API_KEY");
+                    cmd.env_remove("PERPLEXITY_API_KEY");
                 }),
             )?)
             .await?;
@@ -29,14 +32,15 @@ fn webpipe_mcp_stdio_toolset_slim_contract() {
         let names: std::collections::HashSet<String> =
             tools.tools.iter().map(|t| t.name.to_string()).collect();
 
-        // Normal surface should include these.
+        // Normal surface must include these zero-key-required tools.
+        // webpipe_usage is accessible via webpipe_meta?method=usage (not a separate tool).
+        // web_perplexity is only visible when WEBPIPE_PERPLEXITY_API_KEY is configured
+        // (tested separately in mcp_stdio_web_perplexity_contract).
         for must in [
             "webpipe_meta",
-            "webpipe_usage",
             "web_fetch",
             "web_extract",
             "search_evidence",
-            "web_perplexity",
             "arxiv_search",
             "arxiv_enrich",
             "paper_search",
@@ -45,7 +49,13 @@ fn webpipe_mcp_stdio_toolset_slim_contract() {
         }
 
         // And should exclude these (keeps UI tight).
+        // webpipe_usage / webpipe_usage_reset are accessible via webpipe_meta?method=...
+        // web_perplexity is only visible when WEBPIPE_PERPLEXITY_API_KEY is configured
+        // (this test runs without any keys set).
         for must_not in [
+            "webpipe_usage",
+            "webpipe_usage_reset",
+            "web_perplexity",
             "repo_ingest",
             "web_explore_extract",
             "web_sitemap_extract",

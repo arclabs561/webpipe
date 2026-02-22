@@ -583,7 +583,7 @@ pub async fn paper_search(
     }
     let years = clamp_years(&years);
     let limit = limit.clamp(1, 50);
-    let timeout_ms = timeout_ms.max(1000).min(60_000);
+    let timeout_ms = timeout_ms.clamp(1000, 60_000);
 
     // Normalize backends list. Default: semantic_scholar + openalex.
     let mut bset: BTreeSet<String> = BTreeSet::new();

@@ -1,7 +1,7 @@
 use crate::shellout;
 use crate::textprep;
-use slabs_crate::Chunker;
 use serde::Serialize;
+use slabs_crate::Chunker;
 use std::io::Cursor;
 use std::process::Command;
 
@@ -165,6 +165,98 @@ pub fn pdf_to_text(bytes: &[u8]) -> Result<String, String> {
     match r {
         Ok(inner) => inner.map_err(|e| e.to_string()),
         Err(_) => Err("pdf_extract_panicked".to_string()),
+    }
+}
+
+/// Very low-fidelity PDF fallback: scan raw PDF bytes for plausible ASCII “word” runs.
+///
+/// This is meant as a last resort when PDF text extraction fails (or panics) and no shellout
+/// tools are available. It will not recover text from compressed streams reliably, but it often
+/// recovers metadata / uncompressed fragments that can still help downstream matching.
+fn pdf_strings_fallback(bytes: &[u8], max_chars: usize) -> Option<String> {
+    // Keep this deterministic and cheap (O(n) scan).
+    const MIN_LEN: usize = 4;
+    const MAX_LEN: usize = 48;
+
+    fn keep_token(tok: &[u8]) -> bool {
+        if tok.len() < MIN_LEN || tok.len() > MAX_LEN {
+            return false;
+        }
+        if tok.iter().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        match tok {
+            // Common PDF syntax / dictionary keys (very low signal).
+            b"endobj"
+            | b"stream"
+            | b"endstream"
+            | b"trailer"
+            | b"startxref"
+            | b"flatedecode"
+            | b"filter"
+            | b"length"
+            | b"subtype"
+            | b"resources"
+            | b"mediabox"
+            | b"contents"
+            | b"basefont"
+            | b"encoding"
+            | b"objstm"
+            | b"xrefstm" => false,
+            _ => true,
+        }
+    }
+
+    let mut out = String::new();
+    out.reserve(max_chars.min(4096));
+    let mut tok: Vec<u8> = Vec::with_capacity(32);
+    let mut last_space = true;
+
+    let flush = |tok: &mut Vec<u8>, out: &mut String, last_space: &mut bool| {
+        if tok.is_empty() {
+            return;
+        }
+        if keep_token(tok.as_slice()) {
+            if !out.is_empty() && !*last_space {
+                out.push(' ');
+                *last_space = true;
+            }
+            // Tokens are stored lowercase ASCII.
+            out.push_str(&String::from_utf8_lossy(tok));
+            *last_space = false;
+        }
+        tok.clear();
+    };
+
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() {
+            if tok.len() < MAX_LEN {
+                tok.push(b.to_ascii_lowercase());
+            } else {
+                // Token too long; stop accumulating and wait for a separator to flush+drop it.
+                // (This avoids large base64/hex-ish runs dominating output.)
+            }
+        } else {
+            flush(&mut tok, &mut out, &mut last_space);
+            if out.len() >= max_chars {
+                break;
+            }
+            if !out.is_empty() && !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        }
+        if out.len() >= max_chars {
+            break;
+        }
+    }
+    flush(&mut tok, &mut out, &mut last_space);
+
+    let s = out.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 
@@ -727,8 +819,12 @@ pub fn extract_pipeline_from_extracted(
     cfg: ExtractPipelineCfg<'_>,
 ) -> ExtractPipelineResult {
     let query = cfg.query.unwrap_or("").trim();
-    let (text, text_chars, text_truncated, used_query_window) =
-        smart_truncate_to_chars_for_query(&extracted0.text, query, cfg.max_chars, cfg.max_chunk_chars);
+    let (text, text_chars, text_truncated, used_query_window) = smart_truncate_to_chars_for_query(
+        &extracted0.text,
+        query,
+        cfg.max_chars,
+        cfg.max_chunk_chars,
+    );
     let mut warnings = extracted0.warnings;
     if used_query_window {
         warnings.push("text_windowed_for_query");
@@ -1243,7 +1339,7 @@ fn detect_client_redirect(html: &str) -> Option<String> {
     if let Ok(sel) = html_scraper::Selector::parse("meta[http-equiv]") {
         for el in doc.select(&sel) {
             if let Some(equiv) = el.value().attr("http-equiv") {
-                if equiv.trim().to_ascii_lowercase() == "refresh" {
+                if equiv.trim().eq_ignore_ascii_case("refresh") {
                     if let Some(content) = el.value().attr("content") {
                         // content="0; url=http://..."
                         // We are loose with parsing: just look for url=...
@@ -1284,6 +1380,77 @@ fn detect_client_redirect(html: &str) -> Option<String> {
     }
 
     None
+}
+
+fn openreview_notes_api_to_text(v: &serde_json::Value) -> Option<String> {
+    // OpenReview notes API shape: {"notes":[{...,"content":{...}}],"count":...}
+    let notes = v.get("notes")?.as_array()?;
+    let n0 = notes.first()?.as_object()?;
+    // Heuristic: require OpenReview-ish fields so we don't accidentally “pretty” other APIs.
+    if !n0.contains_key("forum") && !n0.contains_key("invitation") {
+        return None;
+    }
+    let id = n0.get("id").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let content = n0.get("content")?.as_object()?;
+    let title = content
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    let abstract0 = content
+        .get("abstract")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    if title.is_empty() && abstract0.is_empty() {
+        return None;
+    }
+
+    fn clamp_chars(s: &str, max: usize) -> String {
+        let mut out = String::new();
+        for (i, ch) in s.chars().enumerate() {
+            if i >= max {
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    let mut out = String::new();
+    out.push_str("OpenReview note\n");
+    if !id.is_empty() {
+        out.push_str("id: ");
+        out.push_str(id);
+        out.push('\n');
+    }
+    if !title.is_empty() {
+        out.push_str("title: ");
+        out.push_str(&clamp_chars(title, 4_000));
+        out.push('\n');
+    }
+    if let Some(authors) = content.get("authors").and_then(|x| x.as_array()) {
+        let names: Vec<&str> = authors.iter().filter_map(|x| x.as_str()).collect();
+        if !names.is_empty() {
+            out.push_str("authors: ");
+            out.push_str(&clamp_chars(&names.join(", "), 4_000));
+            out.push('\n');
+        }
+    }
+    if let Some(venue) = content.get("venue").and_then(|x| x.as_str()) {
+        let v = venue.trim();
+        if !v.is_empty() {
+            out.push_str("venue: ");
+            out.push_str(&clamp_chars(v, 1_000));
+            out.push('\n');
+        }
+    }
+    if !abstract0.is_empty() {
+        out.push_str("abstract: ");
+        out.push_str(&clamp_chars(abstract0, 20_000));
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// Extract best-effort readable text from a fetched body.
@@ -1328,10 +1495,19 @@ pub fn best_effort_text_from_bytes(
                         }
                         Err(_) => {
                             warnings.push("pdf_shellout_unavailable");
-                            ExtractedText {
-                                engine: "pdf-extract",
-                                text: String::new(),
-                                warnings,
+                            if let Some(s) = pdf_strings_fallback(bytes, 50_000) {
+                                warnings.push("pdf_strings_fallback_used");
+                                ExtractedText {
+                                    engine: "pdf-strings",
+                                    text: clean_extracted_text(s),
+                                    warnings,
+                                }
+                            } else {
+                                ExtractedText {
+                                    engine: "pdf-extract",
+                                    text: String::new(),
+                                    warnings,
+                                }
                             }
                         }
                     }
@@ -1353,10 +1529,19 @@ pub fn best_effort_text_from_bytes(
                     }
                     Err(_) => {
                         warnings.push("pdf_shellout_unavailable");
-                        ExtractedText {
-                            engine: "pdf-extract",
-                            text: String::new(),
-                            warnings,
+                        if let Some(s) = pdf_strings_fallback(bytes, 50_000) {
+                            warnings.push("pdf_strings_fallback_used");
+                            ExtractedText {
+                                engine: "pdf-strings",
+                                text: clean_extracted_text(s),
+                                warnings,
+                            }
+                        } else {
+                            ExtractedText {
+                                engine: "pdf-extract",
+                                text: String::new(),
+                                warnings,
+                            }
                         }
                     }
                 }
@@ -1486,7 +1671,6 @@ pub fn best_effort_text_from_bytes(
     let is_html_ct = ct0.starts_with("text/html") || ct0 == "application/xhtml+xml";
     let is_text = ct0.starts_with("text/") || is_markdown || is_json || is_xml;
     if is_text && !is_html_ct && !bytes_look_like_html(bytes) {
-        let text = clean_extracted_text(String::from_utf8_lossy(bytes).to_string());
         let engine = if is_markdown {
             "markdown"
         } else if is_json {
@@ -1496,6 +1680,15 @@ pub fn best_effort_text_from_bytes(
         } else {
             "text"
         };
+        let mut text0 = String::from_utf8_lossy(bytes).to_string();
+        if engine == "json" {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                if let Some(t) = openreview_notes_api_to_text(&v) {
+                    text0 = t;
+                }
+            }
+        }
+        let text = clean_extracted_text(text0);
         return ExtractedText {
             engine,
             text,
@@ -1877,7 +2070,7 @@ fn phrase_bonus_for_chunk(
     // Trigram matches are stronger than bigrams; keep the scale modest vs token weights.
     let mut bonus = 0u64;
     for m in matches_buf.iter().take(8) {
-        let n = m.keyword.trim().split_whitespace().count();
+        let n = m.keyword.split_whitespace().count();
         bonus = bonus.saturating_add(match n {
             2 => 120,
             3 => 200,
@@ -1894,7 +2087,11 @@ fn query_tok_match_strength(qtok: &str, w: &str) -> u8 {
     // - Very short tokens: exact match only to avoid prefix false positives ("go" vs "google").
     // - Otherwise: exact match is strongest; prefix match is a weaker fallback (timeout -> timeouts).
     if qtok.chars().all(|c| c.is_ascii_digit()) || qtok.len() < 3 {
-        if w == qtok { 2 } else { 0 }
+        if w == qtok {
+            2
+        } else {
+            0
+        }
     } else if w == qtok {
         2
     } else if w.starts_with(qtok) {
@@ -2122,7 +2319,7 @@ fn find_paragraph_spans(text: &str) -> Vec<(usize, usize)> {
 fn avg_bytes_per_char(text: &str) -> usize {
     let chars = text.chars().count().max(1);
     // Bounded estimate: UTF-8 is at most 4 bytes per char.
-    ((text.len() + chars - 1) / chars).clamp(1, 4)
+    text.len().div_ceil(chars).clamp(1, 4)
 }
 
 fn find_candidate_spans(text: &str, max_chunk_chars: usize) -> Vec<(usize, usize)> {
@@ -2155,7 +2352,11 @@ fn find_candidate_spans(text: &str, max_chunk_chars: usize) -> Vec<(usize, usize
             out.push((s.start, s.end));
         }
     }
-    if out.len() >= 2 { out } else { spans }
+    if out.len() >= 2 {
+        out
+    } else {
+        spans
+    }
 }
 
 pub fn best_chunks_for_query(
@@ -2230,7 +2431,10 @@ pub fn best_chunks_for_query(
             hits = (exact_mask | prefix_mask).count_ones() as u64;
         } else {
             for t in &q_toks {
-                if toks.iter().any(|w| query_tok_matches_word(t.as_str(), w.text)) {
+                if toks
+                    .iter()
+                    .any(|w| query_tok_matches_word(t.as_str(), w.text))
+                {
                     hits += 1;
                 }
             }
@@ -2329,7 +2533,11 @@ pub fn best_chunks_for_query(
         }
     }
 
-    scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.start_char.cmp(&b.start_char)));
+    scored.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.start_char.cmp(&b.start_char))
+    });
     dedupe_and_truncate_chunks(scored, top_k)
 }
 
@@ -2449,7 +2657,10 @@ pub fn best_chunks_for_query_in_structure(
             hits = (block_exact_mask | block_prefix_mask).count_ones() as u64;
         } else {
             for t in &q_toks {
-                if btoks.iter().any(|w| query_tok_matches_word(t.as_str(), w.text)) {
+                if btoks
+                    .iter()
+                    .any(|w| query_tok_matches_word(t.as_str(), w.text))
+                {
                     hits += 1;
                 }
             }
@@ -2495,7 +2706,10 @@ pub fn best_chunks_for_query_in_structure(
                     }
                 } else {
                     for t in &q_toks {
-                        if htoks.iter().any(|w| query_tok_matches_word(t.as_str(), w.text)) {
+                        if htoks
+                            .iter()
+                            .any(|w| query_tok_matches_word(t.as_str(), w.text))
+                        {
                             heading_bonus_hits = heading_bonus_hits.saturating_add(2);
                         }
                     }
@@ -2593,8 +2807,7 @@ pub fn best_chunks_for_query_in_structure(
             let mut pm = c.block_prefix_mask;
             while pm != 0 {
                 let i = pm.trailing_zeros() as usize;
-                base =
-                    base.saturating_add(weights[i].saturating_mul(PREFIX_SCALE_PCT) / 100);
+                base = base.saturating_add(weights[i].saturating_mul(PREFIX_SCALE_PCT) / 100);
                 pm &= pm - 1;
             }
             let mut hm = c.heading_exact_mask;
@@ -2641,7 +2854,11 @@ pub fn best_chunks_for_query_in_structure(
         }
     }
 
-    scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.start_char.cmp(&b.start_char)));
+    scored.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.start_char.cmp(&b.start_char))
+    });
     dedupe_and_truncate_chunks(scored, top_k)
 }
 
@@ -2676,6 +2893,33 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_pdf_extract_panicked_falls_back_to_strings() {
+        // Real-world motivation: some PDFs trigger panics in the pure-Rust backend. When that
+        // happens (and shellout tools are unavailable), we should still produce a small amount
+        // of evidence text rather than returning empty.
+        //
+        // Use the deterministic panic hook to avoid relying on crate-internal failure modes.
+        let bad_pdfish = b"WEBPIPE_TEST_PDF_EXTRACT_PANIC Fenchel Young losses Omega Theta 2026";
+        let ex = best_effort_text_from_bytes(
+            bad_pdfish,
+            Some("application/pdf"),
+            "https://example.com/paper.pdf",
+            100,
+            500,
+        );
+        assert_eq!(ex.engine, "pdf-strings");
+        assert!(
+            ex.text.to_ascii_lowercase().contains("fenchel"),
+            "expected fallback text to contain a plausible token; got text={:?}",
+            ex.text
+        );
+        assert!(ex.warnings.contains(&"pdf_extract_failed"));
+        assert!(ex.warnings.contains(&"pdf_extract_panicked"));
+        assert!(ex.warnings.contains(&"pdf_shellout_unavailable"));
+        assert!(ex.warnings.contains(&"pdf_strings_fallback_used"));
+    }
+
+    #[test]
     fn bytes_look_like_html_sniffs_common_prefixes() {
         assert!(bytes_look_like_html(b"<!doctype html><html>"));
         assert!(bytes_look_like_html(b"   <html><body>x</body></html>"));
@@ -2684,6 +2928,55 @@ mod tests {
         ));
         assert!(!bytes_look_like_html(br#"{"a":1}"#));
         assert!(!bytes_look_like_html(b""));
+    }
+
+    #[test]
+    fn best_effort_text_from_bytes_openreview_notes_api_compacts_json_to_metadata_text() {
+        let j = serde_json::json!({
+            "notes": [{
+                "id": "RUzSobdYy0V",
+                "forum": "RUzSobdYy0V",
+                "invitation": "ICLR.cc/2023/Conference/-/Blind_Submission",
+                "content": {
+                    "title": "Quantifying and Mitigating the Impact of Label Errors on Model Disparity Metrics",
+                    "authors": ["Julius Adebayo", "Melissa Hall"],
+                    "venue": "ICLR 2023 poster",
+                    "abstract": "Errors in labels obtained via human annotation adversely affect group disparity metrics."
+                }
+            }],
+            "count": 1
+        })
+        .to_string();
+        let ex = best_effort_text_from_bytes(
+            j.as_bytes(),
+            Some("application/json; charset=utf-8"),
+            "https://api.openreview.net/notes?id=RUzSobdYy0V",
+            100,
+            500,
+        );
+        assert_eq!(ex.engine, "json");
+        assert!(
+            ex.text.to_ascii_lowercase().contains("openreview note"),
+            "text={:?}",
+            ex.text
+        );
+        assert!(
+            ex.text
+                .to_ascii_lowercase()
+                .contains("title: quantifying and mitigating"),
+            "text={:?}",
+            ex.text
+        );
+        assert!(
+            ex.text.to_ascii_lowercase().contains("abstract: errors"),
+            "text={:?}",
+            ex.text
+        );
+        assert!(
+            !ex.text.contains("\"notes\""),
+            "expected non-raw JSON text; text={:?}",
+            ex.text
+        );
     }
 
     #[test]
@@ -2765,7 +3058,9 @@ mod tests {
         // Version tokens like "v1"/"rc1" are extremely high-recall and degrade ranking
         // (especially in cache-corpus mode).
         let toks = tokenize_query_for_match("predicateType slsa provenance v1 rc1 2 2022");
-        assert!(toks.contains(&"predicatetype".to_string()) || toks.contains(&"predicate".to_string()));
+        assert!(
+            toks.contains(&"predicatetype".to_string()) || toks.contains(&"predicate".to_string())
+        );
         assert!(toks.contains(&"slsa".to_string()));
         assert!(toks.contains(&"provenance".to_string()));
         assert!(!toks.contains(&"v1".to_string()), "toks={toks:?}");
@@ -2832,7 +3127,8 @@ mod tests {
             max_blocks: 20,
             max_block_chars: 200,
         };
-        let r = extract_pipeline_from_extracted(b"", None, "https://nextjs.org/docs", extracted0, cfg);
+        let r =
+            extract_pipeline_from_extracted(b"", None, "https://nextjs.org/docs", extracted0, cfg);
         assert!(r.text_truncated);
         assert!(r.extracted.warnings.contains(&"text_windowed_for_query"));
         assert!(
@@ -2844,7 +3140,7 @@ mod tests {
         assert!(
             r.chunks[0].text.to_ascii_lowercase().contains("headers"),
             "expected top chunk to match query: {:?}",
-            r.chunks.get(0).map(|c| &c.text)
+            r.chunks.first().map(|c| &c.text)
         );
     }
 
@@ -2903,7 +3199,10 @@ mod tests {
         let chunks = best_chunks_for_query(text, "art", 3, 240);
         assert!(!chunks.is_empty());
         assert!(
-            chunks[0].text.to_ascii_lowercase().contains("art is evidence"),
+            chunks[0]
+                .text
+                .to_ascii_lowercase()
+                .contains("art is evidence"),
             "expected real art paragraph; got: {:?}",
             chunks[0].text
         );
@@ -2917,7 +3216,10 @@ mod tests {
         let chunks = best_chunks_for_query(text, "go", 3, 240);
         assert!(!chunks.is_empty());
         assert!(
-            chunks[0].text.to_ascii_lowercase().contains("go is a language"),
+            chunks[0]
+                .text
+                .to_ascii_lowercase()
+                .contains("go is a language"),
             "expected real 'go' paragraph first; got: {:?}",
             chunks[0].text
         );
@@ -2939,7 +3241,10 @@ mod tests {
         let chunks = best_chunks_for_query(&text, "tokio install timeout", 3, 240);
         assert!(!chunks.is_empty());
         assert!(
-            chunks[0].text.to_ascii_lowercase().contains("tokio install"),
+            chunks[0]
+                .text
+                .to_ascii_lowercase()
+                .contains("tokio install"),
             "expected tokio paragraph first; got: {:?}",
             chunks[0].text
         );

@@ -46,8 +46,9 @@ async fn call(
 
 #[tokio::test]
 async fn search_evidence_marks_http_status_error_and_excludes_chunks_from_top() {
-    let ok_body = "<html><body><main><h1>Ok</h1><p>NEEDLE_123 good content</p></main></body></html>"
-        .to_string();
+    let ok_body =
+        "<html><body><main><h1>Ok</h1><p>NEEDLE_123 good content</p></main></body></html>"
+            .to_string();
     let bad_body =
         "<html><body><main><h1>Bad</h1><p>NEEDLE_123 error-like content</p></main></body></html>"
             .to_string();
@@ -127,7 +128,9 @@ async fn search_evidence_marks_http_status_error_and_excludes_chunks_from_top() 
     assert_eq!(bad["url"].as_str(), Some(bad_url.as_str()));
     let bad_codes = bad["warning_codes"].as_array().cloned().unwrap_or_default();
     assert!(
-        bad_codes.iter().any(|c| c.as_str() == Some("http_status_error")),
+        bad_codes
+            .iter()
+            .any(|c| c.as_str() == Some("http_status_error")),
         "warning_codes={bad_codes:?} payload={v}"
     );
 
@@ -141,4 +144,3 @@ async fn search_evidence_marks_http_status_error_and_excludes_chunks_from_top() 
 
     service.cancel().await.expect("cancel");
 }
-

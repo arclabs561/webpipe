@@ -1,11 +1,12 @@
 # webpipe
 
-Local “search → fetch → extract” plumbing, exposed as an **MCP stdio** server.
+Local "search → fetch → extract" plumbing, exposed as an **MCP stdio** server.
 
 `webpipe` is designed for **bounded, deterministic evidence gathering**:
 - cache-first fetch by default
 - explicit limits on bytes/chars/results
 - stable, schema-versioned JSON outputs
+- **zero API keys required** — the default tool surface works out of the box
 
 ## Cursor MCP setup
 
@@ -32,11 +33,29 @@ Add this to your `~/.cursor/mcp.json` (adjust path to your repo):
 }
 ```
 
-Optional: to enable Brave-backed search, set `WEBPIPE_BRAVE_API_KEY` in your environment (or in `mcp.json`), but **don’t commit keys**.
+Optional: to enable search providers, set API keys in `mcp.json` (see env vars below), but **don't commit keys**.
 
-## Sanity Check
+## Default tool surface (zero keys required)
 
-Run this to verify the server is working (returns JSON):
+The Normal toolset works with no API keys configured:
+
+| Tool | Purpose |
+|---|---|
+| `webpipe_meta` | Server config, capabilities, and runtime stats (method=usage/usage_reset) |
+| `search_evidence` | **Main tool**: optional search → fetch → extract → ranked top chunks |
+| `web_extract` | Extract readable text from a URL you already have |
+| `web_fetch` | Fetch raw bytes/headers from a URL |
+| `arxiv_search` | Search arXiv academic papers |
+| `arxiv_enrich` | Fetch full metadata for a specific arXiv paper |
+| `paper_search` | Search papers via Semantic Scholar / OpenAlex |
+
+Tools that require API keys (shown only when configured):
+
+| Tool | Key required |
+|---|---|
+| `web_perplexity` | `WEBPIPE_PERPLEXITY_API_KEY` |
+
+## Sanity check
 
 ```bash
 python3 - <<'PY'
@@ -55,7 +74,6 @@ def send(obj):
     p.stdin.write(json.dumps(obj) + "\n")
     p.stdin.flush()
 
-# Minimal MCP handshake: initialize -> initialized -> tools/list
 send({
     "jsonrpc": "2.0",
     "id": 1,
@@ -79,7 +97,10 @@ while time.time() - start < 10:
         break
     msg = json.loads(line)
     if msg.get("id") == 2:
-        print(json.dumps(msg, indent=2))
+        tools = msg.get("result", {}).get("tools", [])
+        print(f"{len(tools)} tools registered:")
+        for t in tools:
+            print(f"  {t['name']}")
         break
 
 p.terminate()
@@ -106,25 +127,25 @@ To opt in (only for trusted endpoints), set `WEBPIPE_ALLOW_UNSAFE_HEADERS=true`.
 Set `WEBPIPE_PRIVACY_MODE` to one of:
 
 - **`normal`** (default): network allowed.
-- **`offline`**: *no network egress* (except `localhost`); discovery/search is disabled; use cache-only workflows.
-- **`anonymous`**: network allowed **only when routed via an explicit proxy** (fail-closed). Some remote backends are disabled.
+- **`offline`**: *no network egress* (except `localhost`); use cache-only workflows.
+- **`anonymous`**: network allowed **only when routed via an explicit proxy** (fail-closed).
 
 Related env vars:
 
 - **`WEBPIPE_ANON_PROXY`**: proxy URL used in anonymous mode.
   - For local/reqwest fetches, Tor users typically use `socks5h://127.0.0.1:9050`.
-  - For Playwright render (`fetch_backend="render"`), `socks5h://...` is not supported; use an **HTTP proxy** endpoint (Tor users often run Privoxy and set `WEBPIPE_ANON_PROXY=http://127.0.0.1:8118`).
-- **`WEBPIPE_RENDER_DISABLE=1`**: force-disable render backend (deterministic “not configured”).
+  - For Playwright render (`fetch_backend="render"`), use an HTTP proxy (e.g. `http://127.0.0.1:8118`).
+- **`WEBPIPE_RENDER_DISABLE=1`**: force-disable render backend.
 
 ## Avoid Cargo build locks (dev ergonomics)
 
 If you run multiple `cargo` commands concurrently, you can hit:
 `Blocking waiting for file lock on build directory`.
 
-For `webpipe` work, you can isolate build output by setting a per-repo target dir:
+For `webpipe` work, isolate build output by setting a per-repo target dir:
 
 ```bash
-CARGO_TARGET_DIR=target-webpipe cargo test -p webpipe-mcp --tests -- --skip live_
+CARGO_TARGET_DIR=target-webpipe cargo test -p webpipe --tests -- --skip live_
 ```
 
 ## Manual exploration from the CLI (no Cursor needed)
@@ -172,28 +193,28 @@ webpipe mcp-stdio
 
 ## Two audiences (how to think about the tools)
 
-There are two “modes” in which `webpipe` is used:
+There are two "modes" in which `webpipe` is used:
 
-- **Cursor user (MCP tools)**: you (or Cursor agents) call tools like `web_search_extract` directly from chat. The tool response is a **single JSON payload** that Cursor saves/displays as text.
+- **Cursor user (MCP tools)**: you (or Cursor agents) call tools like `search_evidence` directly from chat. The tool response is a **single JSON payload** that Cursor saves/displays as text.
 - **Agent inside one tool call**: a higher-level agent/tool (outside of `webpipe`, or inside your own app) calls `webpipe` tools as steps in a workflow. The same JSON payloads are used, but you typically branch on fields like `warning_codes`, `error.code`, and `top_chunks`.
 
-In both cases, the “structured output” is the JSON object:
+In both cases, the "structured output" is the JSON object:
 
 - `ok: true|false`
 - `schema_version`, `kind`, `elapsed_ms`
-- optional `warnings` + `warning_codes` + `warning_hints`
+- optional `warning_codes` + `warning_hints`
 - on error: `error: { code, message, hint, retryable }`
 
 One important UX detail: most MCP clients (including Cursor) render **`content[0]`** (human-facing Markdown)
-and keep the canonical machine payload in **`structured_content`**. If you expected “the extracted text” to
-show up inline, set `include_text=true` on `web_extract` / `web_search_extract` (it is still bounded).
+and keep the canonical machine payload in **`structuredContent`**. If you expected "the extracted text" to
+show up inline, set `include_text=true` on `web_extract` or `search_evidence` (bounded by `max_chars`).
 
 ## Tool cookbook (Cursor / MCP users)
 
 These examples are written as **tool arguments** (what you paste into the tool call UI).
-Outputs are JSON-as-text; look at the `ok`, `warning_codes`, and the tool-specific fields described below.
+Look at `ok`, `warning_codes`, and the tool-specific fields described below.
 
-### `webpipe_meta` (what’s configured)
+### `webpipe_meta` (what's configured)
 
 ```json
 {}
@@ -201,12 +222,36 @@ Outputs are JSON-as-text; look at the `ok`, `warning_codes`, and the tool-specif
 
 Look for:
 - `configured.*`: which providers/backends are available
+- `available.*`: which search providers and optional tools are currently configured
 - `supported.*`: allowed enum values
-- `defaults.*`: what you get if you omit fields
+- `defaults.*`: recommended starting values
 
-### `web_search_extract` (the main “do the job” tool)
+Check usage/cost stats:
+```json
+{"method": "usage"}
+```
 
-Online query-mode:
+Reset usage counters:
+```json
+{"method": "usage_reset"}
+```
+
+### `search_evidence` (main evidence tool)
+
+URLs-mode (no search; deterministic, works without search API keys):
+
+```json
+{
+  "urls": ["https://example.com/docs/install", "https://example.com/docs/getting-started"],
+  "query": "installation steps",
+  "url_selection_mode": "query_rank",
+  "fetch_backend": "local",
+  "max_urls": 2,
+  "top_chunks": 4
+}
+```
+
+Search-mode (requires a search provider key: Brave, Tavily, or SearXNG):
 
 ```json
 {
@@ -235,39 +280,21 @@ JS-heavy pages (render in a headless browser first):
 }
 ```
 
-JS-heavy pages (try local first, then fallback to render when local is empty/low-signal):
-
-```json
-{
-  "query": "headers is an async function",
-  "urls": ["https://nextjs.org/docs/app/api-reference/functions/headers"],
-  "fetch_backend": "local",
-  "render_fallback_on_empty_extraction": true,
-  "render_fallback_on_low_signal": true,
-  "max_urls": 1,
-  "top_chunks": 6,
-  "max_chars": 20000
-}
-```
-
-Offline-ish urls-mode (no search; optionally rank chunks by query):
+Compact response (agent loops; ~10x smaller payload):
 
 ```json
 {
   "query": "installation steps",
-  "urls": ["https://example.com/docs/install", "https://example.com/docs/getting-started"],
-  "url_selection_mode": "query_rank",
-  "fetch_backend": "local",
-  "no_network": false,
-  "max_urls": 2,
-  "max_parallel_urls": 2,
-  "top_chunks": 4
+  "urls": ["https://example.com/docs/install"],
+  "max_urls": 1,
+  "top_chunks": 3,
+  "minimal_output": true
 }
 ```
 
 Look for:
 - `top_chunks[]`: the best evidence snippets (bounded)
-- `results[]`: per-URL details
+- `results[]`: per-URL details (omitted when `minimal_output=true`)
 - `warning_hints`: concrete next moves when extraction is empty/low-signal/blocked
 
 ### `web_extract` (single URL, extraction-first)
@@ -298,45 +325,6 @@ Use this when you already know the URL and want extraction, not discovery.
 
 Use this when you need status/content-type/bytes and only sometimes need bounded text.
 
-### `web_search` (search only)
-
-```json
-{
-  "query": "rmcp mcp server examples",
-  "provider": "auto",
-  "auto_mode": "fallback",
-  "max_results": 10
-}
-```
-
-### `web_cache_search_extract` (no network; cache corpus only)
-
-```json
-{
-  "query": "route handlers",
-  "max_docs": 50,
-  "top_chunks": 5
-}
-```
-
-Use this for deterministic “did we already fetch something relevant?” checks.
-
-### `web_deep_research` (evidence gather + optional synthesis)
-
-Evidence-only mode (most inspectable):
-
-```json
-{
-  "query": "What are the main recent approaches to tool-using LLM agents?",
-  "synthesize": false,
-  "include_evidence": true,
-  "provider": "auto",
-  "fetch_backend": "local",
-  "max_urls": 3,
-  "top_chunks": 5
-}
-```
-
 ### `arxiv_search` / `arxiv_enrich`
 
 ```json
@@ -355,9 +343,21 @@ Evidence-only mode (most inspectable):
 }
 ```
 
+### `web_perplexity` (when key is configured)
+
+This tool is only visible when `WEBPIPE_PERPLEXITY_API_KEY` is set:
+
+```json
+{
+  "query": "What are the trade-offs between retrieval-augmented generation and long context?",
+  "model": "sonar",
+  "timeout_ms": 20000
+}
+```
+
 ## Tool cookbook (agent/workflow authors)
 
-If you’re writing an agent that uses `webpipe` as a subsystem, the most reliable pattern is:
+If you're writing an agent that uses `webpipe` as a subsystem, the most reliable pattern is:
 
 1) **Start bounded**: small `max_results`, `max_urls`, `top_chunks`, `max_chars`.
 2) **Branch on warnings**:
@@ -367,32 +367,20 @@ If you’re writing an agent that uses `webpipe` as a subsystem, the most reliab
 4) **Use cache to get repeatable behavior**:
    - warm cache with `no_network=false, cache_write=true`
    - then evaluate with `no_network=true` to eliminate network flakiness
+5) **Use `minimal_output=true` for tight loops** where you only need `top_chunks` and `warning_codes`.
 
-You can treat `ok=false` as “tool call failed” and use `error.hint` as the “next move”.
+You can treat `ok=false` as "tool call failed" and use `error.hint` as the "next move".
 
 Environment variables (optional, provider-dependent):
 - **Brave search**: `WEBPIPE_BRAVE_API_KEY` (or `BRAVE_SEARCH_API_KEY`)
 - **Tavily search**: `WEBPIPE_TAVILY_API_KEY` (or `TAVILY_API_KEY`)
 - **SearXNG search** (self-hosted): `WEBPIPE_SEARXNG_ENDPOINT` (or `WEBPIPE_SEARXNG_ENDPOINTS`)
 - **Firecrawl fetch**: `WEBPIPE_FIRECRAWL_API_KEY` (or `FIRECRAWL_API_KEY`)
-- **Perplexity deep research**: `WEBPIPE_PERPLEXITY_API_KEY` (or `PERPLEXITY_API_KEY`)
+- **Perplexity synthesis**: `WEBPIPE_PERPLEXITY_API_KEY` (or `PERPLEXITY_API_KEY`)
 - **ArXiv endpoint override** (debug): `WEBPIPE_ARXIV_ENDPOINT` (default `https://export.arxiv.org/api/query`)
-
-## Safety defaults
-
-`webpipe` drops request-secret headers by default:
-- `Authorization`
-- `Cookie`
-- `Proxy-Authorization`
-
-If a caller supplies them, responses include a warning:
-- `warning_codes` contains `unsafe_request_headers_dropped`
-- `request.dropped_request_headers` lists header *names only*
-
-To opt in (only for trusted endpoints), set `WEBPIPE_ALLOW_UNSAFE_HEADERS=true`.
 
 ## Quick test
 
 ```bash
-cargo test -p webpipe-mcp --features stdio
+cargo test -p webpipe --features stdio -- --skip live_
 ```

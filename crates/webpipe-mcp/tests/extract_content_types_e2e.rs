@@ -258,7 +258,16 @@ async fn web_extract_handles_multiple_content_types() {
     let v_pdf = call_extract(&service, &format!("{base}/pdf_bad"), None).await;
     assert_eq!(v_pdf["ok"].as_bool(), Some(true));
     assert_eq!(v_pdf["content_type"].as_str(), Some("application/pdf"));
-    assert_eq!(v_pdf["extract"]["engine"].as_str(), Some("pdf-extract"));
+    // When PDF extraction fails, webpipe may fall back to a low-fidelity “strings” scan.
+    // Both engines are PDF-ish, but `pdf-strings` communicates that quality is degraded.
+    assert!(
+        matches!(
+            v_pdf["extract"]["engine"].as_str(),
+            Some("pdf-extract") | Some("pdf-strings")
+        ),
+        "unexpected pdf engine: {:?}",
+        v_pdf["extract"]["engine"]
+    );
     let warnings = v_pdf["warnings"].as_array().cloned().unwrap_or_default();
     assert!(warnings
         .iter()

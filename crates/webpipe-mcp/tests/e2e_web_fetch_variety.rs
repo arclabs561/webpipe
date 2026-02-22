@@ -75,6 +75,20 @@ async fn webpipe_web_fetch_handles_variety_of_urls_and_content_types() {
             }),
         )
         .route(
+            "/rate_limited",
+            get(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [
+                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                        (header::RETRY_AFTER, "7"),
+                    ],
+                    "rate limited",
+                )
+                    .into_response()
+            }),
+        )
+        .route(
             "/redirect",
             get(|| async {
                 // 302 -> /html (fragment should never be sent; query should be ok).
@@ -197,10 +211,81 @@ async fn webpipe_web_fetch_handles_variety_of_urls_and_content_types() {
     .await;
     assert_eq!(v_404["ok"].as_bool(), Some(true));
     assert_eq!(v_404["status"].as_u64(), Some(404));
-    let codes = v_404["warning_codes"].as_array().cloned().unwrap_or_default();
+    let codes = v_404["warning_codes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        codes.iter().any(|c| c.as_str() == Some("http_status_error")),
+        codes
+            .iter()
+            .any(|c| c.as_str() == Some("http_status_error")),
         "expected http_status_error warning_codes; got {codes:?}"
+    );
+
+    // HTTP 429 should be classified as rate limiting (and surface Retry-After on request).
+    let v_429 = call(
+        &service,
+        "web_fetch",
+        serde_json::json!({
+            "url": format!("{base}/rate_limited"),
+            "fetch_backend": "local",
+            "include_text": false,
+            "include_headers": true,
+            "timeout_ms": 5000,
+            "max_bytes": 200_000,
+            "cache_read": false,
+            "cache_write": true
+        }),
+    )
+    .await;
+    assert_eq!(v_429["ok"].as_bool(), Some(true));
+    assert_eq!(v_429["status"].as_u64(), Some(429));
+    let codes = v_429["warning_codes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        codes
+            .iter()
+            .any(|c| c.as_str() == Some("http_status_error")),
+        "expected http_status_error warning_codes; got {codes:?}"
+    );
+    assert!(
+        codes
+            .iter()
+            .any(|c| c.as_str() == Some("http_rate_limited")),
+        "expected http_rate_limited warning_codes; got {codes:?}"
+    );
+    assert_eq!(
+        v_429["headers"]["retry-after"].as_str(),
+        Some("7"),
+        "expected retry-after header to be present; payload={v_429}"
+    );
+
+    // Ensure Retry-After persists through cache rehydration (metadata allowlist).
+    let v_429_cache = call(
+        &service,
+        "web_fetch",
+        serde_json::json!({
+            "url": format!("{base}/rate_limited"),
+            "fetch_backend": "local",
+            "no_network": true,
+            "include_text": false,
+            "include_headers": true,
+            "timeout_ms": 5000,
+            "max_bytes": 200_000,
+            "cache_read": true,
+            "cache_write": false
+        }),
+    )
+    .await;
+    assert_eq!(v_429_cache["ok"].as_bool(), Some(true));
+    assert_eq!(v_429_cache["status"].as_u64(), Some(429));
+    assert_eq!(v_429_cache["source"].as_str(), Some("cache"));
+    assert_eq!(
+        v_429_cache["headers"]["retry-after"].as_str(),
+        Some("7"),
+        "expected retry-after header to persist in cache; payload={v_429_cache}"
     );
 
     service.cancel().await.expect("cancel");

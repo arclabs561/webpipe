@@ -58,7 +58,10 @@ async fn web_extract_pipeline_timeout_returns_warning_code_instead_of_hanging() 
                 cmd.env("WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS", "0");
                 // Keep this test hermetic.
                 cmd.env("WEBPIPE_DOTENV", "0");
-                cmd.env("WEBPIPE_CACHE_DIR", std::env::temp_dir().join("webpipe-timeout-guards"));
+                cmd.env(
+                    "WEBPIPE_CACHE_DIR",
+                    std::env::temp_dir().join("webpipe-timeout-guards"),
+                );
             }))
             .expect("spawn mcp child"),
         )
@@ -84,7 +87,9 @@ async fn web_extract_pipeline_timeout_returns_warning_code_instead_of_hanging() 
     assert_eq!(v["ok"].as_bool(), Some(false));
     let codes = v["warning_codes"].as_array().cloned().unwrap_or_default();
     assert!(
-        codes.iter().any(|c| c.as_str() == Some("extract_pipeline_timeout")),
+        codes
+            .iter()
+            .any(|c| c.as_str() == Some("extract_pipeline_timeout")),
         "warning_codes={codes:?} payload={v}"
     );
     assert!(
@@ -101,7 +106,8 @@ async fn web_extract_pipeline_timeout_returns_warning_code_instead_of_hanging() 
 
 #[tokio::test]
 async fn web_extract_links_timeout_is_bounded_and_returns_empty_links() {
-    let body = "<html><body><main><h1>Doc</h1><p>hello</p><a href=\"/a\">A</a></main></body></html>";
+    let body =
+        "<html><body><main><h1>Doc</h1><p>hello</p><a href=\"/a\">A</a></main></body></html>";
     let body_s = body.to_string();
     let app = Router::new()
         .route(
@@ -111,7 +117,10 @@ async fn web_extract_links_timeout_is_bounded_and_returns_empty_links() {
                 async move { ([(header::CONTENT_TYPE, "text/html")], b) }
             }),
         )
-        .route("/a", get(|| async { ([(header::CONTENT_TYPE, "text/html")], "ok") }));
+        .route(
+            "/a",
+            get(|| async { ([(header::CONTENT_TYPE, "text/html")], "ok") }),
+        );
     let addr = serve(app).await;
     let url = format!("http://{addr}/doc");
 
@@ -123,7 +132,10 @@ async fn web_extract_links_timeout_is_bounded_and_returns_empty_links() {
                 // Force immediate link-timeout deterministically.
                 cmd.env("WEBPIPE_LINKS_TIMEOUT_MS", "0");
                 cmd.env("WEBPIPE_DOTENV", "0");
-                cmd.env("WEBPIPE_CACHE_DIR", std::env::temp_dir().join("webpipe-timeout-guards"));
+                cmd.env(
+                    "WEBPIPE_CACHE_DIR",
+                    std::env::temp_dir().join("webpipe-timeout-guards"),
+                );
             }))
             .expect("spawn mcp child"),
         )
@@ -188,7 +200,10 @@ async fn web_extract_semantic_timeout_is_deterministic_at_zero() {
                 cmd.args(["mcp-stdio"]);
                 cmd.env("WEBPIPE_SEMANTIC_TIMEOUT_MS", "0");
                 cmd.env("WEBPIPE_DOTENV", "0");
-                cmd.env("WEBPIPE_CACHE_DIR", std::env::temp_dir().join("webpipe-timeout-guards"));
+                cmd.env(
+                    "WEBPIPE_CACHE_DIR",
+                    std::env::temp_dir().join("webpipe-timeout-guards"),
+                );
             }))
             .expect("spawn mcp child"),
         )
@@ -216,7 +231,9 @@ async fn web_extract_semantic_timeout_is_deterministic_at_zero() {
     assert_eq!(v["ok"].as_bool(), Some(true));
     let codes = v["warning_codes"].as_array().cloned().unwrap_or_default();
     assert!(
-        codes.iter().any(|c| c.as_str() == Some("semantic_rerank_timeout")),
+        codes
+            .iter()
+            .any(|c| c.as_str() == Some("semantic_rerank_timeout")),
         "warning_codes={codes:?} payload={v}"
     );
     let sem_warns = v
@@ -225,7 +242,9 @@ async fn web_extract_semantic_timeout_is_deterministic_at_zero() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        sem_warns.iter().any(|c| c.as_str() == Some("semantic_rerank_timeout")),
+        sem_warns
+            .iter()
+            .any(|c| c.as_str() == Some("semantic_rerank_timeout")),
         "semantic.warnings={sem_warns:?} payload={v}"
     );
 
@@ -234,7 +253,8 @@ async fn web_extract_semantic_timeout_is_deterministic_at_zero() {
 
 #[tokio::test]
 async fn web_search_extract_links_timeout_is_deterministic_at_zero() {
-    let body = "<html><body><main><h1>Doc</h1><p>hello</p><a href=\"/a\">A</a></main></body></html>";
+    let body =
+        "<html><body><main><h1>Doc</h1><p>hello</p><a href=\"/a\">A</a></main></body></html>";
     let body_s = body.to_string();
     let app = Router::new()
         .route(
@@ -244,7 +264,10 @@ async fn web_search_extract_links_timeout_is_deterministic_at_zero() {
                 async move { ([(header::CONTENT_TYPE, "text/html")], b) }
             }),
         )
-        .route("/a", get(|| async { ([(header::CONTENT_TYPE, "text/html")], "ok") }));
+        .route(
+            "/a",
+            get(|| async { ([(header::CONTENT_TYPE, "text/html")], "ok") }),
+        );
     let addr = serve(app).await;
     let url = format!("http://{addr}/doc");
 
@@ -256,7 +279,10 @@ async fn web_search_extract_links_timeout_is_deterministic_at_zero() {
                 // Force immediate link-timeout deterministically.
                 cmd.env("WEBPIPE_LINKS_TIMEOUT_MS", "0");
                 cmd.env("WEBPIPE_DOTENV", "0");
-                cmd.env("WEBPIPE_CACHE_DIR", std::env::temp_dir().join("webpipe-timeout-guards"));
+                cmd.env(
+                    "WEBPIPE_CACHE_DIR",
+                    std::env::temp_dir().join("webpipe-timeout-guards"),
+                );
             }))
             .expect("spawn mcp child"),
         )
@@ -300,7 +326,10 @@ async fn web_search_extract_links_timeout_is_deterministic_at_zero() {
         "extract.links={}",
         res0["extract"]["links"]
     );
-    let codes = res0["warning_codes"].as_array().cloned().unwrap_or_default();
+    let codes = res0["warning_codes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         codes.iter().any(|c| c.as_str() == Some("links_timeout")),
         "warning_codes={codes:?} payload={v}"
@@ -353,7 +382,10 @@ async fn web_explore_extract_links_timeout_is_deterministic_at_zero() {
                 cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                 cmd.env("WEBPIPE_LINKS_TIMEOUT_MS", "0");
                 cmd.env("WEBPIPE_DOTENV", "0");
-                cmd.env("WEBPIPE_CACHE_DIR", std::env::temp_dir().join("webpipe-timeout-guards"));
+                cmd.env(
+                    "WEBPIPE_CACHE_DIR",
+                    std::env::temp_dir().join("webpipe-timeout-guards"),
+                );
             }))
             .expect("spawn mcp child"),
         )
@@ -390,14 +422,21 @@ async fn web_explore_extract_links_timeout_is_deterministic_at_zero() {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     assert_eq!(
-        pages0.get("links")
+        pages0
+            .get("links")
             .and_then(|x| x.as_array())
             .map(|a| a.len()),
         Some(0),
         "links={}",
-        pages0.get("links").cloned().unwrap_or(serde_json::Value::Null)
+        pages0
+            .get("links")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
     );
-    let codes = pages0["warning_codes"].as_array().cloned().unwrap_or_default();
+    let codes = pages0["warning_codes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         codes.iter().any(|c| c.as_str() == Some("links_timeout")),
         "warning_codes={codes:?} payload={v}"
@@ -416,7 +455,10 @@ async fn web_cache_search_extract_timeout_is_deterministic_at_zero() {
                 cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                 cmd.env("WEBPIPE_CACHE_SEARCH_TIMEOUT_MS", "0");
                 cmd.env("WEBPIPE_DOTENV", "0");
-                cmd.env("WEBPIPE_CACHE_DIR", std::env::temp_dir().join("webpipe-timeout-guards"));
+                cmd.env(
+                    "WEBPIPE_CACHE_DIR",
+                    std::env::temp_dir().join("webpipe-timeout-guards"),
+                );
             }))
             .expect("spawn mcp child"),
         )
@@ -442,7 +484,9 @@ async fn web_cache_search_extract_timeout_is_deterministic_at_zero() {
     assert_eq!(v["ok"].as_bool(), Some(false));
     let codes = v["warning_codes"].as_array().cloned().unwrap_or_default();
     assert!(
-        codes.iter().any(|c| c.as_str() == Some("cache_search_timeout")),
+        codes
+            .iter()
+            .any(|c| c.as_str() == Some("cache_search_timeout")),
         "warning_codes={codes:?} payload={v}"
     );
 
@@ -470,7 +514,10 @@ async fn web_fetch_cache_io_timeout_is_deterministic_at_zero() {
                 cmd.args(["mcp-stdio"]);
                 cmd.env("WEBPIPE_CACHE_IO_TIMEOUT_MS", "0");
                 cmd.env("WEBPIPE_DOTENV", "0");
-                cmd.env("WEBPIPE_CACHE_DIR", std::env::temp_dir().join("webpipe-timeout-guards"));
+                cmd.env(
+                    "WEBPIPE_CACHE_DIR",
+                    std::env::temp_dir().join("webpipe-timeout-guards"),
+                );
             }))
             .expect("spawn mcp child"),
         )
@@ -524,7 +571,10 @@ async fn search_evidence_surfaces_cache_io_timeout_when_cache_io_disabled() {
                 cmd.args(["mcp-stdio"]);
                 cmd.env("WEBPIPE_CACHE_IO_TIMEOUT_MS", "0");
                 cmd.env("WEBPIPE_DOTENV", "0");
-                cmd.env("WEBPIPE_CACHE_DIR", std::env::temp_dir().join("webpipe-timeout-guards"));
+                cmd.env(
+                    "WEBPIPE_CACHE_DIR",
+                    std::env::temp_dir().join("webpipe-timeout-guards"),
+                );
             }))
             .expect("spawn mcp child"),
         )
@@ -558,7 +608,10 @@ async fn search_evidence_surfaces_cache_io_timeout_when_cache_io_disabled() {
         .and_then(|a| a.first())
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let codes = res0["warning_codes"].as_array().cloned().unwrap_or_default();
+    let codes = res0["warning_codes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         codes.iter().any(|c| c.as_str() == Some("cache_io_timeout")),
         "warning_codes={codes:?} payload={v}"
@@ -566,4 +619,3 @@ async fn search_evidence_surfaces_cache_io_timeout_when_cache_io_disabled() {
 
     service.cancel().await.expect("cancel");
 }
-

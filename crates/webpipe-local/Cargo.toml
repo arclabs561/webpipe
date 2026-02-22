@@ -3,6 +3,7 @@ name = "webpipe-local"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+publish = false
 description = "Local (reqwest + filesystem cache) implementations for webpipe."
 repository = "https://github.com/arclabs561/webpipe"
 homepage = "https://github.com/arclabs561/webpipe"
@@ -27,8 +28,8 @@ pdf-extract = "0.10.0"
 tempfile = "3.10"
 base64 = { version = "0.22", optional = true }
 quick-xml = "0.37"
-slabs_crate = { package = "slabs", version = "0.1.0", path = "../../../slabs" }
-textprep_crate = { package = "textprep", version = "0.1.0", path = "../../../textprep" }
+slabs_crate = { package = "slabs", version = "0.1.0" }
+textprep_crate = { package = "textprep", version = "0.1.0" }
 
 [dev-dependencies]
 axum = "0.7"

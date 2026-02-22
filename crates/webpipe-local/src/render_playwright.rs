@@ -394,32 +394,28 @@ main().catch((e) => bad('fetch_failed', String(e && e.message ? e.message : e), 
         buf
     });
 
-    let status = match tokio::time::timeout(Duration::from_millis(hard_timeout_ms), child.wait()).await
-    {
-        Ok(r) => r.map_err(|e| {
-            Error::NotConfigured(format!(
+    let status =
+        match tokio::time::timeout(Duration::from_millis(hard_timeout_ms), child.wait()).await {
+            Ok(r) => r.map_err(|e| {
+                Error::NotConfigured(format!(
                 "Playwright render requires Node.js (`node`) and the Playwright npm package: {e}"
             ))
-        })?,
-        Err(_) => {
-            let _ = child.kill().await;
-            // Avoid leaving zombie processes around; wait best-effort.
-            let _ = child.wait().await;
-            // Don't leak background tasks if the child never produced output.
-            stdout_task.abort();
-            stderr_task.abort();
-            return Err(Error::Fetch(format!(
-                "Playwright render hard timeout after {hard_timeout_ms}ms"
-            )));
-        }
-    };
+            })?,
+            Err(_) => {
+                let _ = child.kill().await;
+                // Avoid leaving zombie processes around; wait best-effort.
+                let _ = child.wait().await;
+                // Don't leak background tasks if the child never produced output.
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(Error::Fetch(format!(
+                    "Playwright render hard timeout after {hard_timeout_ms}ms"
+                )));
+            }
+        };
 
-    let out_stdout = stdout_task
-        .await
-        .unwrap_or_default();
-    let out_stderr = stderr_task
-        .await
-        .unwrap_or_default();
+    let out_stdout = stdout_task.await.unwrap_or_default();
+    let out_stderr = stderr_task.await.unwrap_or_default();
 
     let out = std::process::Output {
         status,

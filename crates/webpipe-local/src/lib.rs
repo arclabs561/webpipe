@@ -43,7 +43,12 @@ impl FsCache {
         let mut out = BTreeMap::new();
         for (k, v) in headers {
             match k.trim().to_ascii_lowercase().as_str() {
-                "content-type" | "content-length" | "etag" | "last-modified" | "cache-control" => {
+                "content-type"
+                | "content-length"
+                | "etag"
+                | "last-modified"
+                | "cache-control"
+                | "retry-after" => {
                     out.insert(k.clone(), v.clone());
                 }
                 _ => {}
@@ -539,10 +544,11 @@ impl LocalFetcher {
                 reqwest::header::HeaderName::from_bytes(k.as_bytes()),
                 reqwest::header::HeaderValue::from_str(v),
             ) {
-                if !allow_unsafe && Self::is_sensitive_request_header(&name) {
-                    if !Self::allow_sensitive_header_for_url(url) {
-                        continue;
-                    }
+                if !allow_unsafe
+                    && Self::is_sensitive_request_header(&name)
+                    && !Self::allow_sensitive_header_for_url(url)
+                {
+                    continue;
                 }
                 rb = rb.header(name, value);
             }
@@ -579,8 +585,9 @@ impl FetchBackend for LocalFetcher {
                     };
                     match join {
                         Ok(r) => {
-                            let hit = r
-                                .map_err(|e| Error::Cache(format!("cache get join failed: {e}")))??;
+                            let hit = r.map_err(|e| {
+                                Error::Cache(format!("cache get join failed: {e}"))
+                            })??;
                             timings_ms.insert("cache_get".to_string(), t0.elapsed().as_millis());
                             if let Some(mut hit) = hit {
                                 hit.timings_ms = timings_ms;
@@ -588,7 +595,8 @@ impl FetchBackend for LocalFetcher {
                             }
                         }
                         Err(()) => {
-                            timings_ms.insert("cache_get_timeout".to_string(), t0.elapsed().as_millis());
+                            timings_ms
+                                .insert("cache_get_timeout".to_string(), t0.elapsed().as_millis());
                             self.cache_io_disabled
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -677,18 +685,18 @@ impl FetchBackend for LocalFetcher {
                                         r.map_err(|e| {
                                             Error::Cache(format!("cache put join failed: {e}"))
                                         })??;
-                                        timings_ms
-                                            .insert("cache_put".to_string(), t_put.elapsed().as_millis());
+                                        timings_ms.insert(
+                                            "cache_put".to_string(),
+                                            t_put.elapsed().as_millis(),
+                                        );
                                     }
                                     Err(()) => {
                                         timings_ms.insert(
                                             "cache_put_timeout".to_string(),
                                             t_put.elapsed().as_millis(),
                                         );
-                                        self.cache_io_disabled.store(
-                                            true,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        self.cache_io_disabled
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -794,7 +802,10 @@ impl FetchBackend for LocalFetcher {
                             timings_ms.insert("cache_put".to_string(), t_put.elapsed().as_millis());
                         }
                         Err(()) => {
-                            timings_ms.insert("cache_put_timeout".to_string(), t_put.elapsed().as_millis());
+                            timings_ms.insert(
+                                "cache_put_timeout".to_string(),
+                                t_put.elapsed().as_millis(),
+                            );
                             self.cache_io_disabled
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -1253,7 +1264,12 @@ mod tests {
                 prop_assert!(
                     matches!(
                         kl.as_str(),
-                        "content-type" | "content-length" | "etag" | "last-modified" | "cache-control"
+                        "content-type"
+                            | "content-length"
+                            | "etag"
+                            | "last-modified"
+                            | "cache-control"
+                            | "retry-after"
                     ),
                     "unexpected cached meta header key: {kl}"
                 );

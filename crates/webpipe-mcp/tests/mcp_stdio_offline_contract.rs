@@ -119,9 +119,11 @@ fn webpipe_mcp_stdio_offline_contract() {
             let t = by_name.get(must_have).expect("tool exists");
             let desc = t.description.as_deref().unwrap_or("");
             assert!(!desc.trim().is_empty(), "{must_have} missing description");
+            // Descriptions follow "Best for: / Not this when: / Output:" pattern.
+            // Each must have an actionable output hint or explicit use-case guidance.
             assert!(
-                desc.contains("JSON"),
-                "{must_have} description should mention JSON output for discovery"
+                desc.contains("Best for") || desc.contains("Call this") || desc.contains("Output"),
+                "{must_have} description should have 'Best for:', 'Call this', or 'Output:' guidance; got: {desc:?}"
             );
         }
         // Annotations contract: titles exist and hints match expected shape.

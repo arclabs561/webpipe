@@ -1148,7 +1148,7 @@ fn vlm_strip_json_fence(s: &str) -> &str {
         let rest = rest.trim_start();
         let rest = rest.strip_prefix("json").unwrap_or(rest);
         let rest = rest.strip_prefix("JSON").unwrap_or(rest);
-        let rest = rest.trim_start_matches(|c: char| c == '\n' || c == '\r');
+        let rest = rest.trim_start_matches(['\n', '\r']);
         if let Some(end) = rest.rfind("```") {
             return rest[..end].trim();
         }
@@ -1521,6 +1521,7 @@ fn vlm_validate_critique_json(v: &serde_json::Value) -> bool {
 }
 
 #[cfg(feature = "vlm")]
+#[allow(clippy::too_many_arguments)]
 async fn vlm_openrouter_call(
     http: &reqwest::Client,
     url: &str,
@@ -1652,8 +1653,7 @@ async fn vlm_openrouter_call(
                 }
             }
             let (text_trunc, clipped) = vlm_truncate_chars(&text, max_chars);
-            let parsed =
-                vlm_extract_json_object(&text_trunc).filter(|p| vlm_validate_critique_json(p));
+            let parsed = vlm_extract_json_object(&text_trunc).filter(vlm_validate_critique_json);
             serde_json::json!({
                 "schema_version": 1,
                 "kind": "webpipe_vlm_openrouter",
@@ -1758,22 +1758,61 @@ mod mcp {
         }
     }
 
+    /// Maps deprecated tool names to their current canonical names.
+    ///
+    /// When a tool is renamed, add an entry here to document the migration path.
+    /// Deprecated tools remain callable (they delegate to the canonical handler)
+    /// but are excluded from the default visible toolset.
+    ///
+    /// Inspired by github/github-mcp-server's `deprecated_tool_aliases.go`.
+    /// Used in `webpipe_meta` to populate `supported.deprecated_aliases`.
+    #[allow(dead_code)]
+    const DEPRECATED_TOOL_ALIASES: &[(&str, &str)] = &[
+        // Fetch aliases (redundant names; web_fetch / web_extract are canonical)
+        ("http_fetch", "web_fetch"),
+        ("page_extract", "web_extract"),
+        ("page_extract_text", "web_extract"),
+        // Search-extract aliases (search_evidence is the Normal-toolset canonical name)
+        ("_web_search_extract_debug", "search_evidence"),
+    ];
+
     fn mcp_tool_allowed(tool_name: &str, toolset: McpToolset) -> bool {
         // Small, opinionated surfaces: the point is to reduce choice overload in Cursor.
         match toolset {
             McpToolset::Debug => true,
-            McpToolset::Normal => matches!(
+            // Normal toolset: one meta tool (webpipe_meta covers usage + usage_reset via method=),
+        // core fetch/extract/search tools, and research/academic tools.
+        //
+        // Design invariant: every tool in this list must work with ZERO API keys configured.
+        // API-key-gated tools (web_perplexity, etc.) are shown conditionally — only when
+        // their key is actually set — so the default surface is fully functional out of the box.
+        //
+        // Deprecated aliases are excluded here; they remain callable but not default-visible.
+        McpToolset::Normal => {
+            // Always-on: work without any API keys.
+            let keyless = matches!(
                 tool_name,
                 "webpipe_meta"
-                    | "webpipe_usage"
                     | "web_fetch"
                     | "web_extract"
                     | "search_evidence"
-                    | "web_perplexity"
                     | "arxiv_search"
                     | "arxiv_enrich"
                     | "paper_search"
-            ),
+            );
+            if keyless {
+                return true;
+            }
+            // Conditionally visible: show only when the required key is configured.
+            // This keeps the default surface fully functional while surfacing
+            // optional premium integrations when they're actually usable.
+            match tool_name {
+                "web_perplexity" => {
+                    has_env("WEBPIPE_PERPLEXITY_API_KEY") || has_env("PERPLEXITY_API_KEY")
+                }
+                _ => false,
+            }
+        }
         }
     }
 
@@ -1817,6 +1856,118 @@ mod mcp {
             let mut out = String::new();
             let mut last_space = true;
             for ch in s.chars() {
+                // Fold a small set of common Greek letters into ASCII tokens.
+                //
+                // Rationale: academic text and PDFs often contain β/Ω/θ/... where users naturally
+                // type "beta"/"omega"/"theta" in queries. This keeps keys and overlap scoring
+                // stable and more intuitive without changing display text.
+                match ch {
+                    'α' | 'Α' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("alpha ");
+                        last_space = true;
+                        continue;
+                    }
+                    'β' | 'Β' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("beta ");
+                        last_space = true;
+                        continue;
+                    }
+                    'γ' | 'Γ' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("gamma ");
+                        last_space = true;
+                        continue;
+                    }
+                    'δ' | 'Δ' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("delta ");
+                        last_space = true;
+                        continue;
+                    }
+                    'ε' | 'ϵ' | 'Ε' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("epsilon ");
+                        last_space = true;
+                        continue;
+                    }
+                    'λ' | 'Λ' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("lambda ");
+                        last_space = true;
+                        continue;
+                    }
+                    'μ' | 'µ' | 'Μ' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("mu ");
+                        last_space = true;
+                        continue;
+                    }
+                    'π' | 'Π' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("pi ");
+                        last_space = true;
+                        continue;
+                    }
+                    'φ' | 'ϕ' | 'Φ' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("phi ");
+                        last_space = true;
+                        continue;
+                    }
+                    'ω' | 'Ω' | 'Ω' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("omega ");
+                        last_space = true;
+                        continue;
+                    }
+                    'ρ' | 'Ρ' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("rho ");
+                        last_space = true;
+                        continue;
+                    }
+                    'σ' | 'ς' | 'Σ' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("sigma ");
+                        last_space = true;
+                        continue;
+                    }
+                    'θ' | 'ϑ' => {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        out.push_str("theta ");
+                        last_space = true;
+                        continue;
+                    }
+                    _ => {}
+                }
                 let c = ch.to_ascii_lowercase();
                 if c.is_ascii_alphanumeric() {
                     out.push(c);
@@ -2570,11 +2721,11 @@ mod mcp {
 
     fn looks_like_js_challenge(status: u16, extracted_text: &str, title: Option<&str>) -> bool {
         // Generic “JS required / challenge page” detector, used for warnings + agentic bailout.
-        if status == 403 || status == 429 {
-            // Many challenge pages show up as 403/429.
+        if status == 403 {
+            // Many challenge pages show up as 403.
             return true;
         }
-        // For 200-ish pages, avoid false positives where a real docs page *mentions* a challenge
+        // For non-403 pages (including 429), avoid false positives where a real docs page *mentions* a challenge
         // string (e.g., “challenge-error-text”) as part of troubleshooting content.
         //
         // Use a small weighted signal score. Only return true when the page looks like an actual
@@ -2746,7 +2897,12 @@ mod mcp {
         if chrome_hits >= 1 {
             let mut total = 0usize;
             let mut short = 0usize;
-            for line in t.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).take(400) {
+            for line in t
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .take(400)
+            {
                 total = total.saturating_add(1);
                 if line.chars().count() <= 40 {
                     short = short.saturating_add(1);
@@ -3178,7 +3334,7 @@ mod mcp {
                                 }
                                 md.push_str(&excerpt);
                                 if text0.chars().count() > 300 {
-                                    md.push_str("…");
+                                    md.push('…');
                                 }
                                 md.push('\n');
                             }
@@ -3274,11 +3430,21 @@ mod mcp {
         // Precompute stable source URL order so chunks can cite sources as [1], [2], ...
         // (Even when we print chunks before the Sources section.)
         let mut source_urls: Vec<String> = Vec::new();
+        let mut source_final_urls: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
             for r in arr.iter() {
                 let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
                 if !url.is_empty() {
                     source_urls.push(url.to_string());
+                    let final_url = r
+                        .get("final_url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if !final_url.is_empty() && final_url != url {
+                        source_final_urls.insert(url.to_string(), final_url.to_string());
+                    }
                 }
             }
         }
@@ -3332,6 +3498,14 @@ mod mcp {
                     }
                     if !url.is_empty() {
                         line.push_str(&format!(": {url}"));
+                        if let Some(fu) = source_final_urls.get(url) {
+                            let fu = fu.trim();
+                            if !fu.is_empty() {
+                                line.push_str(" (→ ");
+                                line.push_str(fu);
+                                line.push(')');
+                            }
+                        }
                     }
                     line.push_str(" — ");
                     line.push_str(short.trim_end());
@@ -3525,6 +3699,29 @@ mod mcp {
                 md.push('\n');
             }
         }
+        if let Some(hints) = payload.get("warning_hints").and_then(|v| v.as_object()) {
+            if !hints.is_empty() {
+                md.push_str("### Warning hints\n\n");
+                let mut ks: Vec<&String> = hints.keys().collect();
+                ks.sort();
+                for k in ks.into_iter().take(12) {
+                    let hint = hints
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if hint.is_empty() {
+                        continue;
+                    }
+                    md.push_str("- `");
+                    md.push_str(k);
+                    md.push_str("`: ");
+                    md.push_str(hint);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+        }
 
         // Sources (bounded by max_urls <= 10). Use stable indices so chunks can cite sources as [1], [2], ...
         let include_text = req
@@ -3543,6 +3740,11 @@ mod mcp {
                     if url.is_empty() {
                         continue;
                     }
+                    let final_url = r
+                        .get("final_url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
                     // Prefer a human title when available (only present when include_structure=true).
                     let title = r
                         .pointer("/extract/structure/title")
@@ -3581,6 +3783,11 @@ mod mcp {
                     md.push_str("- url: ");
                     md.push_str(url);
                     md.push('\n');
+                    if !final_url.is_empty() && final_url != url {
+                        md.push_str("- final_url: ");
+                        md.push_str(final_url);
+                        md.push('\n');
+                    }
                     if status != 0 {
                         md.push_str("- status: ");
                         md.push_str(&status.to_string());
@@ -3739,6 +3946,8 @@ mod mcp {
             || all_codes.contains("chunks_filtered_low_signal")
             || all_codes.contains("empty_extraction");
         let has_trunc = all_codes.contains("body_truncated_by_max_bytes");
+        let has_trunc_retry = all_codes.contains("retried_due_to_truncation");
+        let has_github_repo_readme = all_codes.contains("github_repo_rewritten_to_raw_readme");
 
         // Priority 1: challenge gating.
         if has_js_challenge {
@@ -3780,8 +3989,70 @@ mod mcp {
         if has_trunc {
             next.push(NextStep {
                 id: "trunc_increase_max_bytes",
-                text: "Increase `max_bytes` (or set `include_text=false`) to avoid truncating the fetched HTML before extraction.".to_string(),
+                text: if has_trunc_retry {
+                    "Fetch was still truncated after a retry. Increase `max_bytes` (and/or `truncation_retry_max_bytes`) or use a smaller/deeper URL."
+                        .to_string()
+                } else {
+                    "Increase `max_bytes` (or set `retry_on_truncation=true`) to avoid truncating the fetched body before extraction."
+                        .to_string()
+                },
             });
+        }
+
+        // Priority 4: repo/docs workflows (reduce “maybe try…” ambiguity).
+        if has_github_repo_readme {
+            let qlc = query.to_ascii_lowercase();
+            let apiish = qlc.contains("api")
+                || qlc.contains("endpoint")
+                || qlc.contains("method")
+                || qlc.contains("function")
+                || qlc.contains("docs")
+                || qlc.contains("documentation");
+            if apiish || query.is_empty() {
+                next.push(NextStep {
+                    id: "github_repo_try_repo_ingest",
+                    text: "If you need more than README (API surface / examples), use `repo_ingest` (bounded GitHub API fetch) or pass urls=[...] that point to specific `github.com/.../blob/...` docs/code pages."
+                        .to_string(),
+                });
+            }
+        }
+
+        // Priority 5: search hygiene when results skew toward forums (e.g. Reddit).
+        if mode == "search" && !query.is_empty() {
+            let mut forum_like = false;
+            for u in source_urls
+                .iter()
+                .map(|s| s.as_str())
+                .chain(source_final_urls.values().map(|s| s.as_str()))
+            {
+                let lc = u.to_ascii_lowercase();
+                if lc.contains("reddit.com")
+                    || lc.contains("news.ycombinator.com")
+                    || lc.contains("stackoverflow.com")
+                    || lc.contains("stackexchange.com")
+                {
+                    forum_like = true;
+                    break;
+                }
+            }
+            if forum_like {
+                let qlc = query.to_ascii_lowercase();
+                let rustish = qlc.contains("rust")
+                    || qlc.contains("cargo")
+                    || qlc.contains("crate")
+                    || qlc.contains("crates.io")
+                    || qlc.contains("docs.rs");
+                next.push(NextStep {
+                    id: "search_restrict_domains",
+                    text: if rustish {
+                        "Search results include forum-like domains. For Rust crates, restrict domains (e.g. `domains_allow=[\"docs.rs\",\"crates.io\",\"github.com\"]`) or use a query like `site:docs.rs <crate> OR site:crates.io <crate>`."
+                            .to_string()
+                    } else {
+                        "Search results include forum-like domains. Restrict domains with `domains_allow`/`domains_deny` (or pass urls=[...]) to force higher-signal docs/articles."
+                            .to_string()
+                    },
+                });
+            }
         }
 
         // Keep this short; only emit when it adds value.
@@ -4120,7 +4391,7 @@ mod mcp {
 
         md.push_str("## Notes\n\n");
         md.push_str("- The Markdown below is a summary view. The canonical JSON payload is always in `structured_content`.\n");
-        md.push_str("- If you want full extracted page text, set `include_text=true` (bounded by `max_chars`).\n\n");
+        md.push_str("- If you want full page body text, set `include_text=true` (bounded by `max_text_chars`).\n\n");
 
         if !ok {
             md.push_str("## Error\n\n");
@@ -4174,6 +4445,41 @@ mod mcp {
                 for w in ws.iter().filter_map(|v| v.as_str()).take(12) {
                     md.push_str("- ");
                     md.push_str(w);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+        }
+        if let Some(codes) = payload.get("warning_codes").and_then(|v| v.as_array()) {
+            let codes_s: Vec<&str> = codes.iter().filter_map(|v| v.as_str()).collect();
+            if !codes_s.is_empty() {
+                md.push_str("### Warning codes\n\n");
+                for c in codes_s.iter().take(12) {
+                    md.push_str("- `");
+                    md.push_str(c);
+                    md.push_str("`\n");
+                }
+                md.push('\n');
+            }
+        }
+        if let Some(hints) = payload.get("warning_hints").and_then(|v| v.as_object()) {
+            if !hints.is_empty() {
+                md.push_str("### Warning hints\n\n");
+                let mut ks: Vec<&String> = hints.keys().collect();
+                ks.sort();
+                for k in ks.into_iter().take(12) {
+                    let hint = hints
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if hint.is_empty() {
+                        continue;
+                    }
+                    md.push_str("- `");
+                    md.push_str(k);
+                    md.push_str("`: ");
+                    md.push_str(hint);
                     md.push('\n');
                 }
                 md.push('\n');
@@ -4291,7 +4597,7 @@ mod mcp {
                     md.push_str("   - ");
                     md.push_str(s.trim_end());
                     if snippet.chars().count() > 240 {
-                        md.push_str("…");
+                        md.push('…');
                     }
                     md.push('\n');
                 }
@@ -4489,6 +4795,41 @@ mod mcp {
                 md.push('\n');
             }
         }
+        if let Some(codes) = payload.get("warning_codes").and_then(|v| v.as_array()) {
+            let codes_s: Vec<&str> = codes.iter().filter_map(|v| v.as_str()).collect();
+            if !codes_s.is_empty() {
+                md.push_str("### Warning codes\n\n");
+                for c in codes_s.iter().take(12) {
+                    md.push_str("- `");
+                    md.push_str(c);
+                    md.push_str("`\n");
+                }
+                md.push('\n');
+            }
+        }
+        if let Some(hints) = payload.get("warning_hints").and_then(|v| v.as_object()) {
+            if !hints.is_empty() {
+                md.push_str("### Warning hints\n\n");
+                let mut ks: Vec<&String> = hints.keys().collect();
+                ks.sort();
+                for k in ks.into_iter().take(12) {
+                    let hint = hints
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if hint.is_empty() {
+                        continue;
+                    }
+                    md.push_str("- `");
+                    md.push_str(k);
+                    md.push_str("`: ");
+                    md.push_str(hint);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+        }
         md
     }
 
@@ -4579,7 +4920,7 @@ mod mcp {
                 md.push_str("   - ");
                 md.push_str(short.trim_end());
                 if text.chars().count() > 260 {
-                    md.push_str("…");
+                    md.push('…');
                 }
                 md.push('\n');
             }
@@ -4597,6 +4938,64 @@ mod mcp {
                 md.push('\n');
             }
         }
+        md
+    }
+
+    fn web_perplexity_markdown(payload: &serde_json::Value) -> String {
+        let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+        let query = payload
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let elapsed_ms = payload
+            .get("elapsed_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let mut md = String::new();
+        if ok {
+            // Success path: the caller should build the answer/citations markdown inline.
+            // This function is used for the error paths; fall through to the summary.
+            let answer = payload
+                .get("answer")
+                .and_then(|a| a.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let citations = payload
+                .get("answer")
+                .and_then(|a| a.get("citations"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            md.push_str("## Answer\n\n");
+            md.push_str(answer);
+            if !citations.is_empty() {
+                md.push_str("\n\n## Citations\n");
+                for c in citations.iter().filter_map(|v| v.as_str()).take(12) {
+                    md.push_str("- ");
+                    md.push_str(c);
+                    md.push('\n');
+                }
+            }
+        } else {
+            md.push_str("## Error\n\n");
+            let err = payload.get("error").cloned().unwrap_or_default();
+            let code = err.get("code").and_then(|v| v.as_str()).unwrap_or("error");
+            let message = err.get("message").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let hint = err.get("hint").and_then(|v| v.as_str()).unwrap_or("");
+            md.push_str(&format!("- **code**: `{code}`\n"));
+            md.push_str(&format!("- **message**: {message}\n"));
+            if !hint.is_empty() {
+                md.push_str(&format!("\n**Hint**: {hint}\n"));
+            }
+        }
+
+        md.push_str(&format!("\n---\n*elapsed: {elapsed_ms}ms*"));
+        if !query.is_empty() {
+            md.push_str(&format!(" | *query: {query}*"));
+        }
+        md.push('\n');
         md
     }
 
@@ -4774,9 +5173,10 @@ mod mcp {
         }
 
         md.push_str("## Next\n\n");
-        md.push_str("- Use `web_search_extract` for retrieval (search + bounded extract).\n");
-        md.push_str("- Use `web_extract` for readability-focused extraction.\n");
-        md.push_str("- If the tools list feels too wide in Cursor, set `WEBPIPE_MCP_TOOLSET=normal` (Cursor-first). For debugging, set `WEBPIPE_MCP_TOOLSET=debug`.\n");
+        md.push_str("- Use `search_evidence` for any question requiring web evidence (search + extract + ranked chunks).\n");
+        md.push_str("- Use `web_extract` when you already have a URL and need readable text.\n");
+        md.push_str("- Use `arxiv_search` for academic papers; `arxiv_enrich` for metadata on a specific paper.\n");
+        md.push_str("- Pass `minimal_output=true` to `search_evidence` for a compact response (top_chunks + warning_codes only, ~10x smaller). Default is full response.\n");
         md
     }
 
@@ -4826,7 +5226,7 @@ mod mcp {
                     md.push_str("   - ");
                     md.push_str(n.trim_end());
                     if note.chars().count() > 140 {
-                        md.push_str("…");
+                        md.push('…');
                     }
                     md.push('\n');
                 }
@@ -5279,7 +5679,7 @@ mod mcp {
                         md.push_str("   - ");
                         md.push_str(short.trim_end());
                         if t.chars().count() > 220 {
-                            md.push_str("…");
+                            md.push('…');
                         }
                         md.push('\n');
                     }
@@ -5336,6 +5736,18 @@ mod mcp {
             .map(|t| t.text.clone())
             .unwrap_or_default();
         serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    /// Arguments for `webpipe_meta`.
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
+    struct WebpipeMetaArgs {
+        /// Operation to perform (default: "info").
+        ///
+        /// - "info" (default): server capabilities, configured backends, supported values, defaults.
+        /// - "usage": runtime stats — tool call counts, provider cost units, warning counts.
+        /// - "usage_reset": reset runtime stats (side effect; idempotent).
+        #[serde(default)]
+        method: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema, Default)]
@@ -5998,6 +6410,19 @@ mod mcp {
         /// - some redundant per-URL fields not needed for downstream agent steps
         #[serde(default)]
         pub(crate) compact: Option<bool>,
+
+        /// If true, return only the minimal signal set: ok, top_chunks,
+        /// warning_codes, warning_hints, elapsed_ms, schema_version, kind.
+        ///
+        /// Strips the full per-URL results[], request echo, search.steps, backend_provider,
+        /// agentic trace, and other verbose fields. Reduces response size by ~10x.
+        ///
+        /// Default: false (full response). Set true for tight agent loops that only need
+        /// the top evidence chunks and whether any warnings occurred.
+        ///
+        /// Inspired by the minimal_output pattern from github/github-mcp-server.
+        #[serde(default)]
+        pub(crate) minimal_output: Option<bool>,
     }
 
     /// Arguments for `web_explore_extract`.
@@ -6847,6 +7272,7 @@ mod mcp {
             Self::stats_record_provider(&mut s.fetch_backends, name, ok, 0, elapsed_ms, http_429);
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn maybe_rewrite_github_repo_url(
             &self,
             url: &str,
@@ -7242,16 +7668,22 @@ mod mcp {
                     "blocked_by_js_challenge" => p += 100,
                     "empty_extraction" => p += 80,
                     "http_status_error" => p += 60,
+                    "http_rate_limited" => p += 60,
                     "main_content_low_signal" => p += 25,
                     "chunks_filtered_low_signal" => p += 15,
                     "body_truncated_by_max_bytes" => p += 12,
                     "text_truncated_by_max_chars" => p += 8,
                     "retried_due_to_truncation" => p += 3,
+                    "truncation_retry_used" => p += 3,
                     "truncation_retry_failed" => p += 8,
                     "pdf_extract_failed" => p += 15,
                     "pdf_extract_panicked" => p += 20,
+                    "pdf_strings_fallback_used" => p += 10,
                     "pdf_shellout_used" => p += 2,
                     "pdf_shellout_unavailable" => p += 15,
+                    "arxiv_pdf_fallback_to_html" => p += 0,
+                    "openreview_pdf_fallback_to_forum" => p += 0,
+                    "openreview_pdf_fallback_to_api" => p += 0,
                     "pandoc_failed" => p += 12,
                     "image_no_text_extraction" => p += 30,
                     "media_no_text_extraction" => p += 30,
@@ -7381,12 +7813,7 @@ mod mcp {
             if issues.contains(&"body_truncated") {
                 score -= 10;
             }
-            if score < 0 {
-                score = 0;
-            }
-            if score > 100 {
-                score = 100;
-            }
+            score = score.clamp(0, 100);
 
             // “ok” is conservative: requires nonempty and not obviously junk/challenge.
             let ok = score >= 60 && nonempty && !js_challenge && !bundle_gunk;
@@ -7716,16 +8143,23 @@ mod mcp {
         }
 
         #[tool(
-            description = "Server meta: capabilities, configured backends, supported values, and recommended defaults (no secrets; JSON output)",
-            input_schema = std::sync::Arc::new({
-                let mut m = serde_json::Map::new();
-                m.insert("type".to_string(), serde_json::json!("object"));
-                m.insert("additionalProperties".to_string(), serde_json::json!(false));
-                m
-            }),
+            description = "Call this first to discover what is configured: which search providers (brave/tavily/searxng), fetch backends, privacy mode, and supported parameter enums are active. Use method=\"usage\" to check runtime cost/warning stats; method=\"usage_reset\" to clear them. Not this when you already know the config. Output: capabilities{}, configured{}, supported{}, defaults{} (no secrets).",
+            input_schema = Arc::new(tool_input_schema_draft07::<WebpipeMetaArgs>()),
             annotations(title = "Webpipe meta", read_only_hint = true, open_world_hint = false)
         )]
-        async fn webpipe_meta(&self) -> Result<CallToolResult, McpError> {
+        async fn webpipe_meta(
+            &self,
+            params: Parameters<Option<WebpipeMetaArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            let args = params.0.unwrap_or_default();
+            // Method dispatch: route "usage" and "usage_reset" to their dedicated handlers.
+            // This collapses three separate meta tools into one with a method param,
+            // keeping the individual tools alive as backward-compat delegates.
+            match args.method.as_deref().unwrap_or("info") {
+                "usage" => return self.webpipe_usage(Parameters(None)).await,
+                "usage_reset" => return self.webpipe_usage_reset().await,
+                _ => {}
+            }
             let t0 = std::time::Instant::now();
             self.stats_inc_tool("webpipe_meta");
 
@@ -7817,22 +8251,18 @@ mod mcp {
             let visible_tools: Vec<&'static str> = [
                 "webpipe_meta",
                 "webpipe_usage",
-                "webpipe_usage_reset",
+                "web_fetch",
+                "web_extract",
+                "search_evidence",
+                "web_perplexity",
+                "web_cache_search_extract",
+                "web_deep_research",
+                "web_search",
                 "web_seed_urls",
                 "web_seed_search_extract",
-                "web_fetch",
-                "http_fetch",
-                "web_extract",
-                "page_extract",
-                "page_extract_text",
                 "web_explore_extract",
                 "web_sitemap_extract",
                 "repo_ingest",
-                "web_search",
-                "web_search_extract",
-                "search_evidence",
-                "web_cache_search_extract",
-                "web_deep_research",
                 "paper_search",
                 "arxiv_search",
                 "arxiv_enrich",
@@ -7840,6 +8270,7 @@ mod mcp {
             .into_iter()
             .filter(|name| mcp_tool_allowed(name, ts))
             .collect();
+
 
             let mut payload = serde_json::json!({
                 "ok": true,
@@ -7866,42 +8297,46 @@ mod mcp {
                     "vision_gemini": cfg!(feature = "vision-gemini")
                 },
                 "supported": {
-                    // Tool surface is intentionally small and ordered by “what users reach for first”.
-                    // (UX note: some clients render tools in this order; others don’t, but this is a
-                    // stable, human-friendly reference regardless.)
+                    // Canonical tool surface ordered by "what users reach for first".
+                    // Deprecated aliases (http_fetch, page_extract, web_search_extract, etc.)
+                    // are listed under supported.deprecated_aliases.
                     "mcp_tools": [
                         "webpipe_meta",
                         "webpipe_usage",
-                        "webpipe_usage_reset",
+                        "web_fetch",
+                        "web_extract",
+                        "search_evidence",
+                        "web_perplexity",
+                        "web_cache_search_extract",
+                        "web_deep_research",
+                        "web_search",
                         "web_seed_urls",
                         "web_seed_search_extract",
-                        "web_fetch",
-                        "http_fetch",
-                        "web_extract",
-                        "page_extract",
-                        "page_extract_text",
                         "web_explore_extract",
                         "web_sitemap_extract",
                         "repo_ingest",
-                        "web_search",
-                        "web_search_extract",
-                        "search_evidence",
-                        "web_cache_search_extract",
-                        "web_deep_research",
                         "paper_search",
                         "arxiv_search",
                         "arxiv_enrich"
                     ],
                     "mcp_tools_visible": visible_tools,
                     "mcp_tool_groups": {
-                        "meta": ["webpipe_meta", "webpipe_usage", "webpipe_usage_reset"],
+                        "meta": ["webpipe_meta"],
                         "seeds": ["web_seed_urls", "web_seed_search_extract"],
-                        "fetch_extract": ["web_fetch", "http_fetch", "web_extract", "page_extract", "page_extract_text"],
+                        "fetch_extract": ["web_fetch", "web_extract"],
                         "explore": ["web_explore_extract"],
                         "sitemap": ["web_sitemap_extract"],
                         "ingest": ["repo_ingest"],
-                        "search": ["web_search", "web_search_extract", "search_evidence", "web_cache_search_extract"],
+                        "search": ["web_search", "search_evidence", "web_perplexity", "web_cache_search_extract"],
                         "research": ["web_deep_research", "paper_search", "arxiv_search", "arxiv_enrich"]
+                    },
+                    // Deprecated tool names and their canonical replacements.
+                    // These tools remain callable but are excluded from the default visible set.
+                    "deprecated_aliases": {
+                        "http_fetch": "web_fetch",
+                        "page_extract": "web_extract",
+                        "page_extract_text": "web_extract",
+                        "web_search_extract": "search_evidence"
                     },
                     // Values for web_search.provider
                     "providers": ["auto", "brave", "tavily", "searxng"],
@@ -7910,13 +8345,16 @@ mod mcp {
                     // Values for paper_search.backends
                     "paper_backends": ["semantic_scholar", "openalex", "google_scholar_serpapi"],
                     // Values for extraction engines
-                    "extraction_engines": ["html2text", "html_main", "readability", "html_hint", "text", "json", "xml", "markdown", "pdf-extract", "pdf-pdftotext", "pdf-mutool", "youtube_transcript", "pandoc", "image", "image_ocr", "media", "media_subtitles", "gemini_vision"],
+                    "extraction_engines": ["html2text", "html_main", "readability", "html_hint", "text", "json", "xml", "markdown", "pdf-extract", "pdf-pdftotext", "pdf-mutool", "pdf-strings", "youtube_transcript", "pandoc", "image", "image_ocr", "media", "media_subtitles", "gemini_vision"],
                     // Environment knobs (names only; no values) for opportunistic local tooling + multimodal.
                     "knobs": [
                         "WEBPIPE_SEARXNG_ENDPOINT",
                         "WEBPIPE_SEARXNG_ENDPOINTS",
                         "WEBPIPE_ARXIV_ENDPOINT",
                         "WEBPIPE_ARXIV_REWRITE_HOSTS",
+                        "WEBPIPE_ARXIV_PDF_FALLBACK_BASE",
+                        "WEBPIPE_OPENREVIEW_REWRITE_HOSTS",
+                        "WEBPIPE_OPENREVIEW_API_BASE",
                         "WEBPIPE_GITHUB_API_BASE",
                         "WEBPIPE_GITHUB_RAW_HOST",
                         "WEBPIPE_GITHUB_TOKEN",
@@ -7997,8 +8435,9 @@ mod mcp {
                             "auto_mode": "fallback",
                             "max_results": 5
                         },
-                        // For retrieval workflows, prefer search+extract rather than raw search.
-                        "web_search_extract": {
+                        // For retrieval workflows: search_evidence is the canonical Normal-mode name.
+                        // web_search_extract is the debug alias; same args, same handler.
+                        "search_evidence": {
                             "provider": "auto",
                             "auto_mode": "fallback",
                             "fetch_backend": "local",
@@ -8119,7 +8558,8 @@ mod mcp {
                         "semantic_top_k": 5,
                         "compact": true
                     },
-                    "web_search_extract": {
+                    // web_search_extract is the debug alias for search_evidence.
+                    "search_evidence_defaults": {
                         "provider": "auto",
                         "auto_mode": "fallback",
                         "selection_mode": "pareto",
@@ -8182,17 +8622,20 @@ mod mcp {
                 },
                 "tool_output_summary": {
                     "web_fetch": "Fetch a URL (cache-aware). Returns status/content_type/bytes_len and optional bounded text/headers.",
-                    "http_fetch": "Alias for web_fetch (same args; clearer name in some UIs).",
-                    "web_extract": "Fetch+extract readable text/chunks (bounded). Returns extract.engine, text_chars, top_chunks, warnings/hints.",
-                    "page_extract": "Alias for web_extract (same args; clearer name in some UIs).",
-                    "page_extract_text": "Alias for web_extract that forces include_text=true (bounded by max_chars).",
+                    "web_extract": "Fetch+extract readable text/chunks (bounded). Returns extract.engine, text_chars, extract.top_chunks, warnings/hints.",
                     "web_search": "Search only (bounded). Returns results[] with url/title/content and provider selection when provider=auto.",
-                    "web_search_extract": "Main tool: optional search -> fetch -> extract -> rank top_chunks across URLs (bounded).",
-                    "search_evidence": "Evidence pack (primary): optional search -> fetch -> extract -> rank top_chunks across URLs (bounded).",
+                    "search_evidence": "Primary evidence tool: search -> fetch -> extract -> rank top_chunks. Full response by default; set minimal_output=true for compact (top_chunks + warning_codes only).",
+                    "web_perplexity": "Perplexity-backed synthesis (requires API key). Returns answer text + citations[].",
                     "web_cache_search_extract": "Cache-only search: scan WEBPIPE_CACHE_DIR -> extract -> top_chunks (no network).",
                     "web_deep_research": "Evidence gatherer + optional synthesis. Prefer include_evidence for auditability.",
-                    "arxiv_search": "ArXiv Atom search (bounded). Returns papers[] (and optional semantic rerank metadata).",
-                    "arxiv_enrich": "ArXiv metadata (bounded) + optional discussion search via web_search."
+                    "arxiv_search": "ArXiv Atom search (bounded). Returns papers[] with title/abstract/authors/categories/pdf_url.",
+                    "arxiv_enrich": "ArXiv metadata (bounded) + optional discussion search via web_search.",
+                    "paper_search": "Multi-backend academic search (Semantic Scholar / OpenAlex / Google Scholar). Returns papers[] with citation counts.",
+                    // Deprecated aliases (still callable, not default-visible):
+                    "http_fetch": "DEPRECATED: use web_fetch instead.",
+                    "page_extract": "DEPRECATED: use web_extract instead.",
+                    "page_extract_text": "DEPRECATED: use web_extract with include_text=true instead.",
+                    "web_search_extract": "DEPRECATED: use search_evidence instead (same handler, same args)."
                 },
                 "configured": {
                     "providers": {
@@ -8232,8 +8675,15 @@ mod mcp {
                     }
                 },
                 "available": {
+                    // Currently configured search providers (keys present in env).
                     "providers": providers,
-                    "remote_fetch": remote_fetch
+                    // Remote fetch backends that are configured.
+                    "remote_fetch": remote_fetch,
+                    // API-key-gated tools that are currently visible/callable in Normal mode.
+                    // Empty = no optional tools configured; check configured.llm.* for what keys to add.
+                    "tools": {
+                        "web_perplexity": perplexity_configured
+                    }
                 },
                 "local_tools": local_tools
             });
@@ -8292,7 +8742,7 @@ mod mcp {
                 "max": max,
                 "seeds": seeds_out,
                 "notes": [
-                    "Use these with web_extract or web_search_extract(urls=[...], url_selection_mode=query_rank) to avoid paid search providers.",
+                    "Use these with web_extract or search_evidence(urls=[...], url_selection_mode=query_rank) to avoid paid search providers.",
                     "Prefer small bounds (max_urls/top_chunks/max_chars) and cache_read=true to stay deterministic."
                 ]
             });
@@ -8589,7 +9039,7 @@ mod mcp {
         }
 
         #[tool(
-            description = "Usage stats since server start: tool calls, warnings, and provider cost units (no secrets; JSON output)",
+            description = "Check provider cost unit consumption, per-tool call counts, and accumulated warning counts since server start. Best for budget tracking and diagnosing repeated warning patterns. Not this when you need search capability info — use webpipe_meta instead. Output: tool_calls{}, usage.search_providers{}, warnings.counts{}.",
             input_schema = Arc::new(tool_input_schema_draft07::<WebpipeUsageArgs>()),
             annotations(
                 title = "Webpipe usage",
@@ -8741,7 +9191,7 @@ mod mcp {
         }
 
         #[tool(
-            description = "Search arXiv metadata (Atom API; bounded; JSON output)",
+            description = "Best for: finding academic papers on arXiv by topic, author, or keyword. Not this when you have a specific paper ID — use arxiv_enrich instead. Output: papers[] with title, abstract, authors, categories, pdf_url (bounded by per_page). Supports category filters (cs.AI, cs.CL, etc.) and semantic reranking.",
             input_schema = Arc::new(tool_input_schema_draft07::<ArxivSearchArgs>()),
             annotations(title = "arXiv search", read_only_hint = true, open_world_hint = true)
         )]
@@ -8868,7 +9318,7 @@ mod mcp {
         }
 
         #[tool(
-            description = "Search academic paper metadata via Semantic Scholar / OpenAlex (and optional Google Scholar via SerpAPI) (bounded; JSON output)",
+            description = "Best for: searching academic papers across Semantic Scholar, OpenAlex, and optionally Google Scholar (via SerpAPI). Broader than arxiv_search — covers non-arXiv venues and richer citation metadata. Not this when you want arXiv-specific fields or PDF links — use arxiv_search instead. Output: papers[] with title, abstract, authors, venue, citation counts.",
             input_schema = Arc::new(tool_input_schema_draft07::<PaperSearchArgs>()),
             annotations(title = "Paper search", read_only_hint = true, open_world_hint = true)
         )]
@@ -8915,7 +9365,7 @@ mod mcp {
             warnings.dedup();
             let mut warning_codes: Vec<String> = warnings
                 .iter()
-                .map(|w| normalize_warning_code(*w).to_string())
+                .map(|w| normalize_warning_code(w).to_string())
                 .collect();
             warning_codes.sort();
             warning_codes.dedup();
@@ -8947,7 +9397,7 @@ mod mcp {
         }
 
         #[tool(
-            description = "Fetch arXiv paper metadata and optionally find discussion links (bounded; JSON output)",
+            description = "Best for: getting full metadata for a specific arXiv paper — abstract, authors, categories, PDF link, and optionally related discussion or review links. Requires an arXiv ID (e.g. 2401.12345) or URL. Not this when you need to discover papers — use arxiv_search first. Output: paper{} + optional discussions[].",
             input_schema = Arc::new(tool_input_schema_draft07::<ArxivEnrichArgs>()),
             annotations(title = "arXiv enrich", read_only_hint = true, open_world_hint = true)
         )]
@@ -9331,7 +9781,8 @@ mod mcp {
                         max_blocks: 0,
                         max_block_chars: 0,
                     };
-                    let mut p = webpipe_local::extract::extract_pipeline_from_bytes(&[], None, "", cfg);
+                    let mut p =
+                        webpipe_local::extract::extract_pipeline_from_bytes(&[], None, "", cfg);
                     p.extracted.warnings.push("extract_pipeline_timeout");
                     p
                 } else {
@@ -9386,8 +9837,12 @@ mod mcp {
                                 max_blocks: 0,
                                 max_block_chars: 0,
                             };
-                            let mut p =
-                                webpipe_local::extract::extract_pipeline_from_bytes(&[], None, "", cfg);
+                            let mut p = webpipe_local::extract::extract_pipeline_from_bytes(
+                                &[],
+                                None,
+                                "",
+                                cfg,
+                            );
                             p.extracted.warnings.push("extract_pipeline_timeout");
                             p
                         }
@@ -9457,7 +9912,11 @@ mod mcp {
                             // Link candidates are usually in the head/nav; avoid parsing huge bodies.
                             let cap_bytes = 750_000usize;
                             let b: &[u8] = bytes.as_slice();
-                            let b = if b.len() > cap_bytes { &b[..cap_bytes] } else { b };
+                            let b = if b.len() > cap_bytes {
+                                &b[..cap_bytes]
+                            } else {
+                                b
+                            };
                             let html = String::from_utf8_lossy(b).to_string();
                             webpipe_local::links::extract_link_candidates(
                                 &html,
@@ -9898,10 +10357,10 @@ mod mcp {
                 if !ok {
                     return false;
                 }
-                if !exclude_patterns.is_empty() {
-                    if exclude_patterns.iter().any(|pat| glob_match_simple(pat, p)) {
-                        return false;
-                    }
+                if !exclude_patterns.is_empty()
+                    && exclude_patterns.iter().any(|pat| glob_match_simple(pat, p))
+                {
+                    return false;
                 }
                 true
             }
@@ -9958,9 +10417,7 @@ mod mcp {
                 is_last: bool,
                 name: &str,
             ) {
-                let branch = if prefix.is_empty() {
-                    "└── "
-                } else if is_last {
+                let branch = if prefix.is_empty() || is_last {
                     "└── "
                 } else {
                     "├── "
@@ -10134,7 +10591,7 @@ mod mcp {
                 };
 
                 let bytes = r.bytes;
-                let mut is_binary = bytes.iter().any(|b| *b == 0);
+                let mut is_binary = bytes.contains(&0);
                 // Heuristic: huge non-text blobs should be treated as binary even without NUL.
                 if bytes.len() > 500_000 {
                     is_binary = true;
@@ -10386,7 +10843,7 @@ mod mcp {
                     }
                     let ll = l.to_ascii_lowercase();
                     if ll.starts_with("sitemap:") {
-                        let rest = l.splitn(2, ':').nth(1).unwrap_or("").trim();
+                        let rest = l.split_once(':').map(|x| x.1).unwrap_or("").trim();
                         if !rest.is_empty() {
                             out.push(rest.to_string());
                         }
@@ -10701,7 +11158,7 @@ mod mcp {
         }
 
         #[tool(
-            description = "Primary Cursor workflow: search (optional) → fetch → extract → rank top chunks into an evidence pack.\n\nModes:\n- urls-mode: pass urls=[...] (no web search; best for curated sources)\n- search-mode: pass query=... (uses provider/auto_mode if configured)\n- cache-corpus: pass query=... + no_network=true and omit urls (search over WEBPIPE_CACHE_DIR)\n\nPresets (exploration):\n- balanced (default)\n- deep (more thorough; enables agentic discovery)\n- smart (balanced + agentic)\n\nWhat you get (by default):\n- Markdown: Sources + short excerpts + top chunks + “Next” suggestions when blocked/low-signal\n- structured JSON: `results[*].extract.text_preview` (always) + `top_chunks` (always)\n\nFor full page text per URL, set include_text=true (bounded by max_chars).",
+            description = "Best for: any question requiring web evidence — research, current info, library docs, papers, or any query where you don't know the exact URL. Not this when you already have the URL — use web_extract. Not this for raw bytes/status — use web_fetch.\n\nOutput (full by default): top_chunks[] + results[] + request + search.steps + warning_codes. Set minimal_output=true for a compact response (~10x smaller): top_chunks + warning_codes only.\n\nModes:\n- search-mode (default): pass query=... to search then extract\n- urls-mode: pass urls=[...] to skip search and extract directly (deterministic)\n- cache-corpus: pass query=... + no_network=true to search local cache only\n\nPresets (exploration param): balanced (default) | deep (agentic discovery) | smart (balanced+agentic).\nFor full page text: set include_text=true (bounded by max_chars).\nFor JS-heavy pages: set fetch_backend=render (requires Playwright) or fetch_backend=firecrawl.",
             input_schema = Arc::new(tool_input_schema_draft07::<WebSearchExtractArgs>()),
             annotations(title = "Evidence pack", read_only_hint = true, open_world_hint = true)
         )]
@@ -10817,6 +11274,7 @@ mod mcp {
             let semantic_rerank = args.semantic_rerank.unwrap_or(false);
             let semantic_top_k = args.semantic_top_k.unwrap_or(5).min(50);
             let compact = args.compact.unwrap_or(true);
+            let minimal_output = args.minimal_output.unwrap_or(false);
             let retry_on_truncation = args.retry_on_truncation.unwrap_or(false);
             let truncation_retry_max_bytes = args.truncation_retry_max_bytes;
             // Default to agentic loop only when we're discovering URLs (search-mode).
@@ -10843,32 +11301,28 @@ mod mcp {
 
             // Deterministic fail-fast: allow disabling the render backend without relying on runtime
             // Node/Playwright detection (useful for tests and environments where Node isn't installed).
-            if fetch_backend == "render" {
-                if matches!(
+            if fetch_backend == "render"
+                && matches!(
                     std::env::var("WEBPIPE_RENDER_DISABLE")
                         .unwrap_or_default()
                         .trim()
                         .to_ascii_lowercase()
                         .as_str(),
                     "1" | "true" | "yes" | "on"
-                ) {
-                    let mut payload = serde_json::json!({
-                        "ok": false,
-                        "error": error_obj(
-                            ErrorCode::NotConfigured,
-                            "render backend disabled (WEBPIPE_RENDER_DISABLE)",
-                            "Unset WEBPIPE_RENDER_DISABLE to use fetch_backend=\"render\"."
-                        ),
-                        "request": { "fetch_backend": fetch_backend, "no_network": no_network }
-                    });
-                    add_envelope_fields(
-                        &mut payload,
-                        "web_search_extract",
-                        t0.elapsed().as_millis(),
-                    );
-                    let md = web_search_extract_markdown(&payload);
-                    return Ok(tool_result_markdown_with_json(payload, md));
-                }
+                )
+            {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "error": error_obj(
+                        ErrorCode::NotConfigured,
+                        "render backend disabled (WEBPIPE_RENDER_DISABLE)",
+                        "Unset WEBPIPE_RENDER_DISABLE to use fetch_backend=\"render\"."
+                    ),
+                    "request": { "fetch_backend": fetch_backend, "no_network": no_network }
+                });
+                add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+                let md = web_search_extract_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             // Privacy guardrails (fail closed for anonymous mode).
@@ -11349,12 +11803,14 @@ mod mcp {
                         )
                     });
                     let r = match tokio::time::timeout(remaining, handle).await {
-                        Ok(join) => join.unwrap_or_else(|_| webpipe_local::cache_search::CacheSearchResult {
-                            ok: false,
-                            scanned_entries: 0,
-                            selected_docs: 0,
-                            results: vec![],
-                            warnings: vec!["cache_search_task_failed"],
+                        Ok(join) => join.unwrap_or_else(|_| {
+                            webpipe_local::cache_search::CacheSearchResult {
+                                ok: false,
+                                scanned_entries: 0,
+                                selected_docs: 0,
+                                results: vec![],
+                                warnings: vec!["cache_search_task_failed"],
+                            }
                         }),
                         Err(_) => {
                             let mut payload = serde_json::json!({
@@ -11495,6 +11951,7 @@ mod mcp {
                         "web_search_extract",
                         t0.elapsed().as_millis(),
                     );
+                    if minimal_output { strip_minimal_output(&mut payload); }
                     let md = web_search_extract_markdown(&payload);
                     return Ok(tool_result_markdown_with_json(payload, md));
                 }
@@ -11603,14 +12060,12 @@ mod mcp {
                         && !url_looks_like_low_value_homepage(u)
                     {
                         out.push(u.clone());
-                    } else {
-                        if url_looks_like_auth_or_challenge(u) {
-                            dropped_auth += 1;
-                        } else if url_looks_like_promo_or_tracking(u) {
-                            dropped_promo += 1;
-                        } else if url_looks_like_low_value_homepage(u) {
-                            dropped_home += 1;
-                        }
+                    } else if url_looks_like_auth_or_challenge(u) {
+                        dropped_auth += 1;
+                    } else if url_looks_like_promo_or_tracking(u) {
+                        dropped_promo += 1;
+                    } else if url_looks_like_low_value_homepage(u) {
+                        dropped_home += 1;
                     }
                 }
                 // If we still need URLs, allow promo/tracking/homepage URLs (but still avoid auth walls if possible).
@@ -11631,7 +12086,7 @@ mod mcp {
                         }
                         // Prefer returning fewer seeds over adding obvious soft-junk.
                         // Agentic exploration can expand from good seeds; promo/homepage URLs tend to waste budget.
-                        if out.len() >= 1
+                        if !out.is_empty()
                             && (url_looks_like_promo_or_tracking(u)
                                 || url_looks_like_low_value_homepage(u))
                         {
@@ -12253,15 +12708,22 @@ mod mcp {
                                 "blocked_by_js_challenge" => p += 100,
                                 "empty_extraction" => p += 80,
                                 "http_status_error" => p += 60,
+                                "http_rate_limited" => p += 60,
                                 "main_content_low_signal" => p += 25,
                                 "chunks_filtered_low_signal" => p += 15,
                                 "body_truncated_by_max_bytes" => p += 12,
                                 "text_truncated_by_max_chars" => p += 8,
                                 "retried_due_to_truncation" => p += 3,
+                                "truncation_retry_used" => p += 3,
                                 "truncation_retry_failed" => p += 8,
                                 "pdf_extract_failed" => p += 15,
+                                "pdf_extract_panicked" => p += 20,
+                                "pdf_strings_fallback_used" => p += 10,
                                 "pdf_shellout_used" => p += 2,
                                 "pdf_shellout_unavailable" => p += 15,
+                                "arxiv_pdf_fallback_to_html" => p += 0,
+                                "openreview_pdf_fallback_to_forum" => p += 0,
+                                "openreview_pdf_fallback_to_api" => p += 0,
                                 "pandoc_failed" => p += 12,
                                 "image_no_text_extraction" => p += 30,
                                 "media_no_text_extraction" => p += 30,
@@ -12317,7 +12779,6 @@ mod mcp {
                                 semantic_top_k: Some(semantic_top_k),
                                 retry_on_truncation: Some(retry_on_truncation),
                                 truncation_retry_max_bytes,
-                                ..Default::default()
                             }))
                             .await?;
                         let v = payload_from_result(&r);
@@ -12335,6 +12796,9 @@ mod mcp {
                         let status_bad = status_u >= 400;
                         if status_bad && !warnings.iter().any(|w| w == "http_status_error") {
                             warnings.push("http_status_error".to_string());
+                        }
+                        if status_u == 429 && !warnings.iter().any(|w| w == "http_rate_limited") {
+                            warnings.push("http_rate_limited".to_string());
                         }
                         let hard_junk = warnings
                             .iter()
@@ -13284,7 +13748,7 @@ Rules:
                         let retry_cap = truncation_retry_max_bytes
                             .unwrap_or(retry_cap_default)
                             .max(max_bytes.saturating_add(1))
-                            .min(5_000_000);
+                            .min(20_000_000);
                         if retry_cap > max_bytes {
                             // Snapshot first attempt for diagnostics.
                             local_attempt_obj = Some(serde_json::json!({
@@ -13383,12 +13847,12 @@ Rules:
                         per_t0.elapsed().as_millis() as u64,
                         None,
                     );
-                    let local_final_url = fetched.final_url.clone();
-                    let local_status = fetched.status;
-                    let local_content_type = fetched.content_type.clone();
-                    let local_bytes_len = fetched.bytes.len();
-                    let local_truncated = fetched.truncated;
-                    let local_source = match fetched.source {
+                    let mut local_final_url = fetched.final_url.clone();
+                    let mut local_status = fetched.status;
+                    let mut local_content_type = fetched.content_type.clone();
+                    let mut local_bytes_len = fetched.bytes.len();
+                    let mut local_truncated = fetched.truncated;
+                    let mut local_source = match fetched.source {
                         FetchSource::Cache => "cache",
                         FetchSource::Network => "network",
                     };
@@ -13397,16 +13861,16 @@ Rules:
                         .and_then(|s| s.trim().parse::<u64>().ok())
                         .unwrap_or(2_000)
                         == 0;
-                    let cache_io_timed_out = cache_io_disabled
+                    let mut cache_io_timed_out = cache_io_disabled
                         || fetched.timings_ms.contains_key("cache_get_timeout")
                         || fetched.timings_ms.contains_key("cache_put_timeout");
 
                     // Attempt local extraction first; if it's empty and fallback is enabled + configured,
                     // retry *just this URL* via Firecrawl.
-                    let local_pdf_like = Self::content_type_is_pdf(local_content_type.as_deref())
+                    let mut local_pdf_like = Self::content_type_is_pdf(local_content_type.as_deref())
                         || Self::url_looks_like_pdf(&local_final_url)
                         || webpipe_local::extract::bytes_look_like_pdf(&fetched.bytes);
-                    let local_raw_text = if local_pdf_like {
+                    let mut local_raw_text = if local_pdf_like {
                         String::new()
                     } else {
                         fetched.text_lossy()
@@ -13419,6 +13883,204 @@ Rules:
                             width,
                             500,
                         );
+
+                    // Content-first: if PDF extraction is degraded (common for malformed/compressed
+                    // PDFs), fall back to a higher-signal HTML artifact when a conservative rewrite
+                    // is available (e.g. arXiv→ar5iv, OpenReview PDF→forum metadata page).
+                    // and use that higher-signal content for chunk selection/evidence.
+                    //
+                    // Note: this mirrors the behavior of the `web_extract` tool (which already
+                    // implements the same fallback), but the single-URL agentic hydration path
+                    // in `web_search_extract` does its own fetch+extract.
+                    if fetch_backend == "local" && !no_network && local_pdf_like {
+                        let pdf_extraction_degraded = local_extracted_obj.text.trim().is_empty()
+                            || local_extracted_obj.warnings.iter().any(|&w| {
+                                matches!(
+                                    normalize_warning_code(w),
+                                    "pdf_extract_failed"
+                                        | "pdf_extract_panicked"
+                                        | "pdf_strings_fallback_used"
+                                )
+                            });
+                        if pdf_extraction_degraded {
+                            #[derive(Clone)]
+                            struct PdfHtmlFallbackSpec {
+                                attempt_key: &'static str,
+                                kind: &'static str,
+                                warning_code: &'static str,
+                                url: String,
+                            }
+                            let mut fb_specs: Vec<PdfHtmlFallbackSpec> = Vec::new();
+                            if let Some(cands) = webpipe_local::rewrite::arxiv_pdf_html_candidates(
+                                local_final_url.as_str(),
+                            ) {
+                                if let Some(u) = cands.into_iter().next() {
+                                    fb_specs.push(PdfHtmlFallbackSpec {
+                                        attempt_key: "arxiv_pdf_html_fallback",
+                                        kind: "arxiv_pdf_to_html_fallback",
+                                        warning_code: "arxiv_pdf_fallback_to_html",
+                                        url: u,
+                                    });
+                                }
+                            }
+                            if let Some(cands) =
+                                webpipe_local::rewrite::openreview_pdf_api_candidates(
+                                    local_final_url.as_str(),
+                                )
+                            {
+                                if let Some(u) = cands.into_iter().next() {
+                                    fb_specs.push(PdfHtmlFallbackSpec {
+                                        attempt_key: "openreview_pdf_api_fallback",
+                                        kind: "openreview_pdf_to_api_fallback",
+                                        warning_code: "openreview_pdf_fallback_to_api",
+                                        url: u,
+                                    });
+                                }
+                            }
+                            if let Some(cands) =
+                                webpipe_local::rewrite::openreview_pdf_forum_candidates(
+                                    local_final_url.as_str(),
+                                )
+                            {
+                                if let Some(u) = cands.into_iter().next() {
+                                    fb_specs.push(PdfHtmlFallbackSpec {
+                                        attempt_key: "openreview_pdf_forum_fallback",
+                                        kind: "openreview_pdf_to_forum_fallback",
+                                        warning_code: "openreview_pdf_fallback_to_forum",
+                                        url: u,
+                                    });
+                                }
+                            }
+
+                            for fb in fb_specs {
+                                let fallback_url = fb.url.clone();
+                                let pdf_from_url = local_final_url.clone();
+                                let pdf_engine0 = local_extracted_obj.engine;
+                                let (_t0, pdf_text_chars0, _clip0) =
+                                    Self::truncate_to_chars(&local_extracted_obj.text, max_chars);
+                                let pdf_warn0: Vec<&'static str> = local_extracted_obj.warnings.clone();
+
+                                let t_fb0 = std::time::Instant::now();
+                                let fb_req = FetchRequest {
+                                    url: fallback_url.clone(),
+                                    timeout_ms: Some(timeout_ms_eff),
+                                    max_bytes: Some(max_bytes),
+                                    headers: BTreeMap::new(),
+                                    cache: FetchCachePolicy {
+                                        read: cache_read,
+                                        write: cache_write,
+                                        ttl_s: cache_ttl_s,
+                                    },
+                                };
+                                match self.fetcher.fetch(&fb_req).await {
+                                    Ok(r2) => {
+                                        let fb_final_url = r2.final_url.clone();
+                                        let fb_status = r2.status;
+                                        let fb_content_type = r2.content_type.clone();
+
+                                        let fb_pdf_like =
+                                            Self::content_type_is_pdf(fb_content_type.as_deref())
+                                                || Self::url_looks_like_pdf(&fb_final_url)
+                                                || webpipe_local::extract::bytes_look_like_pdf(&r2.bytes);
+                                        let fb_raw_text = if fb_pdf_like {
+                                            String::new()
+                                        } else {
+                                            r2.text_lossy()
+                                        };
+                                        let mut fb_extracted_obj =
+                                            webpipe_local::extract::best_effort_text_from_bytes(
+                                                &r2.bytes,
+                                                fb_content_type.as_deref(),
+                                                &fb_final_url,
+                                                width,
+                                                500,
+                                            );
+                                        let (_fb_t, fb_text_chars, _fb_clip) = Self::truncate_to_chars(
+                                            &fb_extracted_obj.text,
+                                            max_chars,
+                                        );
+                                        let fb_nonempty = fb_status < 400
+                                            && (fb_text_chars >= 80
+                                                || !fb_extracted_obj.text.trim().is_empty());
+                                        if fb_nonempty {
+                                            fb_extracted_obj.warnings.push(fb.warning_code);
+
+                                            let mut a =
+                                                attempts.as_object().cloned().unwrap_or_default();
+                                            a.insert(
+                                                fb.attempt_key.to_string(),
+                                                serde_json::json!({
+                                                    "kind": fb.kind,
+                                                    "ok": true,
+                                                    "from": pdf_from_url,
+                                                    "to": fb_final_url,
+                                                    "status": fb_status,
+                                                    "elapsed_ms": t_fb0.elapsed().as_millis(),
+                                                    "pdf": {
+                                                        "engine": pdf_engine0,
+                                                        "text_chars": pdf_text_chars0,
+                                                        "warning_codes": pdf_warn0
+                                                    }
+                                                }),
+                                            );
+                                            attempts = serde_json::Value::Object(a);
+
+                                            // Replace the local response + extraction with the HTML fallback.
+                                            fetched = r2;
+                                            local_final_url = fetched.final_url.clone();
+                                            local_status = fetched.status;
+                                            local_content_type = fetched.content_type.clone();
+                                            local_bytes_len = fetched.bytes.len();
+                                            local_truncated = fetched.truncated;
+                                            local_source = match fetched.source {
+                                                FetchSource::Cache => "cache",
+                                                FetchSource::Network => "network",
+                                            };
+                                            local_pdf_like = fb_pdf_like;
+                                            local_raw_text = fb_raw_text;
+                                            local_extracted_obj = fb_extracted_obj;
+                                            cache_io_timed_out = cache_io_disabled
+                                                || fetched.timings_ms.contains_key("cache_get_timeout")
+                                                || fetched.timings_ms.contains_key("cache_put_timeout");
+                                            break;
+                                        } else {
+                                            let mut a =
+                                                attempts.as_object().cloned().unwrap_or_default();
+                                            a.insert(
+                                                fb.attempt_key.to_string(),
+                                                serde_json::json!({
+                                                    "kind": fb.kind,
+                                                    "ok": false,
+                                                    "from": pdf_from_url,
+                                                    "to": fb_final_url,
+                                                    "status": fb_status,
+                                                    "elapsed_ms": t_fb0.elapsed().as_millis(),
+                                                    "error": "fallback_not_better"
+                                                }),
+                                            );
+                                            attempts = serde_json::Value::Object(a);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let mut a =
+                                            attempts.as_object().cloned().unwrap_or_default();
+                                        a.insert(
+                                            fb.attempt_key.to_string(),
+                                            serde_json::json!({
+                                                "kind": fb.kind,
+                                                "ok": false,
+                                                "from": pdf_from_url,
+                                                "to": fallback_url,
+                                                "elapsed_ms": t_fb0.elapsed().as_millis(),
+                                                "error": e.to_string()
+                                            }),
+                                        );
+                                        attempts = serde_json::Value::Object(a);
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // Handle client-side redirects (meta refresh / JS): enqueue the target if found.
                     if local_extracted_obj.engine == "redirect" {
@@ -13691,7 +14353,7 @@ Rules:
                                         false,
                                         false,
                                         local_extracted_obj,
-                                    cache_io_timed_out,
+                                        cache_io_timed_out,
                                     )
                                 }
                             }
@@ -13999,11 +14661,11 @@ Rules:
                             Vec::new()
                         } else {
                             let handle = tokio::task::spawn_blocking(move || {
-                            webpipe_local::links::extract_links(
-                                &raw_text2,
-                                Some(base_url.as_str()),
-                                max_links,
-                            )
+                                webpipe_local::links::extract_links(
+                                    &raw_text2,
+                                    Some(base_url.as_str()),
+                                    max_links,
+                                )
                             });
                             match tokio::time::timeout(
                                 std::time::Duration::from_millis(links_timeout_ms),
@@ -14040,6 +14702,9 @@ Rules:
                 let status_bad = status >= 400;
                 if status_bad {
                     warnings.push("http_status_error");
+                }
+                if status == 429 {
+                    warnings.push("http_rate_limited");
                 }
                 if let Some(o) = attempts.as_object() {
                     if let Some(lr) = o.get("local_retry") {
@@ -14350,12 +15015,12 @@ Rules:
                             let base = Some(base_url.as_str());
                             if markdown_like2 {
                                 webpipe_local::links::extract_markdown_link_candidates(
-                                    &raw,
-                                    base,
-                                    max_links2,
+                                    &raw, base, max_links2,
                                 )
                             } else {
-                                webpipe_local::links::extract_link_candidates(&raw, base, max_links2)
+                                webpipe_local::links::extract_link_candidates(
+                                    &raw, base, max_links2,
+                                )
                             }
                         });
                         match tokio::time::timeout(
@@ -14840,12 +15505,15 @@ Rules:
                 });
             }
             add_envelope_fields(&mut payload, "web_search_extract", t0.elapsed().as_millis());
+            if minimal_output {
+                strip_minimal_output(&mut payload);
+            }
             let md = web_search_extract_markdown(&payload);
             Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Cache-only retrieval: scan WEBPIPE_CACHE_DIR and extract matches for a query (offline; bounded; JSON output)",
+            description = "Best for: offline / deterministic retrieval from previously fetched pages — no network calls. Use this when you want reproducible results from your local cache corpus. Not this when you need fresh network data — use search_evidence instead. Output: top_chunks[] from cached documents matching the query.",
             input_schema = Arc::new(tool_input_schema_draft07::<WebCacheSearchExtractArgs>()),
             annotations(
                 title = "Cache search+extract",
@@ -14950,7 +15618,11 @@ Rules:
                         "cache_search_timeout_ms": cache_timeout_ms
                     }
                 });
-                add_envelope_fields(&mut payload, "web_cache_search_extract", t0.elapsed().as_millis());
+                add_envelope_fields(
+                    &mut payload,
+                    "web_cache_search_extract",
+                    t0.elapsed().as_millis(),
+                );
                 let md = web_cache_search_extract_markdown(&payload);
                 return Ok(tool_result_markdown_with_json(payload, md));
             }
@@ -15105,11 +15777,11 @@ Rules:
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
                         if one_ts > prev_ts {
-                            prev.as_object_mut().map(|m| {
+                            if let Some(m) = prev.as_object_mut() {
                                 if let Some(v) = one.get("fetched_at_epoch_s") {
                                     m.insert("fetched_at_epoch_s".to_string(), v.clone());
                                 }
-                            });
+                            }
                         }
 
                         // Merge warnings.
@@ -15185,7 +15857,7 @@ Rules:
                             ua.cmp(ub)
                         })
                 });
-                out.truncate(max_docs as usize);
+                out.truncate(max_docs);
                 *arr = out;
                 let after = arr.len();
                 if after != before {
@@ -15197,8 +15869,7 @@ Rules:
                 if let Some(arr) = results_json.as_array_mut() {
                     let use_embeddings = Self::openrouter_api_key_from_env().is_some();
                     let max_embed_docs = Self::semantic_embeddings_max_docs_from_env();
-                    let mut doc_i: usize = 0;
-                    for one in arr {
+                    for (doc_i, one) in arr.iter_mut().enumerate() {
                         let chunks = one
                             .get("chunks")
                             .and_then(|v| v.as_array())
@@ -15231,7 +15902,6 @@ Rules:
                         };
                         one.as_object_mut()
                             .map(|m| m.insert("semantic".to_string(), sem));
-                        doc_i += 1;
                     }
                 }
             }
@@ -15409,7 +16079,7 @@ Rules:
         }
 
         #[tool(
-            description = "Agentic research: gather evidence (search+extract) and optionally synthesize an answer (bounded; JSON output)",
+            description = "Best for: multi-source research questions that require gathering and synthesizing evidence across several pages. Not this for single-URL extraction — use web_extract. Not this when you want inspectable evidence without LLM synthesis — use search_evidence with synthesize=false. Output (synthesize=false): top_chunks[] + evidence[]. Output (synthesize=true): answer text + citations (non-deterministic; not reproducible from cache).",
             input_schema = Arc::new(tool_input_schema_draft07::<WebDeepResearchArgs>()),
             annotations(title = "Deep research", read_only_hint = true, open_world_hint = true)
         )]
@@ -15680,7 +16350,7 @@ Rules:
                     "model": model,
                     "error": error_obj(
                         ErrorCode::SearchFailed,
-                        "failed to gather evidence via web_search_extract",
+                        "failed to gather evidence via search_evidence",
                         "Inspect the `evidence` field for details; try a different provider or reduce max_urls/max_results."
                     ),
                     "request": {
@@ -16483,7 +17153,7 @@ Rules:
                                 "ok": false,
                                 "query": query,
                                 "model": model,
-                                "error": error_obj(ErrorCode::ProviderUnavailable, e.to_string(), "Retry later or reduce scope. You can still use web_search_extract output as evidence."),
+                                "error": error_obj(ErrorCode::ProviderUnavailable, e.to_string(), "Retry later or reduce scope. You can still use search_evidence output as evidence."),
                                 "request": {
                                     "provider": provider,
                                     "auto_mode": auto_mode,
@@ -16508,7 +17178,7 @@ Rules:
                             "ok": false,
                             "query": query,
                             "model": model,
-                            "error": error_obj(ErrorCode::ProviderUnavailable, e.to_string(), "Retry later or reduce scope. You can still use web_search_extract output as evidence."),
+                            "error": error_obj(ErrorCode::ProviderUnavailable, e.to_string(), "Retry later or reduce scope. You can still use search_evidence output as evidence."),
                             "request": {
                                 "provider": provider,
                                 "auto_mode": auto_mode,
@@ -16593,7 +17263,7 @@ Rules:
         }
 
         #[tool(
-            description = "Fetch a URL (cache-first; bounded; optional text/headers; safety drops auth/cookie headers; JSON output)",
+            description = "Best for: checking HTTP status, inspecting response headers, or fetching raw bytes from a URL you already know. Not this when you need readable text or ranked evidence — use web_extract (single URL) or search_evidence (search + extract) instead. Output: status, content_type, bytes_len, truncated, optional bounded text (set include_text=true). Cache-first; drops auth/cookie headers by default.",
             input_schema = Arc::new(tool_input_schema_draft07::<WebFetchArgs>()),
             annotations(title = "Fetch URL", read_only_hint = true, open_world_hint = true)
         )]
@@ -16939,6 +17609,9 @@ Rules:
                         if status_bad {
                             warnings.push("http_status_error");
                         }
+                        if resp.status == 429 {
+                            warnings.push("http_rate_limited");
+                        }
                         if text_clipped {
                             warnings.push("text_truncated_by_max_text_chars");
                         }
@@ -17112,6 +17785,9 @@ Rules:
             if status_bad {
                 warnings.push("http_status_error");
             }
+            if resp.status == 429 {
+                warnings.push("http_rate_limited");
+            }
             if text_clipped {
                 warnings.push("text_truncated_by_max_text_chars");
             }
@@ -17184,7 +17860,7 @@ Rules:
         }
 
         #[tool(
-            description = "Alias for web_fetch (same args; clearer name in some UIs)",
+            description = "DEPRECATED: use web_fetch instead (identical args and behavior). This alias exists for backward compatibility only and is excluded from the default toolset.",
             input_schema = Arc::new(tool_input_schema_draft07::<WebFetchArgs>()),
             annotations(title = "HTTP fetch (alias)", read_only_hint = true, open_world_hint = true)
         )]
@@ -17196,7 +17872,7 @@ Rules:
         }
 
         #[tool(
-            description = "Search the web (provider: brave/tavily/searxng/auto; auto picks configured providers; bounded; JSON output)",
+            description = "Best for: getting a list of relevant URLs and snippets for a query. Not this when you also need to extract page content — use search_evidence instead. Output: results[] with url/title/snippet, provider, and selection metadata. Providers: brave, tavily, searxng, auto (picks best configured).",
             input_schema = Arc::new(tool_input_schema_draft07::<WebSearchArgs>()),
             annotations(title = "Web search", read_only_hint = true, open_world_hint = true)
         )]
@@ -17234,7 +17910,7 @@ Rules:
                         "error": error_obj(
                             ErrorCode::NotSupported,
                             "offline-only mode disables web_search",
-                            "Use urls=[...] + no_network=true workflows (web_search_extract with urls, or web_cache_search_extract) or set WEBPIPE_OFFLINE_ONLY=0."
+                            "Use urls=[...] + no_network=true workflows (search_evidence with urls, or web_cache_search_extract) or set WEBPIPE_OFFLINE_ONLY=0."
                         )
                     });
                     add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
@@ -17255,7 +17931,7 @@ Rules:
                         "error": error_obj(
                             ErrorCode::NotSupported,
                             "anonymous mode disables web_search (API providers are deanonymizing)",
-                            "Use web_search_extract with urls=[...] (fetch routed via WEBPIPE_ANON_PROXY), or use web_cache_search_extract, or set WEBPIPE_PRIVACY_MODE=normal."
+                            "Use search_evidence with urls=[...] (fetch routed via WEBPIPE_ANON_PROXY), or use web_cache_search_extract, or set WEBPIPE_PRIVACY_MODE=normal."
                         )
                     });
                     add_envelope_fields(&mut payload, "web_search", t0.elapsed().as_millis());
@@ -18931,7 +19607,7 @@ Rules:
         }
 
         #[tool(
-            description = "Ask Perplexity directly and return a bounded answer + citations (JSON output)",
+            description = "Best for: fast single-turn Q&A with live web citations via Perplexity Sonar. Not this for multi-source evidence with per-URL control — use search_evidence instead. Only visible when WEBPIPE_PERPLEXITY_API_KEY is configured. Output: answer text + citations[].",
             input_schema = Arc::new(tool_input_schema_draft07::<WebPerplexityArgs>()),
             annotations(title = "Perplexity (answer + citations)", read_only_hint = true, open_world_hint = true)
         )]
@@ -18963,7 +19639,8 @@ Rules:
                     "request": { "timeout_ms": timeout_ms, "no_network": no_network }
                 });
                 add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
-                return Ok(tool_result(payload));
+                let md = web_perplexity_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
             }
 
             let pplx = match webpipe_local::perplexity::PerplexityClient::from_env(
@@ -18983,7 +19660,8 @@ Rules:
                         "request": { "timeout_ms": timeout_ms, "no_network": no_network }
                     });
                     add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
-                    return Ok(tool_result(payload));
+                    let md = web_perplexity_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
             };
 
@@ -19031,7 +19709,8 @@ Rules:
                         "request": { "timeout_ms": timeout_ms, "no_network": no_network, "search_mode": search_mode }
                     });
                     add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
-                    return Ok(tool_result(payload));
+                    let md = web_perplexity_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
                 Err(_) => {
                     let mut payload = serde_json::json!({
@@ -19042,7 +19721,8 @@ Rules:
                         "request": { "timeout_ms": timeout_ms, "no_network": no_network, "search_mode": search_mode }
                     });
                     add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
-                    return Ok(tool_result(payload));
+                    let md = web_perplexity_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
                 }
             };
 
@@ -19065,25 +19745,12 @@ Rules:
                 "timings_ms": resp.timings_ms
             });
             add_envelope_fields(&mut payload, "web_perplexity", t0.elapsed().as_millis());
-
-            let mut md = String::new();
-            md.push_str("## Answer\n\n");
-            md.push_str(payload["answer"]["text"].as_str().unwrap_or(""));
-            if let Some(cs) = payload["answer"]["citations"].as_array() {
-                if !cs.is_empty() {
-                    md.push_str("\n\n## Citations\n");
-                    for c in cs.iter().filter_map(|v| v.as_str()).take(12) {
-                        md.push_str("- ");
-                        md.push_str(c);
-                        md.push('\n');
-                    }
-                }
-            }
+            let md = web_perplexity_markdown(&payload);
             Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Fetch + extract readable text/chunks (and optional links/structure) from a URL (bounded; cache-aware; JSON output)",
+            description = "Best for: extracting readable text or ranked evidence chunks from a single URL you already have. Not this when you need to discover the right URL first — use search_evidence instead. Not this when you need raw bytes or status — use web_fetch. Output: top_chunks[] (ranked chunks, also at extract.chunks), extract.text_chars, extract.engine, warning_codes. Set include_text=true for full extracted text (bounded by max_chars).",
             input_schema = Arc::new(tool_input_schema_draft07::<WebExtractArgs>()),
             annotations(title = "Extract URL", read_only_hint = true, open_world_hint = true)
         )]
@@ -19436,7 +20103,11 @@ Rules:
                         }
                     } else {
                         let handle = tokio::task::spawn_blocking(move || {
-                            webpipe_local::semantic::semantic_rerank_chunks(&q0, &cands, semantic_top_k)
+                            webpipe_local::semantic::semantic_rerank_chunks(
+                                &q0,
+                                &cands,
+                                semantic_top_k,
+                            )
                         });
                         match tokio::time::timeout(
                             std::time::Duration::from_millis(semantic_timeout_ms),
@@ -19444,14 +20115,16 @@ Rules:
                         )
                         .await
                         {
-                            Ok(join) => join.unwrap_or_else(|_| webpipe_local::semantic::SemanticRerankResult {
-                                ok: false,
-                                backend: "unknown".to_string(),
-                                model_id: None,
-                                cache_hits: 0,
-                                cache_misses: 0,
-                                chunks: Vec::new(),
-                                warnings: vec!["semantic_rerank_task_failed"],
+                            Ok(join) => join.unwrap_or_else(|_| {
+                                webpipe_local::semantic::SemanticRerankResult {
+                                    ok: false,
+                                    backend: "unknown".to_string(),
+                                    model_id: None,
+                                    cache_hits: 0,
+                                    cache_misses: 0,
+                                    chunks: Vec::new(),
+                                    warnings: vec!["semantic_rerank_task_failed"],
+                                }
                             }),
                             Err(_) => webpipe_local::semantic::SemanticRerankResult {
                                 ok: false,
@@ -19620,7 +20293,7 @@ Rules:
                     None
                 };
 
-                let timeout_ms = args.timeout_ms.unwrap_or(20_000) as u64;
+                let timeout_ms = args.timeout_ms.unwrap_or(20_000);
                 let pr = match webpipe_local::render_playwright::render_html_playwright(
                     fetch_url.as_str(),
                     timeout_ms,
@@ -19872,18 +20545,23 @@ Rules:
                 let ct = resp_content_type.clone();
                 let final_url = resp_final_url.clone();
                 let query = args.query.clone();
-                let extract_timeout_ms = std::env::var("WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS")
+                let extract_timeout_ms_env = std::env::var("WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS")
                     .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    // Default: stay within the per-call timeout, but don't preempt it too aggressively.
-                    // The pipeline timeout exists to prevent hangs in blocking extraction, not to clip
-                    // legitimate slow parses (notably large PDFs) when the caller already allowed more time.
-                    .unwrap_or(
-                        args.timeout_ms
-                            .unwrap_or(20_000)
-                            .saturating_sub(1_000)
-                            .clamp(4_000, 45_000),
-                    );
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                let caller_timeout_ms = args.timeout_ms.unwrap_or(20_000);
+                let pdf_like = Self::content_type_is_pdf(ct.as_deref())
+                    || Self::url_looks_like_pdf(final_url.as_str())
+                    || webpipe_local::extract::bytes_look_like_pdf(bytes.as_ref());
+                let extract_timeout_ms_default = if pdf_like {
+                    // PDFs can be slower to parse/extract than HTML. Keep a bounded but more
+                    // permissive default so “arXiv PDF → evidence” works out of the box.
+                    45_000
+                } else {
+                    // For HTML-ish content, stay within the per-call fetch timeout by default.
+                    caller_timeout_ms.saturating_sub(1_000).clamp(4_000, 45_000)
+                };
+                let extract_timeout_ms =
+                    extract_timeout_ms_env.unwrap_or(extract_timeout_ms_default);
                 if extract_timeout_ms == 0 {
                     let mut payload = serde_json::json!({
                         "ok": false,
@@ -19965,7 +20643,7 @@ Rules:
                             "error": error_obj(
                                 ErrorCode::FetchFailed,
                                 format!("extract pipeline timed out after {extract_timeout_ms}ms"),
-                                "Extraction hit a bounded timeout (likely pathological HTML). Try reducing max_bytes/max_chars, or switching fetch_backend."
+                                "Extraction hit a bounded timeout. HTML parsing and PDF extraction can be slow. Try increasing timeout_ms (e.g. 60000), reducing max_bytes/max_chars, switching fetch_backend, or setting WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS."
                             ),
                             "request": {
                                 "fetch_backend": fetch_backend,
@@ -19991,15 +20669,255 @@ Rules:
                     }
                 }
             };
-            #[cfg(feature = "vision-gemini")]
-            let mut pipeline = pipeline0;
-            #[cfg(not(feature = "vision-gemini"))]
-            let pipeline = pipeline0;
+            // Allow post-extraction fallbacks to replace pipeline + response parts.
+            let mut resp_url = resp_url;
+            let mut resp_final_url = resp_final_url;
+            let mut resp_status = resp_status;
+            let mut resp_content_type = resp_content_type;
+            let mut resp_body_truncated = resp_body_truncated;
+            let mut resp_timings_ms = resp_timings_ms;
+            let mut resp_bytes = resp_bytes;
 
+            let mut pipeline = pipeline0;
             #[cfg(feature = "vision-gemini")]
             let mut vision_model: Option<String> = None;
             #[cfg(not(feature = "vision-gemini"))]
             let vision_model: Option<String> = None;
+
+            // Content-first: if PDF extraction fails (or panics) in the pure-Rust backend,
+            // fall back to a higher-signal HTML artifact (bounded, conservative rewrites) and
+            // extract evidence from that instead.
+            //
+            // This is bounded and only triggers when local PDF extraction produced degraded output.
+            let mut pdf_html_fallback_used_warning: Option<&'static str> = None;
+            if fetch_backend == "local" && !no_network {
+                let pdf_extraction_degraded = pipeline.text_chars == 0
+                    || pipeline.extracted.warnings.iter().any(|&w| {
+                        matches!(
+                            normalize_warning_code(w),
+                            "pdf_extract_failed" | "pdf_extract_panicked" | "pdf_strings_fallback_used"
+                        )
+                    });
+                if pdf_extraction_degraded {
+                    #[derive(Clone)]
+                    struct PdfHtmlFallbackSpec {
+                        attempt_key: &'static str,
+                        kind: &'static str,
+                        warning_code: &'static str,
+                        url: String,
+                    }
+                    let mut fb_specs: Vec<PdfHtmlFallbackSpec> = Vec::new();
+                    if let Some(cands) =
+                        webpipe_local::rewrite::arxiv_pdf_html_candidates(resp_final_url.as_str())
+                    {
+                        if let Some(u) = cands.into_iter().next() {
+                            fb_specs.push(PdfHtmlFallbackSpec {
+                                attempt_key: "arxiv_pdf_html_fallback",
+                                kind: "arxiv_pdf_to_html_fallback",
+                                warning_code: "arxiv_pdf_fallback_to_html",
+                                url: u,
+                            });
+                        }
+                    }
+                    if let Some(cands) =
+                        webpipe_local::rewrite::openreview_pdf_api_candidates(resp_final_url.as_str())
+                    {
+                        if let Some(u) = cands.into_iter().next() {
+                            fb_specs.push(PdfHtmlFallbackSpec {
+                                attempt_key: "openreview_pdf_api_fallback",
+                                kind: "openreview_pdf_to_api_fallback",
+                                warning_code: "openreview_pdf_fallback_to_api",
+                                url: u,
+                            });
+                        }
+                    }
+                    if let Some(cands) = webpipe_local::rewrite::openreview_pdf_forum_candidates(
+                        resp_final_url.as_str(),
+                    ) {
+                        if let Some(u) = cands.into_iter().next() {
+                            fb_specs.push(PdfHtmlFallbackSpec {
+                                attempt_key: "openreview_pdf_forum_fallback",
+                                kind: "openreview_pdf_to_forum_fallback",
+                                warning_code: "openreview_pdf_fallback_to_forum",
+                                url: u,
+                            });
+                        }
+                    }
+
+                    for fb in fb_specs {
+                        let fallback_url = fb.url.clone();
+                        let pdf_from_url = resp_final_url.clone();
+                        let pdf_engine0 = pipeline.extracted.engine;
+                        let pdf_text_chars0 = pipeline.text_chars;
+                        let pdf_warn0: Vec<&'static str> = pipeline.extracted.warnings.clone();
+
+                        let t_fb0 = std::time::Instant::now();
+                        let fb_req = FetchRequest {
+                            url: fallback_url.clone(),
+                            timeout_ms: req.timeout_ms,
+                            max_bytes: req.max_bytes,
+                            headers: BTreeMap::new(),
+                            cache: FetchCachePolicy {
+                                read: req.cache.read,
+                                write: req.cache.write,
+                                ttl_s: req.cache.ttl_s,
+                            },
+                        };
+                        match self.fetcher.fetch(&fb_req).await {
+                            Ok(resp2) => {
+                                let webpipe_core::FetchResponse {
+                                    url: fb_resp_url,
+                                    final_url: fb_final_url,
+                                    status: fb_status,
+                                    content_type: fb_content_type,
+                                    headers: _fb_headers,
+                                    bytes: fb_bytes0,
+                                    truncated: fb_body_truncated,
+                                    source: _fb_source,
+                                    timings_ms: fb_timings_ms,
+                                } = resp2;
+
+                                // Run extraction pipeline on the fallback HTML.
+                                let fb_bytes = std::sync::Arc::new(fb_bytes0);
+                                let bytes2 = fb_bytes.clone();
+                                let ct2 = fb_content_type.clone();
+                                let final_url2 = fb_final_url.clone();
+                                let query2 = args.query.clone();
+
+                                let extract_timeout_ms = std::env::var("WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS")
+                                    .ok()
+                                    .and_then(|s| s.trim().parse::<u64>().ok())
+                                    .unwrap_or(
+                                        args.timeout_ms
+                                            .unwrap_or(20_000)
+                                            .saturating_sub(1_000)
+                                            .clamp(4_000, 45_000),
+                                    );
+
+                                let fb_pipeline_opt = if extract_timeout_ms == 0 {
+                                    None
+                                } else {
+                                    let handle = tokio::task::spawn_blocking(move || {
+                                        let extracted0 =
+                                            webpipe_local::extract::best_effort_text_from_bytes(
+                                                &bytes2,
+                                                ct2.as_deref(),
+                                                final_url2.as_str(),
+                                                width,
+                                                500,
+                                            );
+                                        webpipe_local::extract::extract_pipeline_from_extracted(
+                                            &bytes2,
+                                            ct2.as_deref(),
+                                            final_url2.as_str(),
+                                            extracted0,
+                                            webpipe_local::extract::ExtractPipelineCfg {
+                                                query: query2.as_deref(),
+                                                width,
+                                                max_chars,
+                                                top_chunks,
+                                                max_chunk_chars,
+                                                include_structure,
+                                                max_outline_items,
+                                                max_blocks,
+                                                max_block_chars,
+                                            },
+                                        )
+                                    });
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_millis(extract_timeout_ms),
+                                        handle,
+                                    )
+                                    .await
+                                    {
+                                        Ok(join) => join.ok(),
+                                        Err(_) => None,
+                                    }
+                                };
+
+                                if let Some(fb_pipeline) = fb_pipeline_opt {
+                                    // Prefer fallback when it yields non-empty evidence and
+                                    // is not obviously worse than the PDF attempt.
+                                    let fb_pen =
+                                        Self::warning_penalty(&fb_pipeline.extracted.warnings);
+                                    let pdf_pen = Self::warning_penalty(&pdf_warn0);
+                                    let fb_nonempty =
+                                        fb_pipeline.text_chars >= 80 || !fb_pipeline.chunks.is_empty();
+                                    if fb_status < 400 && fb_nonempty && fb_pen <= pdf_pen {
+                                        pdf_html_fallback_used_warning = Some(fb.warning_code);
+                                        attempts_map.insert(
+                                            fb.attempt_key.to_string(),
+                                            serde_json::json!({
+                                                "kind": fb.kind,
+                                                "ok": true,
+                                                "from": pdf_from_url,
+                                                "to": fb_final_url,
+                                                "status": fb_status,
+                                                "elapsed_ms": t_fb0.elapsed().as_millis(),
+                                                "pdf": {
+                                                    "engine": pdf_engine0,
+                                                    "text_chars": pdf_text_chars0,
+                                                    "warning_codes": pdf_warn0
+                                                }
+                                            }),
+                                        );
+
+                                        // Replace response parts + pipeline so downstream payload uses
+                                        // the higher-signal HTML evidence.
+                                        resp_url = fb_resp_url;
+                                        resp_final_url = fb_final_url;
+                                        resp_status = fb_status;
+                                        resp_content_type = fb_content_type;
+                                        resp_body_truncated = fb_body_truncated;
+                                        resp_timings_ms = fb_timings_ms;
+                                        resp_bytes = fb_bytes;
+                                        pipeline = fb_pipeline;
+                                        break;
+                                    } else {
+                                        attempts_map.insert(
+                                            fb.attempt_key.to_string(),
+                                            serde_json::json!({
+                                                "kind": fb.kind,
+                                                "ok": false,
+                                                "from": pdf_from_url,
+                                                "to": fb_final_url,
+                                                "status": fb_status,
+                                                "elapsed_ms": t_fb0.elapsed().as_millis(),
+                                                "error": "fallback_not_better"
+                                            }),
+                                        );
+                                    }
+                                } else {
+                                    attempts_map.insert(
+                                        fb.attempt_key.to_string(),
+                                        serde_json::json!({
+                                            "kind": fb.kind,
+                                            "ok": false,
+                                            "from": pdf_from_url,
+                                            "to": fallback_url,
+                                            "elapsed_ms": t_fb0.elapsed().as_millis(),
+                                            "error": "fallback_extract_timeout_or_failed"
+                                        }),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                attempts_map.insert(
+                                    fb.attempt_key.to_string(),
+                                    serde_json::json!({
+                                        "kind": fb.kind,
+                                        "ok": false,
+                                        "from": pdf_from_url,
+                                        "to": fallback_url,
+                                        "elapsed_ms": t_fb0.elapsed().as_millis(),
+                                        "error": e.to_string()
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
 
             // Opportunistic multimodal: if we fetched an image and local extraction produced no text,
             // optionally call Gemini Flash (feature-gated, opt-in via WEBPIPE_VISION).
@@ -20121,19 +21039,17 @@ Rules:
             for w in &extracted.warnings {
                 warnings.push(*w);
             }
-            if no_network {
-                if !url_is_localhost(&req.url) {
-                    warnings.push("cache_only");
-                }
+            if no_network && !url_is_localhost(&req.url) {
+                warnings.push("cache_only");
             }
             let status_bad = resp_status >= 400;
             if status_bad && !warnings.contains(&"http_status_error") {
                 warnings.push("http_status_error");
             }
-            let title_opt = pipeline
-                .structure
-                .as_ref()
-                .and_then(|s| s.title.as_deref());
+            if resp_status == 429 && !warnings.contains(&"http_rate_limited") {
+                warnings.push("http_rate_limited");
+            }
+            let title_opt = pipeline.structure.as_ref().and_then(|s| s.title.as_deref());
             if looks_like_js_challenge(resp_status, &text, title_opt)
                 && !warnings.contains(&"blocked_by_js_challenge")
             {
@@ -20184,6 +21100,9 @@ Rules:
             }
             if arxiv_rewrote {
                 warnings.push("arxiv_abs_rewritten_to_pdf");
+            }
+            if let Some(w) = pdf_html_fallback_used_warning {
+                warnings.push(w);
             }
             if gh_issue_rewrote {
                 warnings.push("github_issue_rewritten_to_api");
@@ -20305,7 +21224,12 @@ Rules:
                     let semantic_timeout_ms = std::env::var("WEBPIPE_SEMANTIC_TIMEOUT_MS")
                         .ok()
                         .and_then(|s| s.trim().parse::<u64>().ok())
-                        .unwrap_or(args.timeout_ms.unwrap_or(20_000).saturating_div(2).clamp(2_000, 8_000));
+                        .unwrap_or(
+                            args.timeout_ms
+                                .unwrap_or(20_000)
+                                .saturating_div(2)
+                                .clamp(2_000, 8_000),
+                        );
                     let sem = if semantic_timeout_ms == 0 {
                         webpipe_local::semantic::SemanticRerankResult {
                             ok: false,
@@ -20318,7 +21242,11 @@ Rules:
                         }
                     } else {
                         let handle = tokio::task::spawn_blocking(move || {
-                            webpipe_local::semantic::semantic_rerank_chunks(&q0, &cands, semantic_top_k)
+                            webpipe_local::semantic::semantic_rerank_chunks(
+                                &q0,
+                                &cands,
+                                semantic_top_k,
+                            )
                         });
                         match tokio::time::timeout(
                             std::time::Duration::from_millis(semantic_timeout_ms),
@@ -20326,14 +21254,16 @@ Rules:
                         )
                         .await
                         {
-                            Ok(join) => join.unwrap_or_else(|_| webpipe_local::semantic::SemanticRerankResult {
-                                ok: false,
-                                backend: "unknown".to_string(),
-                                model_id: None,
-                                cache_hits: 0,
-                                cache_misses: 0,
-                                chunks: Vec::new(),
-                                warnings: vec!["semantic_rerank_task_failed"],
+                            Ok(join) => join.unwrap_or_else(|_| {
+                                webpipe_local::semantic::SemanticRerankResult {
+                                    ok: false,
+                                    backend: "unknown".to_string(),
+                                    model_id: None,
+                                    cache_hits: 0,
+                                    cache_misses: 0,
+                                    chunks: Vec::new(),
+                                    warnings: vec!["semantic_rerank_task_failed"],
+                                }
                             }),
                             Err(_) => webpipe_local::semantic::SemanticRerankResult {
                                 ok: false,
@@ -20441,12 +21371,20 @@ Rules:
             } else {
                 serde_json::Value::Object(attempts_map)
             };
+            // Mirror extract.chunks as top_chunks at the top level for API consistency with
+            // search_evidence, which returns top_chunks[] at the response root.
+            // Agents can write `response.top_chunks` consistently for both tools.
+            // extract.chunks remains at its current location for backward compat.
+            if let Some(chunks) = payload["extract"].get("chunks").cloned() {
+                payload["top_chunks"] = chunks;
+            }
+
             let md = web_extract_markdown(&payload);
             Ok(tool_result_markdown_with_json(payload, md))
         }
 
         #[tool(
-            description = "Alias for web_extract (same args; clearer name in some UIs)",
+            description = "DEPRECATED: use web_extract instead (identical args and behavior). This alias exists for backward compatibility only and is excluded from the default toolset.",
             input_schema = Arc::new(tool_input_schema_draft07::<WebExtractArgs>()),
             annotations(title = "Page extract (alias)", read_only_hint = true, open_world_hint = true)
         )]
@@ -20458,7 +21396,7 @@ Rules:
         }
 
         #[tool(
-            description = "Alias for web_extract but forces include_text=true (bounded by max_chars)",
+            description = "DEPRECATED: use web_extract with include_text=true instead. This alias exists for backward compatibility only and is excluded from the default toolset.",
             input_schema = Arc::new(tool_input_schema_draft07::<WebExtractArgs>()),
             annotations(title = "Page extract (text)", read_only_hint = true, open_world_hint = true)
         )]
@@ -20718,7 +21656,7 @@ Rules:
             let uri = request.uri.trim().to_string();
             let (text, mime_type) = match uri.as_str() {
                 "webpipe://meta" => {
-                    let r = self.webpipe_meta().await?;
+                    let r = self.webpipe_meta(Parameters(None)).await?;
                     let v = r.structured_content.clone().ok_or_else(|| {
                         McpError::internal_error(
                             "webpipe_meta missing structured_content".to_string(),
@@ -20799,9 +21737,8 @@ Rules:
             let writer = self.writer.clone();
             async move {
                 let mut w = writer.lock().await;
-                let s = serde_json::to_string(&item).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("json encode: {e}"))
-                })?;
+                let s = serde_json::to_string(&item)
+                    .map_err(|e| std::io::Error::other(format!("json encode: {e}")))?;
                 w.write_all(s.as_bytes()).await?;
                 w.write_all(b"\n").await?;
                 w.flush().await?;
@@ -20971,6 +21908,70 @@ Rules:
             "PERPLEXITY_API_KEY",
             "WEBPIPE_PERPLEXITY_ENDPOINT",
         ];
+
+        #[test]
+        fn web_search_extract_markdown_next_suggests_domains_allow_for_rust_when_forum_sources_present()
+        {
+            let payload = serde_json::json!({
+                "ok": true,
+                "query": "evoc Rust crate documentation",
+                "mode": "search",
+                "request": { "fetch_backend": "local" },
+                "results": [
+                    {
+                        "url": "https://reddit.com/r/rust/comments/abc123/evoc/",
+                        "final_url": "https://reddit.com/r/rust/comments/abc123/evoc/",
+                        "status": 200,
+                        "title": "evoc",
+                        "warning_codes": []
+                    }
+                ],
+                "top_chunks": [
+                    {
+                        "url": "https://reddit.com/r/rust/comments/abc123/evoc/",
+                        "score": 1,
+                        "text": "evoc discussion thread"
+                    }
+                ]
+            });
+            let md = web_search_extract_markdown(&payload);
+            assert!(
+                md.contains("domains_allow"),
+                "expected markdown to suggest domains_allow; md={md}"
+            );
+        }
+
+        #[test]
+        fn web_search_extract_markdown_next_suggests_repo_ingest_for_github_repo_root_when_apiish_query(
+        ) {
+            let payload = serde_json::json!({
+                "ok": true,
+                "query": "API methods",
+                "mode": "urls",
+                "request": { "fetch_backend": "local" },
+                "results": [
+                    {
+                        "url": "https://github.com/foo/bar",
+                        "final_url": "https://raw.githubusercontent.com/foo/bar/main/README.md",
+                        "status": 200,
+                        "title": "bar",
+                        "warning_codes": ["github_repo_rewritten_to_raw_readme"]
+                    }
+                ],
+                "top_chunks": [
+                    {
+                        "url": "https://github.com/foo/bar",
+                        "score": 1,
+                        "text": "README excerpt"
+                    }
+                ]
+            });
+            let md = web_search_extract_markdown(&payload);
+            assert!(
+                md.contains("repo_ingest"),
+                "expected markdown to suggest repo_ingest; md={md}"
+            );
+        }
 
         #[test]
         fn routing_context_query_key_prefers_contextual_window() {
@@ -21162,6 +22163,16 @@ Rules:
             assert_eq!(n2, out2.chars().count());
             assert_eq!(out2, s);
             assert!(!clipped2);
+        }
+
+        #[test]
+        fn query_key_folds_common_greek_letters() {
+            // Keep this deterministic and ASCII-only: query_key is used for stable keys.
+            assert_eq!(
+                WebpipeMcp::query_key("β-Gaussian"),
+                Some("beta gaussian".to_string())
+            );
+            assert_eq!(WebpipeMcp::query_key("Ω(θ)"), Some("omega theta".to_string()));
         }
 
         proptest! {
@@ -22936,6 +23947,116 @@ Rules:
         }
 
         #[tokio::test]
+        async fn web_search_extract_retry_on_truncation_can_retry_beyond_5mb_default_cap() {
+            let _env = EnvGuard::new(&["WEBPIPE_CACHE_DIR"]);
+
+            // Regression: urls-mode sequential hydration has its own truncation retry logic.
+            // It must be able to retry beyond 5MB when max_bytes=5_000_000 (default), otherwise
+            // retry_on_truncation=true is ineffective on large HTML pages.
+            use axum::{routing::get, Router};
+            use std::net::SocketAddr;
+
+            // Build a body slightly above 5MB.
+            let prefix = "<html><body><main><h1>Big</h1><p>Intro</p>";
+            let tail = "<p>TAIL_SENTINEL_5MB</p></main></body></html>";
+            let target_len = 6_200_000usize;
+            let mut filler_len = target_len.saturating_sub(prefix.len() + tail.len());
+            // Keep filler non-empty so the response is actually larger than max_bytes.
+            filler_len = filler_len.max(1);
+            let filler = "x".repeat(filler_len);
+            let body = format!("{prefix}{filler}{tail}");
+            assert!(body.len() > 5_000_000, "fixture must exceed 5MB");
+
+            let app = Router::new().route(
+                "/",
+                get(move || {
+                    let body = body.clone();
+                    async move { ([(axum::http::header::CONTENT_TYPE, "text/html")], body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr: SocketAddr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("axum serve");
+            });
+            let url = format!("http://{}/", addr);
+
+            let svc = WebpipeMcp::new().expect("new");
+            let r = svc
+                .web_search_extract(p(WebSearchExtractArgs {
+                    query: Some("tail sentinel".to_string()),
+                    urls: Some(vec![url]),
+                    url_selection_mode: Some("auto".to_string()),
+                    provider: Some("auto".to_string()),
+                    auto_mode: Some("fallback".to_string()),
+                    selection_mode: Some("score".to_string()),
+                    fetch_backend: Some("local".to_string()),
+                    no_network: Some(false),
+                    firecrawl_fallback_on_empty_extraction: Some(false),
+                    firecrawl_fallback_on_low_signal: Some(false),
+                    render_fallback_on_empty_extraction: Some(false),
+                    render_fallback_on_low_signal: Some(false),
+                    max_results: Some(1),
+                    max_urls: Some(1),
+                    timeout_ms: Some(5_000),
+                    // Default-ish: 5MB fetch cap.
+                    max_bytes: Some(5_000_000),
+                    retry_on_truncation: Some(true),
+                    // Explicitly allow retry to exceed 5MB.
+                    truncation_retry_max_bytes: Some(10_000_000),
+                    width: Some(80),
+                    // Keep bounded; we only care about attempts and bytes/truncation status.
+                    max_chars: Some(8_000),
+                    top_chunks: Some(1),
+                    max_chunk_chars: Some(400),
+                    include_links: Some(false),
+                    include_structure: Some(false),
+                    max_outline_items: None,
+                    max_blocks: None,
+                    max_block_chars: None,
+                    semantic_rerank: None,
+                    semantic_top_k: None,
+                    max_links: Some(10),
+                    include_text: Some(false),
+                    cache_read: Some(false),
+                    cache_write: Some(false),
+                    cache_ttl_s: None,
+                    exploration: None,
+                    agentic: Some(false),
+                    agentic_selector: Some("lexical".to_string()),
+                    agentic_max_search_rounds: None,
+                    agentic_frontier_max: None,
+                    planner_max_calls: None,
+                    // Need per-URL attempts for the assertion.
+                    compact: Some(false),
+                    ..Default::default()
+                }))
+                .await
+                .expect("call");
+
+            let v = payload_from_call_tool_result(&r);
+            assert_eq!(v["ok"].as_bool(), Some(true));
+            let one = v["results"].as_array().unwrap()[0].clone();
+            assert!(one.get("attempts").is_some());
+            assert!(
+                one["attempts"].get("local_retry").is_some(),
+                "expected local_retry attempt when max_bytes=5MB; attempts={}",
+                one["attempts"]
+            );
+            assert!(
+                one["bytes"].as_u64().unwrap_or(0) > 5_000_000,
+                "expected bytes to exceed 5MB after retry; got bytes={}",
+                one["bytes"]
+            );
+            assert_eq!(
+                one["truncated"].as_bool(),
+                Some(false),
+                "expected truncated=false after retry; got truncated={}",
+                one["truncated"]
+            );
+        }
+
+        #[tokio::test]
         async fn web_search_extract_urls_mode_without_query_still_returns_top_chunks() {
             let _env = EnvGuard::new(&["WEBPIPE_CACHE_DIR"]);
 
@@ -23422,9 +24543,9 @@ Rules:
                 .filter_map(|x| x.as_str())
                 .collect();
             assert!(
-                warns.iter().any(|w| *w == "empty_extraction")
-                    || warns.iter().any(|w| *w == "main_content_low_signal")
-                    || warns.iter().any(|w| *w == "unsupported_content_no_text"),
+                warns.contains(&"empty_extraction")
+                    || warns.contains(&"main_content_low_signal")
+                    || warns.contains(&"unsupported_content_no_text"),
                 "expected an empty/low-signal warning; got warnings={warns:?}"
             );
         }
@@ -24508,6 +25629,7 @@ fn load_env_file_no_log(path: &std::path::Path) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod dotenv_tests {
     use super::*;
     use std::io::Write;
@@ -24821,6 +25943,7 @@ async fn main() -> Result<()> {
                                 agentic_frontier_max: args.agentic_frontier_max,
                                 planner_max_calls: args.planner_max_calls,
                                 compact: None,
+                                ..Default::default()
                             })))
                             .await
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -24951,6 +26074,7 @@ async fn main() -> Result<()> {
                                 agentic_frontier_max: args.agentic_frontier_max,
                                 planner_max_calls: args.planner_max_calls,
                                 compact: None,
+                                ..Default::default()
                             })))
                             .await
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -25082,8 +26206,8 @@ async fn main() -> Result<()> {
 
             let max_results = args.max_results.clamp(1, 20);
             let max_urls = args.max_urls.clamp(1, 10);
-            let top_chunks = args.top_chunks.min(50).max(1);
-            let max_chunk_chars = args.max_chunk_chars.min(5_000).max(20);
+            let top_chunks = args.top_chunks.clamp(1, 50);
+            let max_chunk_chars = args.max_chunk_chars.clamp(20, 5_000);
 
             let call_json = |r: rmcp::model::CallToolResult| -> Result<serde_json::Value> {
                 if let Some(v) = r.structured_content {
@@ -25991,23 +27115,21 @@ async fn main() -> Result<()> {
             if llm_backend == "openrouter" {
                 if let Ok(v) = std::env::var("WEBPIPE_OPENROUTER_INCLUDE_REASONING") {
                     let v = v.trim().to_ascii_lowercase();
-                    if v == "true" || v == "1" {
-                        if openrouter_caps
+                    if (v == "true" || v == "1")
+                        && openrouter_caps
                             .as_ref()
                             .map(|s| s.contains("include_reasoning"))
                             .unwrap_or(true)
-                        {
-                            chat_options.include_reasoning = Some(true);
-                        }
+                    {
+                        chat_options.include_reasoning = Some(true);
                     }
-                    if v == "false" || v == "0" {
-                        if openrouter_caps
+                    if (v == "false" || v == "0")
+                        && openrouter_caps
                             .as_ref()
                             .map(|s| s.contains("include_reasoning"))
                             .unwrap_or(true)
-                        {
-                            chat_options.include_reasoning = Some(false);
-                        }
+                    {
+                        chat_options.include_reasoning = Some(false);
                     }
                 }
                 if let Ok(eff) = std::env::var("WEBPIPE_OPENROUTER_REASONING_EFFORT") {
@@ -27192,23 +28314,21 @@ Scoring guidance:
             if llm_backend == "openrouter" {
                 if let Ok(v) = std::env::var("WEBPIPE_OPENROUTER_INCLUDE_REASONING") {
                     let v = v.trim().to_ascii_lowercase();
-                    if v == "true" || v == "1" {
-                        if openrouter_caps
+                    if (v == "true" || v == "1")
+                        && openrouter_caps
                             .as_ref()
                             .map(|s| s.contains("include_reasoning"))
                             .unwrap_or(true)
-                        {
-                            chat_options.include_reasoning = Some(true);
-                        }
+                    {
+                        chat_options.include_reasoning = Some(true);
                     }
-                    if v == "false" || v == "0" {
-                        if openrouter_caps
+                    if (v == "false" || v == "0")
+                        && openrouter_caps
                             .as_ref()
                             .map(|s| s.contains("include_reasoning"))
                             .unwrap_or(true)
-                        {
-                            chat_options.include_reasoning = Some(false);
-                        }
+                    {
+                        chat_options.include_reasoning = Some(false);
                     }
                 }
                 if let Ok(eff) = std::env::var("WEBPIPE_OPENROUTER_REASONING_EFFORT") {
@@ -27224,6 +28344,7 @@ Scoring guidance:
                 }
             }
 
+            #[allow(clippy::too_many_arguments)]
             async fn llm_call(
                 llm_backend: &str,
                 openai_like: Option<&webpipe_local::openai_compat::OpenAiCompatClient>,
@@ -27312,9 +28433,7 @@ Scoring guidance:
                         xs.iter().all(|x| {
                             x.as_str().is_some_and(|s| {
                                 let s = s.trim();
-                                !s.is_empty()
-                                    && s.len() <= 64
-                                    && ISSUE_VOCAB.iter().any(|&v| v == s)
+                                !s.is_empty() && s.len() <= 64 && ISSUE_VOCAB.contains(&s)
                             })
                         })
                     }
@@ -27390,9 +28509,7 @@ Scoring guidance:
                         xs.iter().all(|x| {
                             x.as_str().is_some_and(|s| {
                                 let s = s.trim();
-                                !s.is_empty()
-                                    && s.len() <= 64
-                                    && ISSUE_VOCAB.iter().any(|&v| v == s)
+                                !s.is_empty() && s.len() <= 64 && ISSUE_VOCAB.contains(&s)
                             })
                         })
                     }
@@ -27434,9 +28551,7 @@ Scoring guidance:
                         xs.iter().all(|x| {
                             x.as_str().is_some_and(|s| {
                                 let s = s.trim();
-                                !s.is_empty()
-                                    && s.len() <= 64
-                                    && ISSUE_VOCAB.iter().any(|&v| v == s)
+                                !s.is_empty() && s.len() <= 64 && ISSUE_VOCAB.contains(&s)
                             })
                         })
                     }
@@ -27555,8 +28670,8 @@ Scoring guidance:
 
             let max_results = args.max_results.clamp(1, 20);
             let max_urls = args.max_urls.clamp(1, 10);
-            let top_chunks = args.top_chunks.min(50).max(1);
-            let max_chunk_chars = args.max_chunk_chars.min(5_000).max(20);
+            let top_chunks = args.top_chunks.clamp(1, 50);
+            let max_chunk_chars = args.max_chunk_chars.clamp(20, 5_000);
 
             let trials: Vec<TrialCfg> = match args.trial_set.to_ascii_lowercase().as_str() {
                 "wide" => vec![
@@ -27710,11 +28825,7 @@ Scoring guidance:
                 if curriculum_mode == "unseen" && !curriculum.is_empty() {
                     selected.retain(|q| !curriculum.contains_key(&q.query_id));
                 } else if curriculum_mode == "failed" && !curriculum.is_empty() {
-                    selected.retain(|q| {
-                        curriculum
-                            .get(&q.query_id)
-                            .is_some_and(|st| st.worked == false)
-                    });
+                    selected.retain(|q| curriculum.get(&q.query_id).is_some_and(|st| !st.worked));
                 }
 
                 // Deterministic ordering by (hash(seed+judge_id, query_id), query_id).
@@ -28076,7 +29187,7 @@ Rules:
                             });
                             let _ = append_jsonl(transcript_path.as_path(), &line);
                         }
-                        if parsed.as_ref().is_some_and(|v| validate_scorecard(v)) {
+                        if parsed.as_ref().is_some_and(validate_scorecard) {
                             // ok
                         } else if retry_on_parse_fail
                             && openai_like.is_some()
@@ -28112,7 +29223,7 @@ Rules:
                             if let Some(o) = parsed.as_mut().and_then(|v| v.as_object_mut()) {
                                 let _ = o.remove("notes");
                             }
-                            parsed = parsed.filter(|v| validate_scorecard(v));
+                            parsed = parsed.filter(validate_scorecard);
                             if transcript_enabled {
                                 let evidence_chars = judge_text.chars().count();
                                 let observed_url_count = observed_urls.len();
@@ -28275,7 +29386,7 @@ Rules:
                         .await
                         .unwrap_or_default();
                         task_solve =
-                            extract_json_object(&task_solve_raw).filter(|v| validate_task_solve(v));
+                            extract_json_object(&task_solve_raw).filter(validate_task_solve);
                         if transcript_enabled {
                             transcript_seq = transcript_seq.wrapping_add(1);
                             let line = serde_json::json!({
@@ -28329,8 +29440,8 @@ Rules:
                             )
                             .await
                             .unwrap_or_default();
-                            task_solve = extract_json_object(&task_solve_raw)
-                                .filter(|v| validate_task_solve(v));
+                            task_solve =
+                                extract_json_object(&task_solve_raw).filter(validate_task_solve);
                             if transcript_enabled {
                                 transcript_seq = transcript_seq.wrapping_add(1);
                                 let line = serde_json::json!({
@@ -28473,7 +29584,7 @@ Rules:
                 .await
                 .unwrap_or_default();
                 let mut judge_overall =
-                    extract_json_object(&judge_overall_raw).filter(|v| validate_judge_overall(v));
+                    extract_json_object(&judge_overall_raw).filter(validate_judge_overall);
                 if transcript_enabled {
                     transcript_seq = transcript_seq.wrapping_add(1);
                     let line = serde_json::json!({
@@ -28526,8 +29637,8 @@ Rules:
                     )
                     .await
                     .unwrap_or_default();
-                    judge_overall = extract_json_object(&judge_overall_raw)
-                        .filter(|v| validate_judge_overall(v));
+                    judge_overall =
+                        extract_json_object(&judge_overall_raw).filter(validate_judge_overall);
                     if transcript_enabled {
                         transcript_seq = transcript_seq.wrapping_add(1);
                         let line = serde_json::json!({
@@ -28645,7 +29756,7 @@ Rules:
             )
             .await
             .unwrap_or_default();
-            let mut meta = extract_json_object(&meta_raw).filter(|v| validate_meta_summary(v));
+            let mut meta = extract_json_object(&meta_raw).filter(validate_meta_summary);
             if transcript_enabled {
                 transcript_seq = transcript_seq.wrapping_add(1);
                 let line = serde_json::json!({
@@ -28699,7 +29810,7 @@ Rules:
                 )
                 .await
                 .unwrap_or_default();
-                meta = extract_json_object(&meta_raw).filter(|v| validate_meta_summary(v));
+                meta = extract_json_object(&meta_raw).filter(validate_meta_summary);
                 if transcript_enabled {
                     transcript_seq = transcript_seq.wrapping_add(1);
                     let line = serde_json::json!({
@@ -28843,13 +29954,11 @@ Rules:
                     return (String::new(), true);
                 }
                 let mut out = String::new();
-                let mut n = 0usize;
-                for ch in s.chars() {
+                for (n, ch) in s.chars().enumerate() {
                     if n >= max_chars {
                         return (out, true);
                     }
                     out.push(ch);
-                    n += 1;
                 }
                 (out, false)
             }
@@ -28923,10 +30032,10 @@ Rules:
 
             let mut issues: Vec<&str> = Vec::new();
             let mut push_issue = |s: &'static str| {
-                if !CRITIC_ISSUE_VOCAB.iter().any(|&v| v == s) {
+                if !CRITIC_ISSUE_VOCAB.contains(&s) {
                     return;
                 }
-                if !issues.iter().any(|&x| x == s) {
+                if !issues.contains(&s) {
                     issues.push(s);
                 }
             };
@@ -29148,13 +30257,11 @@ Rules:
                     return (String::new(), true);
                 }
                 let mut out = String::new();
-                let mut n = 0usize;
-                for ch in s.chars() {
+                for (n, ch) in s.chars().enumerate() {
                     if n >= max_chars {
                         return (out, true);
                     }
                     out.push(ch);
-                    n += 1;
                 }
                 (out, false)
             }
@@ -29286,10 +30393,10 @@ Rules:
 
                 let mut issues: Vec<&str> = Vec::new();
                 let mut push_issue = |s: &'static str| {
-                    if !CRITIC_ISSUE_VOCAB.iter().any(|&v| v == s) {
+                    if !CRITIC_ISSUE_VOCAB.contains(&s) {
                         return;
                     }
-                    if !issues.iter().any(|&x| x == s) {
+                    if !issues.contains(&s) {
                         issues.push(s);
                     }
                 };
@@ -29896,7 +31003,7 @@ Rules:
                 _ => anyhow::bail!("Pass exactly one of --args-json or --args-json-file"),
             }
 
-            let reps = args.repeat.max(1).min(1000);
+            let reps = args.repeat.clamp(1, 1000);
             let mut call_durations_ms: Vec<u128> = Vec::new();
             let mut tool_elapsed_ms: Vec<Option<u64>> = Vec::new();
 
@@ -30074,7 +31181,7 @@ Rules:
                 let mut structured_present = false;
                 let mut kind: Option<String> = None;
 
-                let resp = (|| async {
+                let resp = async {
                     let Some(obj) = args_json.as_object().cloned() else {
                         anyhow::bail!("internal: args must be a JSON object");
                     };
@@ -30090,7 +31197,7 @@ Rules:
                         anyhow::anyhow!("mcp call timed out after {}ms", args.timeout_ms)
                     })??;
                     Ok::<_, anyhow::Error>(resp)
-                })()
+                }
                 .await;
 
                 match resp {
@@ -30128,7 +31235,7 @@ Rules:
             }
 
             // Finally, query usage within the same long-lived child server so counts are meaningful.
-            let usage = (|| async {
+            let usage = async {
                 let resp = tokio::time::timeout(
                     std::time::Duration::from_millis(args.timeout_ms),
                     service.call_tool(CallToolRequestParam {
@@ -30145,7 +31252,7 @@ Rules:
                 .ok()?
                 .ok()?;
                 resp.structured_content
-            })()
+            }
             .await;
 
             let payload = serde_json::json!({
@@ -30298,7 +31405,7 @@ Rules:
                                 critic_issue_unknown = critic_issue_unknown.saturating_add(1);
                                 continue;
                             }
-                            if CRITIC_ISSUE_VOCAB.iter().any(|&v| v == s) {
+                            if CRITIC_ISSUE_VOCAB.contains(&s) {
                                 *critic_issue_counts.entry(s.to_string()).or_insert(0) += 1;
                             } else {
                                 critic_issue_unknown = critic_issue_unknown.saturating_add(1);
@@ -30736,12 +31843,12 @@ Rules:
                             from_dir.push(p);
                         }
                     }
-                    from_dir.sort_by(|a, b| a.display().to_string().cmp(&b.display().to_string()));
+                    from_dir.sort_by_key(|a| a.display().to_string());
                     from_dir.truncate(max_images);
                     images.extend(from_dir);
                 }
             }
-            images.sort_by(|a, b| a.display().to_string().cmp(&b.display().to_string()));
+            images.sort_by_key(|a| a.display().to_string());
             images.dedup();
             if images.is_empty() {
                 anyhow::bail!("no images provided (use --image ... or --images-dir ...)");
@@ -31080,7 +32187,6 @@ Rules:
                 let goal_profiles_used = goal_profiles_used.clone();
                 let transcript_jsonl = transcript_jsonl.clone();
                 let prompt_tx_base = prompt_tx_base.clone();
-                let use_legacy_name = use_legacy_name;
 
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await?;
@@ -31090,7 +32196,7 @@ Rules:
                     prompt_effective.push_str("\n\n");
                     prompt_effective.push_str(profile_prompt_suffix(spec.profile.as_str()));
                     if !goals.is_empty() {
-                        prompt_effective.push_str("\n");
+                        prompt_effective.push('\n');
                         prompt_effective.push_str(format_goals_block(goals.as_ref()).as_str());
                     }
                     if context_dir.is_some() {
@@ -31450,10 +32556,10 @@ Rules:
                 img_fix_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 let img_top_3_fixes: Vec<String> =
                     img_fix_vec.iter().take(3).map(|(s, _)| s.clone()).collect();
-                let consensus_min = (trials + 1) / 2;
+                let consensus_min = trials.div_ceil(2);
                 let consensus_fixes: Vec<String> = img_fix_vec
                     .iter()
-                    .filter(|(_s, c)| (*c as u64) >= consensus_min)
+                    .filter(|(_s, c)| *c >= consensus_min)
                     .take(5)
                     .map(|(s, _)| s.clone())
                     .collect();

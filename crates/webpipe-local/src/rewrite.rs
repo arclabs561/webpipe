@@ -78,6 +78,43 @@ fn arxiv_rewrite_hosts() -> Vec<String> {
     }
 }
 
+fn openreview_rewrite_hosts() -> Vec<String> {
+    let v = env_csv("WEBPIPE_OPENREVIEW_REWRITE_HOSTS");
+    if v.is_empty() {
+        vec![
+            "openreview.net".to_string(),
+            "www.openreview.net".to_string(),
+        ]
+    } else {
+        v
+    }
+}
+
+fn openreview_api_base() -> String {
+    // Default to the public OpenReview API. Tests can override this to point at a local fixture.
+    std::env::var("WEBPIPE_OPENREVIEW_API_BASE")
+        .ok()
+        .unwrap_or_else(|| "https://api.openreview.net/notes".to_string())
+        .trim()
+        .to_string()
+}
+
+fn arxiv_pdf_fallback_base() -> String {
+    // Default to arXiv Labs (first-party-ish) ar5iv HTML conversion.
+    //
+    // This is used as a *fallback* when PDF extraction fails, so keep it stable and avoid
+    // surprise third-party domains. Tests can override this to point at a local fixture server.
+    let v = std::env::var("WEBPIPE_ARXIV_PDF_FALLBACK_BASE")
+        .ok()
+        .unwrap_or_else(|| "https://ar5iv.labs.arxiv.org/html/".to_string());
+    let s = v.trim().to_string();
+    if s.ends_with('/') {
+        s
+    } else {
+        format!("{s}/")
+    }
+}
+
 /// If `url` looks like an arXiv abstract page (`arxiv.org/abs/<id>`), return a PDF candidate URL.
 ///
 /// This is bounded/deterministic and does not perform network IO.
@@ -95,7 +132,9 @@ pub fn arxiv_abs_pdf_candidates(url: &str) -> Option<Vec<String>> {
     if parts[0] != "abs" {
         return None;
     }
-    let id = parts[1].trim();
+    // Support both modern IDs (`abs/1234.5678`) and legacy category IDs (`abs/hep-th/9901001`).
+    let id = parts[1..].join("/");
+    let id = id.trim();
     if id.is_empty() {
         return None;
     }
@@ -108,6 +147,108 @@ pub fn arxiv_abs_pdf_candidates(url: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     out.push(format!("{scheme}://{pdf_host}/pdf/{id}.pdf"));
     Some(out)
+}
+
+/// If `url` looks like an arXiv PDF URL (`.../pdf/<id>.pdf`), return an ar5iv HTML candidate URL.
+///
+/// This is a *fallback* path used when PDF extraction fails (or panics) and no shellout tools are
+/// available. It is bounded/deterministic and does not perform network IO.
+pub fn arxiv_pdf_html_candidates(url: &str) -> Option<Vec<String>> {
+    let u = reqwest::Url::parse(url.trim()).ok()?;
+    let host = u.host_str()?.to_string();
+    if !arxiv_rewrite_hosts().iter().any(|h| host_matches(&host, h)) {
+        return None;
+    }
+    let parts: Vec<&str> = u.path().trim_matches('/').split('/').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    if parts[0] != "pdf" {
+        return None;
+    }
+    // Support both modern IDs (`pdf/1234.5678.pdf`) and legacy category IDs (`pdf/hep-th/9901001.pdf`).
+    let mut id = parts[1..].join("/");
+    id = id.trim().to_string();
+    if let Some(x) = id.strip_suffix(".pdf") {
+        id = x.to_string();
+    }
+    if id.trim().is_empty() {
+        return None;
+    }
+    let base = arxiv_pdf_fallback_base();
+    Some(vec![format!("{base}{id}")])
+}
+
+/// If `url` looks like an OpenReview PDF URL (`openreview.net/pdf?id=<id>`), return a forum page
+/// candidate URL (`openreview.net/forum?id=<id>`).
+///
+/// This is meant as a fallback when PDF extraction fails; the forum page usually contains at least
+/// title/abstract metadata (even when the PDF is malformed/scanned).
+pub fn openreview_pdf_forum_candidates(url: &str) -> Option<Vec<String>> {
+    let u = reqwest::Url::parse(url.trim()).ok()?;
+    let host = u.host_str()?.to_string();
+    if !openreview_rewrite_hosts()
+        .iter()
+        .any(|h| host_matches(&host, h))
+    {
+        return None;
+    }
+    if u.path().trim_matches('/') != "pdf" {
+        return None;
+    }
+    let id = u
+        .query_pairs()
+        .find_map(|(k, v)| (k == "id").then_some(v.to_string()))?;
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+
+    let mut u2 = u.clone();
+    u2.set_path("/forum");
+    u2.set_fragment(None);
+    {
+        let mut qp = u2.query_pairs_mut();
+        qp.clear();
+        qp.append_pair("id", id.as_str());
+    }
+    Some(vec![u2.to_string()])
+}
+
+/// If `url` looks like an OpenReview PDF URL (`openreview.net/pdf?id=<id>`), return a candidate
+/// OpenReview API URL (`api.openreview.net/notes?id=<id>`).
+///
+/// This is preferred over the forum HTML for evidence: the API reliably contains title/abstract
+/// even when the forum page is JS-heavy.
+pub fn openreview_pdf_api_candidates(url: &str) -> Option<Vec<String>> {
+    let u = reqwest::Url::parse(url.trim()).ok()?;
+    let host = u.host_str()?.to_string();
+    if !openreview_rewrite_hosts()
+        .iter()
+        .any(|h| host_matches(&host, h))
+    {
+        return None;
+    }
+    if u.path().trim_matches('/') != "pdf" {
+        return None;
+    }
+    let id = u
+        .query_pairs()
+        .find_map(|(k, v)| (k == "id").then_some(v.to_string()))?;
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+
+    let base = openreview_api_base();
+    let mut u2 = reqwest::Url::parse(base.as_str()).ok()?;
+    u2.set_fragment(None);
+    {
+        let mut qp = u2.query_pairs_mut();
+        qp.clear();
+        qp.append_pair("id", id.as_str());
+    }
+    Some(vec![u2.to_string()])
 }
 
 /// If `url` looks like a GitHub file view (`github.com/<owner>/<repo>/blob/<ref>/<path...>`),
@@ -295,7 +436,7 @@ pub fn github_issue_api_candidates(url: &str, api_base: &str) -> Option<Vec<Stri
 /// If `url` looks like a GitHub release page:
 /// - `.../releases/latest`
 /// - `.../releases/tag/<tag>`
-/// return GitHub API candidates:
+///   return GitHub API candidates:
 /// - `/repos/<owner>/<repo>/releases/latest`
 /// - `/repos/<owner>/<repo>/releases/tags/<tag>`
 pub fn github_release_api_candidates(url: &str, api_base: &str) -> Option<Vec<String>> {

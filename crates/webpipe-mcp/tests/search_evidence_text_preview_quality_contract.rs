@@ -128,8 +128,7 @@ async fn search_evidence_text_preview_prefers_top_chunk_when_query_present() {
         "expected query token in preview; src={src} preview={preview:?} payload={v}"
     );
     assert_eq!(
-        src,
-        "top_chunk",
+        src, "top_chunk",
         "expected preview source top_chunk; preview={preview:?} payload={v}"
     );
 
@@ -215,15 +214,15 @@ async fn search_evidence_text_preview_uses_fallback_chunk_when_query_has_no_over
         .and_then(|x| x.as_str())
         .unwrap_or("");
     assert!(
-        preview.to_ascii_lowercase().contains("relevant content starts here"),
+        preview
+            .to_ascii_lowercase()
+            .contains("relevant content starts here"),
         "expected substantive content in preview; src={src} preview={preview:?} payload={v}"
     );
     assert_eq!(
-        src,
-        "top_chunk_fallback",
+        src, "top_chunk_fallback",
         "expected preview source top_chunk_fallback; preview={preview:?} payload={v}"
     );
 
     service.cancel().await.expect("cancel");
 }
-

@@ -331,7 +331,7 @@ pub fn cache_search_extract(
         let score: u64 = chunks.iter().map(|c| c.score).sum();
         let extraction_engine = pipe.extracted.engine.to_string();
         let mut doc_warnings: Vec<&'static str> = pipe.extracted.warnings.clone();
-        if pipe.chunks.len() > 0 && chunks.is_empty() {
+        if !pipe.chunks.is_empty() && chunks.is_empty() {
             doc_warnings.push("no_query_overlap_doc");
         }
         if (bytes_full.len() as u64) > max_bytes {

@@ -2409,6 +2409,8 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slabs"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c2b3eba7ce8438af96eaea288c5ad16ee048d2104240f98e3ed09c5d559a883"
 dependencies = [
  "thiserror 2.0.18",
  "unicode-segmentation",
