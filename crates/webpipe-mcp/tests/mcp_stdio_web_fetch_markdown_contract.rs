@@ -130,4 +130,3 @@ async fn webpipe_mcp_stdio_web_fetch_markdown_includes_warning_hints_and_correct
 
     service.cancel().await.expect("cancel");
 }
-

@@ -125,4 +125,3 @@ fn webpipe_mcp_stdio_search_evidence_markdown_surfaces_warning_hints() {
     })
     .expect("mcp stdio search_evidence warning hints contract");
 }
-

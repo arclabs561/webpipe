@@ -44,9 +44,19 @@ fn webpipe_mcp_stdio_web_perplexity_contract_not_configured_is_stable() {
             "web_perplexity must NOT appear in Normal mode without API key; got: {names_normal:?}"
         );
         // The 7 zero-key tools must all be present.
-        for must in ["webpipe_meta", "web_fetch", "web_extract", "search_evidence",
-                     "arxiv_search", "arxiv_enrich", "paper_search"] {
-            assert!(names_normal.contains(must), "missing required keyless tool: {must}");
+        for must in [
+            "webpipe_meta",
+            "web_fetch",
+            "web_extract",
+            "search_evidence",
+            "arxiv_search",
+            "arxiv_enrich",
+            "paper_search",
+        ] {
+            assert!(
+                names_normal.contains(must),
+                "missing required keyless tool: {must}"
+            );
         }
         svc_normal.cancel().await?;
 
@@ -96,7 +106,11 @@ fn webpipe_mcp_stdio_web_perplexity_contract_not_configured_is_stable() {
         assert_eq!(v["schema_version"].as_u64(), Some(2), "schema_version");
         assert_eq!(v["kind"].as_str(), Some("web_perplexity"), "kind");
         assert_eq!(v["ok"].as_bool(), Some(false), "ok");
-        assert_eq!(v["error"]["code"].as_str(), Some("not_configured"), "error code");
+        assert_eq!(
+            v["error"]["code"].as_str(),
+            Some("not_configured"),
+            "error code"
+        );
 
         // Markdown contract: content[0] must be Markdown (not raw JSON).
         let txt0 = r

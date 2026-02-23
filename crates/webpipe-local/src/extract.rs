@@ -187,22 +187,9 @@ fn pdf_strings_fallback(bytes: &[u8], max_chars: usize) -> Option<String> {
         }
         match tok {
             // Common PDF syntax / dictionary keys (very low signal).
-            b"endobj"
-            | b"stream"
-            | b"endstream"
-            | b"trailer"
-            | b"startxref"
-            | b"flatedecode"
-            | b"filter"
-            | b"length"
-            | b"subtype"
-            | b"resources"
-            | b"mediabox"
-            | b"contents"
-            | b"basefont"
-            | b"encoding"
-            | b"objstm"
-            | b"xrefstm" => false,
+            b"endobj" | b"stream" | b"endstream" | b"trailer" | b"startxref" | b"flatedecode"
+            | b"filter" | b"length" | b"subtype" | b"resources" | b"mediabox" | b"contents"
+            | b"basefont" | b"encoding" | b"objstm" | b"xrefstm" => false,
             _ => true,
         }
     }

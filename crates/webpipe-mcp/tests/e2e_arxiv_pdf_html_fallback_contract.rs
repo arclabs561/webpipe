@@ -40,7 +40,9 @@ async fn call_extract(service: &RunningService<RoleClient, ()>, url: &str) -> se
         })
         .await
         .expect("call_tool");
-    r.structured_content.clone().unwrap_or_else(|| serde_json::json!({}))
+    r.structured_content
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 async fn call_search_evidence(
@@ -74,7 +76,9 @@ async fn call_search_evidence(
         })
         .await
         .expect("call_tool");
-    r.structured_content.clone().unwrap_or_else(|| serde_json::json!({}))
+    r.structured_content
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 async fn call_search_evidence_markdown(
@@ -293,7 +297,10 @@ async fn search_evidence_urls_mode_falls_back_from_arxiv_pdf_to_html_when_pdf_ex
             .unwrap_or(false),
         "expected non-empty top_chunks"
     );
-    let top = v["top_chunks"][0]["text"].as_str().unwrap_or("").to_string();
+    let top = v["top_chunks"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     assert!(
         top.to_ascii_lowercase().contains("fenchel"),
         "expected top chunk to mention fenchel; got {top:?}"
@@ -520,7 +527,10 @@ async fn search_evidence_urls_mode_falls_back_from_openreview_pdf_to_api_when_pd
             .unwrap_or(false),
         "expected non-empty top_chunks"
     );
-    let top = v["top_chunks"][0]["text"].as_str().unwrap_or("").to_string();
+    let top = v["top_chunks"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     assert!(
         top.to_ascii_lowercase().contains("fenchel"),
         "expected top chunk to mention fenchel; got {top:?}"
@@ -600,4 +610,3 @@ async fn search_evidence_markdown_surfaces_final_url_when_arxiv_fallback_used(
     service.cancel().await?;
     Ok(())
 }
-

@@ -1772,6 +1772,9 @@ mod mcp {
         ("http_fetch", "web_fetch"),
         ("page_extract", "web_extract"),
         ("page_extract_text", "web_extract"),
+        // arxiv_search and arxiv_enrich are now merged into the single `arxiv` tool.
+        ("arxiv_search", "arxiv"),
+        ("arxiv_enrich", "arxiv"),
         // Search-extract aliases (search_evidence is the Normal-toolset canonical name)
         ("_web_search_extract_debug", "search_evidence"),
     ];
@@ -1781,38 +1784,32 @@ mod mcp {
         match toolset {
             McpToolset::Debug => true,
             // Normal toolset: one meta tool (webpipe_meta covers usage + usage_reset via method=),
-        // core fetch/extract/search tools, and research/academic tools.
-        //
-        // Design invariant: every tool in this list must work with ZERO API keys configured.
-        // API-key-gated tools (web_perplexity, etc.) are shown conditionally — only when
-        // their key is actually set — so the default surface is fully functional out of the box.
-        //
-        // Deprecated aliases are excluded here; they remain callable but not default-visible.
-        McpToolset::Normal => {
-            // Always-on: work without any API keys.
-            let keyless = matches!(
-                tool_name,
-                "webpipe_meta"
-                    | "web_fetch"
-                    | "web_extract"
-                    | "search_evidence"
-                    | "arxiv_search"
-                    | "arxiv_enrich"
-                    | "paper_search"
-            );
-            if keyless {
-                return true;
-            }
-            // Conditionally visible: show only when the required key is configured.
-            // This keeps the default surface fully functional while surfacing
-            // optional premium integrations when they're actually usable.
-            match tool_name {
-                "web_perplexity" => {
-                    has_env("WEBPIPE_PERPLEXITY_API_KEY") || has_env("PERPLEXITY_API_KEY")
+            // core fetch/extract/search tools, and research/academic tools.
+            //
+            // Design invariant: every tool in this list must work with ZERO API keys configured.
+            // API-key-gated tools (web_perplexity, etc.) are shown conditionally — only when
+            // their key is actually set — so the default surface is fully functional out of the box.
+            //
+            // Deprecated aliases are excluded here; they remain callable but not default-visible.
+            McpToolset::Normal => {
+                // Always-on: work without any API keys.
+                let keyless = matches!(
+                    tool_name,
+                    "webpipe_meta" | "web_extract" | "search_evidence" | "arxiv" | "paper_search"
+                );
+                if keyless {
+                    return true;
                 }
-                _ => false,
+                // Conditionally visible: show only when the required key is configured.
+                // This keeps the default surface fully functional while surfacing
+                // optional premium integrations when they're actually usable.
+                match tool_name {
+                    "web_perplexity" => {
+                        has_env("WEBPIPE_PERPLEXITY_API_KEY") || has_env("PERPLEXITY_API_KEY")
+                    }
+                    _ => false,
+                }
             }
-        }
         }
     }
 
@@ -3724,11 +3721,7 @@ mod mcp {
                 let mut ks: Vec<&String> = hints.keys().collect();
                 ks.sort();
                 for k in ks.into_iter().take(12) {
-                    let hint = hints
-                        .get(k)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim();
+                    let hint = hints.get(k).and_then(|v| v.as_str()).unwrap_or("").trim();
                     if hint.is_empty() {
                         continue;
                     }
@@ -4492,11 +4485,7 @@ mod mcp {
                 let mut ks: Vec<&String> = hints.keys().collect();
                 ks.sort();
                 for k in ks.into_iter().take(12) {
-                    let hint = hints
-                        .get(k)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim();
+                    let hint = hints.get(k).and_then(|v| v.as_str()).unwrap_or("").trim();
                     if hint.is_empty() {
                         continue;
                     }
@@ -4837,11 +4826,7 @@ mod mcp {
                 let mut ks: Vec<&String> = hints.keys().collect();
                 ks.sort();
                 for k in ks.into_iter().take(12) {
-                    let hint = hints
-                        .get(k)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim();
+                    let hint = hints.get(k).and_then(|v| v.as_str()).unwrap_or("").trim();
                     if hint.is_empty() {
                         continue;
                     }
@@ -5006,7 +4991,10 @@ mod mcp {
             md.push_str("## Error\n\n");
             let err = payload.get("error").cloned().unwrap_or_default();
             let code = err.get("code").and_then(|v| v.as_str()).unwrap_or("error");
-            let message = err.get("message").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let message = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             let hint = err.get("hint").and_then(|v| v.as_str()).unwrap_or("");
             md.push_str(&format!("- **code**: `{code}`\n"));
             md.push_str(&format!("- **message**: {message}\n"));
@@ -6168,6 +6156,54 @@ mod mcp {
         #[serde(default)]
         max_discussion_urls: Option<usize>,
         /// Timeout per discussion fetch (ms). Default: 20_000.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    }
+
+    /// Combined arXiv tool: search by topic (pass `query`) or get metadata for one paper (pass `id_or_url`).
+    #[derive(Debug, Deserialize, JsonSchema, Default)]
+    struct ArxivArgs {
+        // ---- enrich fields (pass id_or_url to get metadata for one specific paper) ----
+        /// ArXiv ID (e.g. "0805.3415") or an arxiv.org/abs URL.
+        /// If provided, enrich mode: returns full metadata for this paper.
+        /// Omit when searching by topic — use `query` instead.
+        #[serde(default)]
+        id_or_url: Option<String>,
+        /// Include best-effort discussion/commentary links via web search (bounded). Enrich mode only.
+        #[serde(default)]
+        include_discussions: Option<bool>,
+        /// Max discussion pages to include (default: 2; max: 5). Enrich mode only.
+        #[serde(default)]
+        max_discussion_urls: Option<usize>,
+
+        // ---- search fields (pass query to search for papers by topic/keyword) ----
+        /// Search query. If provided (and id_or_url is absent), search mode: returns papers[].
+        #[serde(default)]
+        query: Option<String>,
+        /// ArXiv categories to filter by (e.g. "cs.AI", "cs.CL"). Search mode only.
+        #[serde(default)]
+        categories: Option<Vec<String>>,
+        /// Filter by publication years. Search mode only.
+        #[serde(default)]
+        years: Option<Vec<u32>>,
+        /// Page number (1-based, default: 1). Search mode only.
+        #[serde(default)]
+        page: Option<usize>,
+        /// Results per page (default: 10; max: 50). Alias: max_results. Search mode only.
+        #[serde(default)]
+        per_page: Option<usize>,
+        /// Alias for per_page. Search mode only.
+        #[serde(default)]
+        max_results: Option<usize>,
+        /// Rerank returned papers using semantic embeddings. Search mode only.
+        #[serde(default)]
+        semantic_rerank: Option<bool>,
+        /// Max papers after semantic rerank (default: per_page; max: 50). Search mode only.
+        #[serde(default)]
+        semantic_top_k: Option<usize>,
+
+        // ---- shared ----
+        /// Timeout (ms). Default: 20_000.
         #[serde(default)]
         timeout_ms: Option<u64>,
     }
@@ -8317,13 +8353,13 @@ mod mcp {
                 "web_sitemap_extract",
                 "repo_ingest",
                 "paper_search",
+                "arxiv",
                 "arxiv_search",
                 "arxiv_enrich",
             ]
             .into_iter()
             .filter(|name| mcp_tool_allowed(name, ts))
             .collect();
-
 
             let mut payload = serde_json::json!({
                 "ok": true,
@@ -8369,6 +8405,7 @@ mod mcp {
                         "web_sitemap_extract",
                         "repo_ingest",
                         "paper_search",
+                        "arxiv",
                         "arxiv_search",
                         "arxiv_enrich"
                     ],
@@ -8381,7 +8418,7 @@ mod mcp {
                         "sitemap": ["web_sitemap_extract"],
                         "ingest": ["repo_ingest"],
                         "search": ["web_search", "search_evidence", "web_perplexity", "web_cache_search_extract"],
-                        "research": ["web_deep_research", "paper_search", "arxiv_search", "arxiv_enrich"]
+                        "research": ["web_deep_research", "paper_search", "arxiv"]
                     },
                     // Deprecated tool names and their canonical replacements.
                     // These tools remain callable but are excluded from the default visible set.
@@ -8389,7 +8426,9 @@ mod mcp {
                         "http_fetch": "web_fetch",
                         "page_extract": "web_extract",
                         "page_extract_text": "web_extract",
-                        "web_search_extract": "search_evidence"
+                        "web_search_extract": "search_evidence",
+                        "arxiv_search": "arxiv",
+                        "arxiv_enrich": "arxiv"
                     },
                     // Values for web_search.provider
                     "providers": ["auto", "brave", "tavily", "searxng"],
@@ -8681,8 +8720,9 @@ mod mcp {
                     "web_perplexity": "Perplexity-backed synthesis (requires API key). Returns answer text + citations[].",
                     "web_cache_search_extract": "Cache-only search: scan WEBPIPE_CACHE_DIR -> extract -> top_chunks (no network).",
                     "web_deep_research": "Evidence gatherer + optional synthesis. Prefer include_evidence for auditability.",
-                    "arxiv_search": "ArXiv Atom search (bounded). Returns papers[] with title/abstract/authors/categories/pdf_url.",
-                    "arxiv_enrich": "ArXiv metadata (bounded) + optional discussion search via web_search.",
+                    "arxiv": "arXiv papers: search by topic (pass query) or get metadata for a specific paper (pass id_or_url). Returns papers[] or paper{}.",
+                    "arxiv_search": "DEPRECATED: use arxiv instead (same capabilities; pass query).",
+                    "arxiv_enrich": "DEPRECATED: use arxiv instead (same capabilities; pass id_or_url).",
                     "paper_search": "Multi-backend academic search (Semantic Scholar / OpenAlex / Google Scholar). Returns papers[] with citation counts.",
                     // Deprecated aliases (still callable, not default-visible):
                     "http_fetch": "DEPRECATED: use web_fetch instead.",
@@ -9523,6 +9563,192 @@ mod mcp {
 
             add_envelope_fields(&mut payload, "arxiv_enrich", t0.elapsed().as_millis());
             let md = arxiv_enrich_markdown(&payload);
+            Ok(tool_result_markdown_with_json(payload, md))
+        }
+
+        #[tool(
+            description = "arXiv papers: search by topic/keyword (pass query) or get full metadata for a specific paper (pass id_or_url). Provide exactly one. Search output: papers[] with title, abstract, authors, categories, pdf_url. Enrich output: paper{} + optional discussions[].",
+            input_schema = Arc::new(tool_input_schema_draft07::<ArxivArgs>()),
+            annotations(title = "arXiv", read_only_hint = true, open_world_hint = true)
+        )]
+        async fn arxiv(
+            &self,
+            params: Parameters<Option<ArxivArgs>>,
+        ) -> Result<CallToolResult, McpError> {
+            let args = params.0.unwrap_or_default();
+            self.stats_inc_tool("arxiv");
+            let t0 = std::time::Instant::now();
+
+            if args.id_or_url.is_some() {
+                // --- ENRICH MODE ---
+                let raw = args.id_or_url.unwrap_or_default().trim().to_string();
+                if raw.is_empty() {
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "error": error_obj(ErrorCode::InvalidParams, "id_or_url must be non-empty", "Pass an arXiv ID like \"0805.3415\" or a full abs URL.")
+                    });
+                    add_envelope_fields(&mut payload, "arxiv", t0.elapsed().as_millis());
+                    let md = arxiv_enrich_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
+                let arxiv_id = if raw.contains("arxiv.org/") {
+                    raw.split("/abs/")
+                        .nth(1)
+                        .unwrap_or(&raw)
+                        .trim()
+                        .trim_matches('/')
+                        .to_string()
+                } else {
+                    raw.clone()
+                };
+                let abs_url = webpipe_local::arxiv::arxiv_abs_url(&arxiv_id);
+                let paper = webpipe_local::arxiv::arxiv_lookup_by_id(
+                    self.http.clone(),
+                    arxiv_id.clone(),
+                    args.timeout_ms.unwrap_or(20_000),
+                )
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                let mut payload = serde_json::json!({
+                    "ok": true,
+                    "arxiv_id": arxiv_id,
+                    "abs_url": abs_url,
+                    "paper": paper,
+                });
+                let include_discussions = args.include_discussions.unwrap_or(false);
+                if include_discussions {
+                    let max_discussion_urls = args.max_discussion_urls.unwrap_or(2).clamp(1, 5);
+                    let q = format!("{} discussion", abs_url);
+                    let r = self
+                        .web_search(p(WebSearchArgs {
+                            query: Some(q),
+                            provider: Some("auto".to_string()),
+                            auto_mode: Some("mab".to_string()),
+                            max_results: Some(max_discussion_urls),
+                            language: None,
+                            country: None,
+                            ..Default::default()
+                        }))
+                        .await?;
+                    payload["discussion_search"] = payload_from_result(&r);
+                }
+                add_envelope_fields(&mut payload, "arxiv", t0.elapsed().as_millis());
+                let md = arxiv_enrich_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
+            }
+
+            // --- SEARCH MODE ---
+            let query = args.query.clone().unwrap_or_default().trim().to_string();
+            if query.is_empty() {
+                let mut payload = serde_json::json!({
+                    "ok": false,
+                    "query": args.query.unwrap_or_default(),
+                    "error": error_obj(ErrorCode::InvalidParams, "provide query (search) or id_or_url (enrich)", "Pass query to search arXiv papers, or id_or_url to get details for a specific paper.")
+                });
+                add_envelope_fields(&mut payload, "arxiv", t0.elapsed().as_millis());
+                let md = arxiv_search_markdown(&payload);
+                return Ok(tool_result_markdown_with_json(payload, md));
+            }
+
+            let page = args.page.unwrap_or(1).max(1);
+            let per_page = args
+                .per_page
+                .or(args.max_results)
+                .unwrap_or(10)
+                .clamp(1, 50);
+            let timeout_ms = args.timeout_ms.unwrap_or(20_000);
+            let categories = args.categories.unwrap_or_default();
+            let years = args.years.unwrap_or_default();
+            let semantic_rerank = args.semantic_rerank.unwrap_or(false);
+            let semantic_top_k = args.semantic_top_k.unwrap_or(per_page).clamp(1, 50);
+
+            let mut resp = webpipe_local::arxiv::arxiv_search(
+                self.http.clone(),
+                query.clone(),
+                categories.clone(),
+                years.clone(),
+                page,
+                per_page,
+                timeout_ms,
+            )
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            let mut semantic: serde_json::Value = serde_json::Value::Null;
+            if semantic_rerank {
+                let cands: Vec<(usize, usize, String)> = resp
+                    .papers
+                    .iter()
+                    .map(|p| {
+                        let text =
+                            format!("__ARXIV_ID__:{}\n{}\n\n{}", p.arxiv_id, p.title, p.summary);
+                        (0, text.chars().count(), text)
+                    })
+                    .collect();
+                let sem = self
+                    .semantic_rerank_chunks_best(&query, &cands, semantic_top_k)
+                    .await;
+                if sem.ok {
+                    let mut by_id = std::collections::BTreeMap::<
+                        String,
+                        webpipe_local::arxiv::ArxivPaper,
+                    >::new();
+                    for p in &resp.papers {
+                        by_id.insert(p.arxiv_id.clone(), p.clone());
+                    }
+                    let mut out: Vec<webpipe_local::arxiv::ArxivPaper> = Vec::new();
+                    let mut seen = std::collections::HashSet::<String>::new();
+                    for ch in &sem.chunks {
+                        let first = ch.text.lines().next().unwrap_or("");
+                        let id = first.strip_prefix("__ARXIV_ID__:").unwrap_or("").trim();
+                        if id.is_empty() {
+                            continue;
+                        }
+                        if let Some(p) = by_id.get(id) {
+                            if seen.insert(p.arxiv_id.clone()) {
+                                out.push(p.clone());
+                            }
+                        }
+                        if out.len() >= semantic_top_k {
+                            break;
+                        }
+                    }
+                    if !out.is_empty() {
+                        resp.papers = out;
+                    } else {
+                        resp.warnings.push("semantic_rerank_no_matches");
+                    }
+                } else {
+                    resp.warnings.extend(sem.warnings.iter().copied());
+                }
+                semantic = serde_json::to_value(sem).unwrap_or(serde_json::Value::Null);
+            }
+
+            let mut payload = serde_json::json!({
+                "ok": resp.ok,
+                "query": resp.query,
+                "page": resp.page,
+                "per_page": resp.per_page,
+                "total_results": resp.total_results,
+                "papers": resp.papers,
+                "warnings": resp.warnings,
+                "request": {
+                    "query": query,
+                    "categories": categories,
+                    "years": years,
+                    "page": page,
+                    "per_page": per_page,
+                    "timeout_ms": timeout_ms,
+                    "semantic_rerank": semantic_rerank,
+                    "semantic_top_k": semantic_top_k
+                }
+            });
+            if !semantic.is_null() {
+                payload["request"]["semantic"] = semantic;
+            }
+            add_envelope_fields(&mut payload, "arxiv", t0.elapsed().as_millis());
+            let md = arxiv_search_markdown(&payload);
             Ok(tool_result_markdown_with_json(payload, md))
         }
 
@@ -12004,7 +12230,9 @@ mod mcp {
                         "web_search_extract",
                         t0.elapsed().as_millis(),
                     );
-                    if minimal_output { strip_minimal_output(&mut payload); }
+                    if minimal_output {
+                        strip_minimal_output(&mut payload);
+                    }
                     let md = web_search_extract_markdown(&payload);
                     return Ok(tool_result_markdown_with_json(payload, md));
                 }
@@ -13920,9 +14148,10 @@ Rules:
 
                     // Attempt local extraction first; if it's empty and fallback is enabled + configured,
                     // retry *just this URL* via Firecrawl.
-                    let mut local_pdf_like = Self::content_type_is_pdf(local_content_type.as_deref())
-                        || Self::url_looks_like_pdf(&local_final_url)
-                        || webpipe_local::extract::bytes_look_like_pdf(&fetched.bytes);
+                    let mut local_pdf_like =
+                        Self::content_type_is_pdf(local_content_type.as_deref())
+                            || Self::url_looks_like_pdf(&local_final_url)
+                            || webpipe_local::extract::bytes_look_like_pdf(&fetched.bytes);
                     let mut local_raw_text = if local_pdf_like {
                         String::new()
                     } else {
@@ -14011,7 +14240,8 @@ Rules:
                                 let pdf_engine0 = local_extracted_obj.engine;
                                 let (_t0, pdf_text_chars0, _clip0) =
                                     Self::truncate_to_chars(&local_extracted_obj.text, max_chars);
-                                let pdf_warn0: Vec<&'static str> = local_extracted_obj.warnings.clone();
+                                let pdf_warn0: Vec<&'static str> =
+                                    local_extracted_obj.warnings.clone();
 
                                 let t_fb0 = std::time::Instant::now();
                                 let fb_req = FetchRequest {
@@ -14034,7 +14264,9 @@ Rules:
                                         let fb_pdf_like =
                                             Self::content_type_is_pdf(fb_content_type.as_deref())
                                                 || Self::url_looks_like_pdf(&fb_final_url)
-                                                || webpipe_local::extract::bytes_look_like_pdf(&r2.bytes);
+                                                || webpipe_local::extract::bytes_look_like_pdf(
+                                                    &r2.bytes,
+                                                );
                                         let fb_raw_text = if fb_pdf_like {
                                             String::new()
                                         } else {
@@ -14048,10 +14280,11 @@ Rules:
                                                 width,
                                                 500,
                                             );
-                                        let (_fb_t, fb_text_chars, _fb_clip) = Self::truncate_to_chars(
-                                            &fb_extracted_obj.text,
-                                            max_chars,
-                                        );
+                                        let (_fb_t, fb_text_chars, _fb_clip) =
+                                            Self::truncate_to_chars(
+                                                &fb_extracted_obj.text,
+                                                max_chars,
+                                            );
                                         let fb_nonempty = fb_status < 400
                                             && (fb_text_chars >= 80
                                                 || !fb_extracted_obj.text.trim().is_empty());
@@ -14093,8 +14326,12 @@ Rules:
                                             local_raw_text = fb_raw_text;
                                             local_extracted_obj = fb_extracted_obj;
                                             cache_io_timed_out = cache_io_disabled
-                                                || fetched.timings_ms.contains_key("cache_get_timeout")
-                                                || fetched.timings_ms.contains_key("cache_put_timeout");
+                                                || fetched
+                                                    .timings_ms
+                                                    .contains_key("cache_get_timeout")
+                                                || fetched
+                                                    .timings_ms
+                                                    .contains_key("cache_put_timeout");
                                             break;
                                         } else {
                                             let mut a =
@@ -20294,20 +20531,20 @@ Rules:
             let resp = if fetch_backend == "render" {
                 let pm = privacy_mode_from_env();
                 if matches!(pm, PrivacyMode::Offline) && !is_localhost_url(fetch_url.as_str()) {
-                        let mut payload = serde_json::json!({
-                            "ok": false,
-                            "url": url,
-                            "error": error_obj(
-                                ErrorCode::NotSupported,
-                                "privacy_mode=offline blocks render fetches to non-localhost URLs",
-                                "Use a localhost URL, or set WEBPIPE_PRIVACY_MODE=normal/anonymous."
-                            ),
-                            "request": { "fetch_backend": fetch_backend, "no_network": no_network }
-                        });
-                        add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                        let md = web_extract_markdown(&payload);
-                        return Ok(tool_result_markdown_with_json(payload, md));
-                    }
+                    let mut payload = serde_json::json!({
+                        "ok": false,
+                        "url": url,
+                        "error": error_obj(
+                            ErrorCode::NotSupported,
+                            "privacy_mode=offline blocks render fetches to non-localhost URLs",
+                            "Use a localhost URL, or set WEBPIPE_PRIVACY_MODE=normal/anonymous."
+                        ),
+                        "request": { "fetch_backend": fetch_backend, "no_network": no_network }
+                    });
+                    add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
+                    let md = web_extract_markdown(&payload);
+                    return Ok(tool_result_markdown_with_json(payload, md));
+                }
 
                 let anon_proxy = anon_proxy_from_env();
                 let proxy_for_render = if matches!(pm, PrivacyMode::Anonymous)
@@ -20755,7 +20992,9 @@ Rules:
                     || pipeline.extracted.warnings.iter().any(|&w| {
                         matches!(
                             normalize_warning_code(w),
-                            "pdf_extract_failed" | "pdf_extract_panicked" | "pdf_strings_fallback_used"
+                            "pdf_extract_failed"
+                                | "pdf_extract_panicked"
+                                | "pdf_strings_fallback_used"
                         )
                     });
                 if pdf_extraction_degraded {
@@ -20779,9 +21018,9 @@ Rules:
                             });
                         }
                     }
-                    if let Some(cands) =
-                        webpipe_local::rewrite::openreview_pdf_api_candidates(resp_final_url.as_str())
-                    {
+                    if let Some(cands) = webpipe_local::rewrite::openreview_pdf_api_candidates(
+                        resp_final_url.as_str(),
+                    ) {
                         if let Some(u) = cands.into_iter().next() {
                             fb_specs.push(PdfHtmlFallbackSpec {
                                 attempt_key: "openreview_pdf_api_fallback",
@@ -20844,15 +21083,16 @@ Rules:
                                 let final_url2 = fb_final_url.clone();
                                 let query2 = args.query.clone();
 
-                                let extract_timeout_ms = std::env::var("WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS")
-                                    .ok()
-                                    .and_then(|s| s.trim().parse::<u64>().ok())
-                                    .unwrap_or(
-                                        args.timeout_ms
-                                            .unwrap_or(20_000)
-                                            .saturating_sub(1_000)
-                                            .clamp(4_000, 45_000),
-                                    );
+                                let extract_timeout_ms =
+                                    std::env::var("WEBPIPE_EXTRACT_PIPELINE_TIMEOUT_MS")
+                                        .ok()
+                                        .and_then(|s| s.trim().parse::<u64>().ok())
+                                        .unwrap_or(
+                                            args.timeout_ms
+                                                .unwrap_or(20_000)
+                                                .saturating_sub(1_000)
+                                                .clamp(4_000, 45_000),
+                                        );
 
                                 let fb_pipeline_opt = if extract_timeout_ms == 0 {
                                     None
@@ -20901,8 +21141,8 @@ Rules:
                                     let fb_pen =
                                         Self::warning_penalty(&fb_pipeline.extracted.warnings);
                                     let pdf_pen = Self::warning_penalty(&pdf_warn0);
-                                    let fb_nonempty =
-                                        fb_pipeline.text_chars >= 80 || !fb_pipeline.chunks.is_empty();
+                                    let fb_nonempty = fb_pipeline.text_chars >= 80
+                                        || !fb_pipeline.chunks.is_empty();
                                     if fb_status < 400 && fb_nonempty && fb_pen <= pdf_pen {
                                         pdf_html_fallback_used_warning = Some(fb.warning_code);
                                         attempts_map.insert(
@@ -21970,8 +22210,8 @@ Rules:
         ];
 
         #[test]
-        fn web_search_extract_markdown_next_suggests_domains_allow_for_rust_when_forum_sources_present()
-        {
+        fn web_search_extract_markdown_next_suggests_domains_allow_for_rust_when_forum_sources_present(
+        ) {
             let payload = serde_json::json!({
                 "ok": true,
                 "query": "evoc Rust crate documentation",
@@ -22232,7 +22472,10 @@ Rules:
                 WebpipeMcp::query_key("β-Gaussian"),
                 Some("beta gaussian".to_string())
             );
-            assert_eq!(WebpipeMcp::query_key("Ω(θ)"), Some("omega theta".to_string()));
+            assert_eq!(
+                WebpipeMcp::query_key("Ω(θ)"),
+                Some("omega theta".to_string())
+            );
         }
 
         proptest! {
@@ -24965,7 +25208,9 @@ Rules:
             let svc = WebpipeMcp::new().expect("new");
 
             // none configured
-            let v0 = payload_from_call_tool_result(&svc.webpipe_meta(Parameters(None)).await.expect("meta"));
+            let v0 = payload_from_call_tool_result(
+                &svc.webpipe_meta(Parameters(None)).await.expect("meta"),
+            );
             assert_eq!(v0["ok"].as_bool(), Some(true));
             assert_eq!(
                 v0["defaults"]["web_search"]["provider"].as_str(),
@@ -25009,7 +25254,9 @@ Rules:
 
             // brave only
             _env.set("WEBPIPE_BRAVE_API_KEY", "x");
-            let v1 = payload_from_call_tool_result(&svc.webpipe_meta(Parameters(None)).await.expect("meta"));
+            let v1 = payload_from_call_tool_result(
+                &svc.webpipe_meta(Parameters(None)).await.expect("meta"),
+            );
             assert_eq!(
                 v1["defaults"]["web_search"]["provider_auto_order"]
                     .as_array()
@@ -25028,7 +25275,9 @@ Rules:
             // tavily only (clear brave, set tavily)
             std::env::remove_var("WEBPIPE_BRAVE_API_KEY");
             _env.set("WEBPIPE_TAVILY_API_KEY", "x");
-            let v2 = payload_from_call_tool_result(&svc.webpipe_meta(Parameters(None)).await.expect("meta"));
+            let v2 = payload_from_call_tool_result(
+                &svc.webpipe_meta(Parameters(None)).await.expect("meta"),
+            );
             assert_eq!(
                 v2["defaults"]["web_search"]["provider_auto_order"]
                     .as_array()
@@ -25049,7 +25298,9 @@ Rules:
 
             // both configured (brave-first ordering)
             _env.set("WEBPIPE_BRAVE_API_KEY", "x");
-            let v3 = payload_from_call_tool_result(&svc.webpipe_meta(Parameters(None)).await.expect("meta"));
+            let v3 = payload_from_call_tool_result(
+                &svc.webpipe_meta(Parameters(None)).await.expect("meta"),
+            );
             assert_eq!(
                 v3["defaults"]["web_search"]["provider_auto_order"]
                     .as_array()

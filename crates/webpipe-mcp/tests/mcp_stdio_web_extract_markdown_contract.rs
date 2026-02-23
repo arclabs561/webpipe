@@ -109,4 +109,3 @@ async fn webpipe_mcp_stdio_web_extract_markdown_surfaces_warning_hints() {
 
     service.cancel().await.expect("cancel");
 }
-

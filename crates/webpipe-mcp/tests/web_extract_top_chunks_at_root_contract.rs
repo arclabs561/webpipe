@@ -11,9 +11,7 @@ fn web_extract_top_chunks_at_root_contract() {
     rt.block_on(async {
         use axum::{http::header, routing::get, Router};
         use rmcp::{
-            model::CallToolRequestParam,
-            service::ServiceExt,
-            transport::ConfigureCommandExt,
+            model::CallToolRequestParam, service::ServiceExt, transport::ConfigureCommandExt,
         };
         use std::net::SocketAddr;
 

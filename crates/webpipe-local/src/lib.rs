@@ -43,11 +43,7 @@ impl FsCache {
         let mut out = BTreeMap::new();
         for (k, v) in headers {
             match k.trim().to_ascii_lowercase().as_str() {
-                "content-type"
-                | "content-length"
-                | "etag"
-                | "last-modified"
-                | "cache-control"
+                "content-type" | "content-length" | "etag" | "last-modified" | "cache-control"
                 | "retry-after" => {
                     out.insert(k.clone(), v.clone());
                 }
