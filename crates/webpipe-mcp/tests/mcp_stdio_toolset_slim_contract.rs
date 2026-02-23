@@ -38,11 +38,9 @@ fn webpipe_mcp_stdio_toolset_slim_contract() {
         // (tested separately in mcp_stdio_web_perplexity_contract).
         for must in [
             "webpipe_meta",
-            "web_fetch",
             "web_extract",
             "search_evidence",
-            "arxiv_search",
-            "arxiv_enrich",
+            "arxiv",
             "paper_search",
         ] {
             assert!(names.contains(must), "missing required tool: {must}");
@@ -52,10 +50,12 @@ fn webpipe_mcp_stdio_toolset_slim_contract() {
         // webpipe_usage / webpipe_usage_reset are accessible via webpipe_meta?method=...
         // web_perplexity is only visible when WEBPIPE_PERPLEXITY_API_KEY is configured
         // (this test runs without any keys set).
+        // web_fetch, arxiv_search, arxiv_enrich are deprecated → web_extract / arxiv.
         for must_not in [
             "webpipe_usage",
             "webpipe_usage_reset",
             "web_perplexity",
+            "web_fetch",
             "repo_ingest",
             "web_explore_extract",
             "web_sitemap_extract",
@@ -63,7 +63,9 @@ fn webpipe_mcp_stdio_toolset_slim_contract() {
             "web_seed_urls",
             "web_seed_search_extract",
             "web_deep_research",
-            // Redundant aliases / legacy names:
+            // Deprecated aliases / legacy names:
+            "arxiv_search",
+            "arxiv_enrich",
             "web_search_extract",
             "web_cache_search_extract",
             "http_fetch",

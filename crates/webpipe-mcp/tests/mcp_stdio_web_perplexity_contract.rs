@@ -43,14 +43,12 @@ fn webpipe_mcp_stdio_web_perplexity_contract_not_configured_is_stable() {
             !names_normal.contains("web_perplexity"),
             "web_perplexity must NOT appear in Normal mode without API key; got: {names_normal:?}"
         );
-        // The 7 zero-key tools must all be present.
+        // The 5 zero-key tools must all be present.
         for must in [
             "webpipe_meta",
-            "web_fetch",
             "web_extract",
             "search_evidence",
-            "arxiv_search",
-            "arxiv_enrich",
+            "arxiv",
             "paper_search",
         ] {
             assert!(
