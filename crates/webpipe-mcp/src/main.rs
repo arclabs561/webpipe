@@ -3536,9 +3536,28 @@ mod mcp {
         if !backend_provider.is_empty() {
             parts.push(format!("**backend_provider**: `{backend_provider}`"));
         }
-        parts.push(format!("**urls**: {url_count_in}→{url_count_used}"));
-        parts.push(format!("**results**: {results_count}"));
+        // When minimal_output stripped request/results, avoid "urls: 0→0; results: 0" when we have chunks.
+        let minimal_summary = url_count_in == 0 && results_count == 0 && top_chunks_count > 0;
+        if !minimal_summary {
+            parts.push(format!("**urls**: {url_count_in}→{url_count_used}"));
+            parts.push(format!("**results**: {results_count}"));
+        }
         parts.push(format!("**chunks**: {top_chunks_count}"));
+        if minimal_summary && top_chunks_count > 0 {
+            let unique_urls: std::collections::BTreeSet<&str> = payload
+                .get("top_chunks")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| c.get("url").and_then(|v| v.as_str()))
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !unique_urls.is_empty() {
+                parts.push(format!("**sources**: {}", unique_urls.len()));
+            }
+        }
         if let Some(ms) = payload.get("elapsed_ms").and_then(|v| v.as_u64()) {
             parts.push(format!("**elapsed_ms**: {ms}"));
         }
@@ -4285,9 +4304,14 @@ mod mcp {
         if let Some(ws) = payload.get("warnings").and_then(|v| v.as_array()) {
             if !ws.is_empty() {
                 md.push_str("\n## Warnings\n\n");
+                let hints = payload.get("warning_hints").and_then(|v| v.as_object());
                 for w in ws.iter().filter_map(|v| v.as_str()) {
                     md.push_str("- ");
                     md.push_str(w);
+                    if let Some(ob) = hints.and_then(|h| h.get(w)).and_then(|v| v.as_str()) {
+                        md.push_str(": ");
+                        md.push_str(ob);
+                    }
                     md.push('\n');
                 }
             }
@@ -20270,19 +20294,20 @@ Rules:
             let resp = if fetch_backend == "render" {
                 let pm = privacy_mode_from_env();
                 if matches!(pm, PrivacyMode::Offline) && !is_localhost_url(fetch_url.as_str()) {
-                    let mut payload = serde_json::json!({
-                        "ok": false,
-                        "url": url,
-                        "error": error_obj(
-                            ErrorCode::NotSupported,
-                            "privacy_mode=offline blocks render fetches to non-localhost URLs",
-                            "Use a localhost URL, or set WEBPIPE_PRIVACY_MODE=normal/anonymous."
-                        ),
-                        "request": { "fetch_backend": fetch_backend, "no_network": no_network }
-                    });
-                    add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                    return Ok(tool_result(payload));
-                }
+                        let mut payload = serde_json::json!({
+                            "ok": false,
+                            "url": url,
+                            "error": error_obj(
+                                ErrorCode::NotSupported,
+                                "privacy_mode=offline blocks render fetches to non-localhost URLs",
+                                "Use a localhost URL, or set WEBPIPE_PRIVACY_MODE=normal/anonymous."
+                            ),
+                            "request": { "fetch_backend": fetch_backend, "no_network": no_network }
+                        });
+                        add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
+                    }
 
                 let anon_proxy = anon_proxy_from_env();
                 let proxy_for_render = if matches!(pm, PrivacyMode::Anonymous)
@@ -20300,7 +20325,8 @@ Rules:
                             "request": { "fetch_backend": fetch_backend, "no_network": no_network }
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     };
                     let pl = p.trim().to_ascii_lowercase();
                     if pl.starts_with("socks5h://") {
@@ -20315,7 +20341,8 @@ Rules:
                             "request": { "fetch_backend": fetch_backend, "no_network": no_network }
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                     Some(p)
                 } else {
@@ -20364,7 +20391,8 @@ Rules:
                             "request": { "fetch_backend": fetch_backend, "no_network": no_network, "timeout_ms": timeout_ms }
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                 };
 
@@ -20418,7 +20446,8 @@ Rules:
                             "warning_hints": warning_hints_from(&codes)
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -20435,7 +20464,8 @@ Rules:
                             "request": { "fetch_backend": "local", "no_network": true }
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                 }
             } else {
@@ -20494,7 +20524,8 @@ Rules:
                             }
                         });
                         add_envelope_fields(&mut payload, "web_extract", t0.elapsed().as_millis());
-                        return Ok(tool_result(payload));
+                        let md = web_extract_markdown(&payload);
+                        return Ok(tool_result_markdown_with_json(payload, md));
                     }
                 };
 
@@ -24934,7 +24965,7 @@ Rules:
             let svc = WebpipeMcp::new().expect("new");
 
             // none configured
-            let v0 = payload_from_call_tool_result(&svc.webpipe_meta().await.expect("meta"));
+            let v0 = payload_from_call_tool_result(&svc.webpipe_meta(Parameters(None)).await.expect("meta"));
             assert_eq!(v0["ok"].as_bool(), Some(true));
             assert_eq!(
                 v0["defaults"]["web_search"]["provider"].as_str(),
@@ -24978,7 +25009,7 @@ Rules:
 
             // brave only
             _env.set("WEBPIPE_BRAVE_API_KEY", "x");
-            let v1 = payload_from_call_tool_result(&svc.webpipe_meta().await.expect("meta"));
+            let v1 = payload_from_call_tool_result(&svc.webpipe_meta(Parameters(None)).await.expect("meta"));
             assert_eq!(
                 v1["defaults"]["web_search"]["provider_auto_order"]
                     .as_array()
@@ -24997,7 +25028,7 @@ Rules:
             // tavily only (clear brave, set tavily)
             std::env::remove_var("WEBPIPE_BRAVE_API_KEY");
             _env.set("WEBPIPE_TAVILY_API_KEY", "x");
-            let v2 = payload_from_call_tool_result(&svc.webpipe_meta().await.expect("meta"));
+            let v2 = payload_from_call_tool_result(&svc.webpipe_meta(Parameters(None)).await.expect("meta"));
             assert_eq!(
                 v2["defaults"]["web_search"]["provider_auto_order"]
                     .as_array()
@@ -25018,7 +25049,7 @@ Rules:
 
             // both configured (brave-first ordering)
             _env.set("WEBPIPE_BRAVE_API_KEY", "x");
-            let v3 = payload_from_call_tool_result(&svc.webpipe_meta().await.expect("meta"));
+            let v3 = payload_from_call_tool_result(&svc.webpipe_meta(Parameters(None)).await.expect("meta"));
             assert_eq!(
                 v3["defaults"]["web_search"]["provider_auto_order"]
                     .as_array()
@@ -31028,6 +31059,10 @@ Rules:
                             "--args-json-file must contain a JSON object or array of objects"
                         ),
                     }
+                }
+                (None, None) => {
+                    // Default to empty args for tools that need no arguments (e.g. webpipe_meta).
+                    arg_objs.push(serde_json::Map::new());
                 }
                 _ => anyhow::bail!("Pass exactly one of --args-json or --args-json-file"),
             }

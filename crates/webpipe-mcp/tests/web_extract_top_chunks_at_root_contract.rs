@@ -13,7 +13,7 @@ fn web_extract_top_chunks_at_root_contract() {
         use rmcp::{
             model::CallToolRequestParam,
             service::ServiceExt,
-            transport::{ConfigureCommandExt, TokioChildProcess},
+            transport::ConfigureCommandExt,
         };
         use std::net::SocketAddr;
 
