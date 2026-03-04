@@ -61,6 +61,7 @@ async fn webpipe_web_fetch_sets_truncated_and_warning_codes_when_body_is_cut() {
                 // Disable `.env` autoload so this test stays hermetic.
                 cmd.env("WEBPIPE_DOTENV", "0");
                 cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
+                cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
             }))
             .expect("spawn mcp child"),
         )
