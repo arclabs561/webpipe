@@ -1,6 +1,9 @@
 # webpipe
 
-Local "search → fetch → extract" plumbing, exposed as an **MCP stdio** server.
+[![crates.io](https://img.shields.io/crates/v/webpipe.svg)](https://crates.io/crates/webpipe)
+[![CI](https://github.com/arclabs561/webpipe/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/webpipe/actions/workflows/ci.yml)
+
+Local "search -> fetch -> extract" plumbing, exposed as an MCP stdio server.
 
 - cache-first fetch by default
 - explicit limits on bytes/chars/results
@@ -152,3 +155,7 @@ webpipe mcp-call --tool search_evidence --args-json '{"query":"example","urls":[
 - `crates/webpipe-core`: backend-agnostic types + traits
 - `crates/webpipe-local`: local implementations (reqwest + cache + extractors)
 - `crates/webpipe-mcp`: CLI + MCP stdio server (`bin webpipe`)
+
+## License
+
+MIT OR Apache-2.0
