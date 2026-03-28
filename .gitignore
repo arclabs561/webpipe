@@ -29,3 +29,6 @@ id_ed25519*
 *secret*
 *credentials*
 
+# Claude Code
+.claude/settings.local.json
+.claude/audit-reports/
