@@ -1,6 +1,5 @@
 # webpipe
 
-[![crates.io](https://img.shields.io/crates/v/webpipe.svg)](https://crates.io/crates/webpipe)
 [![CI](https://github.com/arclabs561/webpipe/actions/workflows/ci.yml/badge.svg)](https://github.com/arclabs561/webpipe/actions/workflows/ci.yml)
 
 Local "search -> fetch -> extract" plumbing, exposed as an MCP stdio server.
