@@ -514,6 +514,7 @@ async fn web_fetch_cache_io_timeout_is_deterministic_at_zero() {
                 cmd.args(["mcp-stdio"]);
                 cmd.env("WEBPIPE_CACHE_IO_TIMEOUT_MS", "0");
                 cmd.env("WEBPIPE_DOTENV", "0");
+                cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                 cmd.env(
                     "WEBPIPE_CACHE_DIR",
                     std::env::temp_dir().join("webpipe-timeout-guards"),
