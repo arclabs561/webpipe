@@ -1,9 +1,9 @@
 #[test]
-fn webpipe_mcp_stdio_slim_workflow_contract() {
+fn webpipe_mcp_stdio_debug_workflow_contract() {
     // End-to-end (spawns child process), no external network.
     //
     // Contract:
-    // - With WEBPIPE_MCP_TOOLSET=normal, the remaining tools compose into a usable workflow:
+    // - With WEBPIPE_MCP_TOOLSET=debug, the full local tools compose into a usable workflow:
     //   web_fetch (warm cache) -> web_extract -> search_evidence(urls=..., no_network=true)
     //   -> search_evidence(query=..., no_network=true) (cache-corpus follow-up; urls omitted).
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -53,7 +53,7 @@ fn webpipe_mcp_stdio_slim_workflow_contract() {
                 tokio::process::Command::new(bin).configure(|cmd| {
                     cmd.args(["mcp-stdio"]);
                     cmd.env("WEBPIPE_DOTENV", "0");
-                    cmd.env("WEBPIPE_MCP_TOOLSET", "normal");
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env("WEBPIPE_CACHE_DIR", cache_dir.path());
                 }),
             )?)

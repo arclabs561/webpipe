@@ -119,6 +119,7 @@ async fn webpipe_web_fetch_handles_variety_of_urls_and_content_types() {
                 // Disable `.env` autoload so this test stays hermetic.
                 cmd.env("WEBPIPE_DOTENV", "0");
                 cmd.env("WEBPIPE_CACHE_DIR", &cache_dir);
+                cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                 // Ensure no provider keys are present.
                 cmd.env_remove("WEBPIPE_BRAVE_API_KEY");
                 cmd.env_remove("BRAVE_SEARCH_API_KEY");

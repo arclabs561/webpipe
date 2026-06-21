@@ -43,7 +43,7 @@ async fn webpipe_mcp_stdio_web_fetch_markdown_includes_warning_hints_and_correct
             TokioChildProcess::new(tokio::process::Command::new(bin).configure(|cmd| {
                 cmd.args(["mcp-stdio"]);
                 cmd.env("WEBPIPE_DOTENV", "0");
-                cmd.env("WEBPIPE_MCP_TOOLSET", "normal");
+                cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                 cmd.env("WEBPIPE_CACHE_DIR", cache_dir.path());
                 // Keep output stable: Markdown-first only, no raw JSON text.
                 cmd.env("WEBPIPE_MCP_INCLUDE_JSON_TEXT", "0");
