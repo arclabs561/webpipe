@@ -28,7 +28,7 @@ pdf-extract = "0.10.0"
 tempfile = "3.10"
 base64 = { version = "0.22", optional = true }
 quick-xml = "0.37"
-slabs_crate = { package = "slabs", version = "0.1.0" }
+text-splitter = "0.32"
 textprep_crate = { package = "textprep", version = "0.1.0" }
 
 [dev-dependencies]

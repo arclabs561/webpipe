@@ -1,9 +1,9 @@
 use crate::shellout;
 use crate::textprep;
 use serde::Serialize;
-use slabs_crate::Chunker;
 use std::io::Cursor;
 use std::process::Command;
+use text_splitter::TextSplitter;
 
 /// Convert HTML to readable plain text.
 ///
@@ -2316,7 +2316,7 @@ fn find_candidate_spans(text: &str, max_chunk_chars: usize) -> Vec<(usize, usize
     }
 
     // Fallback: when we only got 0-1 “paragraph spans”, generate more candidate spans using a
-    // recursive separator hierarchy (via `slabs`). This helps with:
+    // recursive separator hierarchy. This helps with:
     // - text/plain pages that use single newlines
     // - extracted HTML where blank lines were lost
     // - “nav word-salad” pages that become one huge line
@@ -2327,16 +2327,17 @@ fn find_candidate_spans(text: &str, max_chunk_chars: usize) -> Vec<(usize, usize
         // Keep this bounded; we only need “reasonable chunks”, not a perfect segmentation.
         .clamp(120, 50_000);
 
-    let chunker = slabs_crate::RecursiveChunker::prose(max_size_bytes);
-    let slabs = chunker.chunk(text);
-    if slabs.len() < 2 {
+    let splitter = TextSplitter::new(max_size_bytes);
+    let chunks = splitter.chunk_indices(text).collect::<Vec<_>>();
+    if chunks.len() < 2 {
         return spans;
     }
 
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(slabs.len());
-    for s in slabs.into_iter().take(500) {
-        if s.end > s.start {
-            out.push((s.start, s.end));
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(chunks.len());
+    for (start, chunk) in chunks.into_iter().take(500) {
+        let end = start + chunk.len();
+        if end > start {
+            out.push((start, end));
         }
     }
     if out.len() >= 2 {
@@ -3177,6 +3178,31 @@ mod tests {
         let chunks = best_chunks_for_query(text, "MCP stdio transport", 5, 200);
         assert!(!chunks.is_empty());
         assert!(chunks[0].score >= 2);
+    }
+
+    #[test]
+    fn candidate_span_fallback_keeps_valid_byte_offsets() {
+        let text = format!(
+            "{}\n{}\n{}",
+            "intro café ".repeat(18),
+            "target résumé ".repeat(18),
+            "tail naïve ".repeat(18)
+        );
+
+        let spans = find_candidate_spans(&text, 50);
+        assert!(
+            spans.len() >= 2,
+            "expected fallback splitter to create multiple spans; got {spans:?}"
+        );
+        assert!(spans
+            .iter()
+            .any(|(start, end)| { text.get(*start..*end).is_some_and(|s| s.contains("target")) }));
+        for (start, end) in spans {
+            assert!(
+                text.get(start..end).is_some(),
+                "span must stay on UTF-8 byte boundaries: {start}..{end}"
+            );
+        }
     }
 
     #[test]

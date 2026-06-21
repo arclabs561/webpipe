@@ -120,6 +120,7 @@ fn webpipe_mcp_stdio_tool_surface_markdown_contract_offlineish() {
                     cmd.env("WEBPIPE_DOTENV", "0");
                     cmd.env("WEBPIPE_CACHE_DIR", cache_dir.path());
                     cmd.env("WEBPIPE_ARXIV_ENDPOINT", &arxiv_endpoint);
+                    cmd.env("WEBPIPE_MCP_TOOLSET", "debug");
                     cmd.env("WEBPIPE_MCP_INCLUDE_JSON_TEXT", "0");
                 }),
             )?)
