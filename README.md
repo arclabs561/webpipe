@@ -7,7 +7,7 @@ Local "search -> fetch -> extract" plumbing, exposed as an MCP stdio server.
 - cache-first fetch by default
 - explicit limits on bytes/chars/results
 - stable, schema-versioned JSON outputs
-- **zero API keys required** — the default tool surface works out of the box
+- **zero API keys required**: the default tool surface works out of the box
 
 ## Cursor MCP setup
 
